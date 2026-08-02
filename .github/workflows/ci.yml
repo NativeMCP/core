@@ -49,9 +49,9 @@ jobs:
       fail-fast: false
       matrix:
         os:
-      - ubuntu-latest
-      - windows-latest
-      - macos-latest
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -96,6 +96,38 @@ jobs:
             exit 1
           fi
           echo "INV-6 gate passed."
+      - name: workflow definitions parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A workflow with a YAML error is accepted by GitHub, listed as
+          # active, and never runs. Without this step a broken required
+          # check is indistinguishable from a passing one.
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 -c "
+          import pathlib, sys, yaml
+          bad = 0
+          for f in sorted(pathlib.Path('.github/workflows').glob('*.y*ml')):
+              try:
+                  doc = yaml.safe_load(f.read_text())
+              except Exception as exc:
+                  print('::error file=' + str(f) + '::YAML parse failure: ' + str(exc))
+                  bad += 1
+                  continue
+              if not isinstance(doc, dict):
+                  print('::error file=' + str(f) + '::workflow is not a mapping')
+                  bad += 1
+                  continue
+              if not doc.get('name'):
+                  print('::error file=' + str(f) + '::workflow has no top-level name')
+                  bad += 1
+              if not doc.get('jobs'):
+                  print('::error file=' + str(f) + '::workflow declares no jobs')
+                  bad += 1
+              else:
+                  print(str(f) + ' ok: ' + str(doc['name']) + ' -> ' + ', '.join(doc['jobs']))
+          sys.exit(1 if bad else 0)
+          "
       - name: "INV-1: no destructive filesystem primitives"
         shell: bash
         run: |
