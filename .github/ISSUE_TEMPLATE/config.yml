@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/NativeMCP/core/security/advisories/new
+    about: Report privately. Never open a public issue for a vulnerability.
+  - name: Governance invariants
+    url: https://github.com/NativeMCP/core/blob/main/docs/GOVERNANCE.md
+    about: The normative rules every change in this organization must satisfy.

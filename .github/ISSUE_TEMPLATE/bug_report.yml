@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaves differently than specified.
+labels: ["type:bug", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not use this form for security vulnerabilities. Report those privately:
+        https://github.com/NativeMCP/core/security/advisories/new
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or 7f3a91c
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and version
+      placeholder: "any"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Specified behaviour
+      description: What the contract, schema, invariant or documentation says should happen. Cite it.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Observed behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact steps or a minimal case. Include configuration with secrets redacted.
+    validations:
+      required: true
+  - type: textarea
+    id: audit
+    attributes:
+      label: Relevant audit records
+      description: Redact paths and identifiers you do not want public.
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Does this violate a governance invariant?
+      options:
+        - "No"
+        - "INV-1 No Destructive Primitive"
+        - "INV-2 Root-Scoped Path Authority"
+        - "INV-3 Immutable Audit"
+        - "INV-4 Hierarchical Instruction Authority"
+        - "INV-5 Explicit State Machine"
+        - "INV-7 Reproducible Build"
+        - "Unsure"
+    validations:
+      required: true

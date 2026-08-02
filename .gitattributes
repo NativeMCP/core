@@ -1,0 +1,29 @@
+# Normalize on LF in the repository. This is load-bearing: the same crates are
+# built on Windows, Linux and macOS runners and CRLF drift breaks rustfmt --check.
+* text=auto eol=lf
+
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.sh      text eol=lf
+*.service text eol=lf
+*.plist   text eol=lf
+
+# Windows-native sources keep CRLF.
+*.ps1     text eol=crlf
+*.psm1    text eol=crlf
+*.cmd     text eol=crlf
+*.bat     text eol=crlf
+*.wxs     text eol=crlf
+*.wxl     text eol=crlf
+
+# Binary
+*.png binary
+*.ico binary
+*.icns binary
+*.msi binary
+*.pkg binary
+*.dmg binary

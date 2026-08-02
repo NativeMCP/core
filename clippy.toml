@@ -1,0 +1,9 @@
+# Clippy configuration. CI runs `-D warnings`; there is no soft-fail lane.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300
+avoid-breaking-exported-api = false
+
+# Project proper nouns. Without these, `clippy::doc_markdown` demands backticks
+# around product names in prose, which turns documentation into code voice.
+# The trailing ".." extends clippy's default list rather than replacing it.
+doc-valid-idents = ["NativeMCP", "WinMCP", "LinuxMCP", "MacMCP", ".."]

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  lint:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+      - ubuntu-latest
+      - windows-latest
+      - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+      - run: cargo build --workspace --all-features --locked
+      - run: cargo test --workspace --all-features --locked
+
+  supply-chain:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  governance:
+    name: governance gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "INV-6: no stubs, no placeholder markers"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # INV-6 forbids placeholder work anywhere in tracked sources.
+          # This gate is why "no stubs" is a property of the repository and
+          # not a promise in a document.
+          #
+          # The marker pattern is assembled from fragments so that this file
+          # does not itself contain the tokens it rejects. A gate that trips
+          # on its own definition is a gate nobody keeps.
+          MARKERS="$(printf '%s' 'TO''DO' '|' 'FIX''ME' '|' 'XX''X' '|' 'HA''CK')"
+          if git grep -n -E '\b(todo!|unimplemented!|unreachable!)\s*\(' -- '*.rs'; then
+            echo "::error::INV-6 violation: placeholder macro present in tracked Rust sources."
+            exit 1
+          fi
+          if git grep -n -E "(^|[^A-Za-z])($MARKERS)([^A-Za-z]|$)" \
+               -- '*.rs' '*.toml' '*.ps1' '*.sh' '*.wxs'; then
+            echo "::error::INV-6 violation: placeholder marker present. Name the gap in an issue instead."
+            exit 1
+          fi
+          echo "INV-6 gate passed."
+      - name: "INV-1: no destructive filesystem primitives"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # INV-1 forbids irreversible destruction. Destructive intent is
+          # redirected to quarantine; it is never executed directly.
+          if git grep -n -E '\b(remove_file|remove_dir_all|DeleteFileW?|SHFileOperation)\b' -- '*.rs'; then
+            echo "::error::INV-1 violation: destructive filesystem primitive in tracked Rust sources."
+            exit 1
+          fi
+          echo "INV-1 gate passed."

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+"crates/nmcp-proto",
+"crates/nmcp-policy",
+"crates/nmcp-schema",
+"crates/nmcp-audit",
+"crates/nmcp-host",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "Apache-2.0"
+authors = ["Madewell R&D LLC"]
+repository = "https://github.com/NativeMCP/core"
+homepage = "https://github.com/NativeMCP"
+readme = "README.md"
+keywords = ["mcp", "governance", "audit", "policy"]
+categories = ["network-programming"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# INV-1 and INV-5: a panic in a privileged local service is an availability
+# failure with an audit gap attached. These are denied, not discouraged.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+debug = "line-tables-only"

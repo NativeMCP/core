@@ -1,0 +1,38 @@
+name: Capability request
+description: Propose a capability or a change to a contract.
+labels: ["type:feature", "status:triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: The situation that is worse than it needs to be. Not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed capability
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How anyone can tell this is done. One testable statement per line.
+    validations:
+      required: true
+  - type: textarea
+    id: governance
+    attributes:
+      label: Governance impact
+      description: >
+        Which invariants does this touch, and how does it stay inside them?
+        A capability that requires relaxing an invariant is out of scope by
+        definition, so say so here rather than discovering it in review.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

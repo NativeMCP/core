@@ -1,0 +1,7 @@
+# Pinned toolchain. Reproducible builds are an invariant, not a preference.
+# Bumping this file is a reviewed change: it moves every runner and every
+# developer at once. See docs/GOVERNANCE.md INV-7 (Reproducible Build).
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

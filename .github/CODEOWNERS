@@ -1,0 +1,10 @@
+# Every path has an owner. Unowned code is unreviewed code.
+*                       @MadewellRD
+
+# Governance, security and supply-chain surfaces require the owner explicitly,
+# even if a future team gains broader write access.
+/docs/GOVERNANCE.md     @MadewellRD
+/SECURITY.md            @MadewellRD
+/deny.toml              @MadewellRD
+/rust-toolchain.toml    @MadewellRD
+/.github/               @MadewellRD

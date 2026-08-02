@@ -1,0 +1,42 @@
+# cargo-deny policy. Supply chain rules are enforced in CI, not advisory.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. Any copyleft entering the graph is a reviewed
+# decision recorded as an exception below, never a silent addition.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+exceptions = []
+# The allow list is the policy, not a record of what is currently in the
+# graph. Warning on entries nothing has used yet turns every run into noise,
+# and a gate people stop reading is not a gate.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/NativeMCP/core"]
