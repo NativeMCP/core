@@ -23,6 +23,7 @@ nmcp-identity.workspace = true
 nmcp-memory = { path = "../nmcp-memory", version = "0.1.0" }
 nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
 nmcp-proto = { path = "../nmcp-proto", version = "0.1.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

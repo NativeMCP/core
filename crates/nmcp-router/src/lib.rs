@@ -242,43 +242,13 @@ impl ToolCallResult {
     }
 }
 
-fn public_tool_name(provider_id: &str, local_name: &str) -> String {
-    let canonical = if provider_id.is_empty() {
-        local_name.to_string()
-    } else {
-        format!("{provider_id}_{local_name}")
-    };
-    let mut safe = String::with_capacity(canonical.len().min(64));
-    let mut previous_was_separator = false;
-    for ch in canonical.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            ch
-        } else {
-            '_'
-        };
-        if mapped == '_' {
-            if previous_was_separator {
-                continue;
-            }
-            previous_was_separator = true;
-        } else {
-            previous_was_separator = false;
-        }
-        safe.push(mapped);
-        if safe.len() >= 64 {
-            break;
-        }
-    }
-    safe.trim_matches('_').to_string()
-}
-
-fn is_valid_public_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-}
+/// The public tool name derivation and its validator, re-exported from `nmcp-schema`.
+///
+/// Both moved there under NMCP-SPEC-003 RC-D6, because the registry that owns the
+/// local-to-public mapping lives in the contract crate and a name derived in two places is
+/// the defect that spec's section 1 measures. Behaviour is unchanged, which is what
+/// `public_tool_names_are_claude_safe` below asserts on the same table it always did.
+pub use nmcp_schema::{is_valid_public_tool_name, public_tool_name};
 
 // - ToolProvider -
 
