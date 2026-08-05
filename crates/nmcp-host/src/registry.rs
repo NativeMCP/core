@@ -1,6 +1,6 @@
 //! The indexed tool registry.
 //!
-//! NMCP-SPEC-003 section 4.4, RATIFIED v1.1. The trait lives in `nmcp-schema` so every
+//! NMCP-SPEC-003 section 4.4, RATIFIED v1.3. The trait lives in `nmcp-schema` so every
 //! provider can see it; the index lives here because the kernel owns dispatch and owns INV-1.
 //!
 //! RC-D6 is the shape: an index from public tool name to the provider that owns the tool, the
@@ -8,13 +8,10 @@
 //! rebuilt on refresh, never walked on dispatch. Duplicate detection falls out of insertion
 //! rather than being a separate pass.
 //!
-//! Nothing in this module is wired into dispatch yet, and that is deliberate rather than
-//! incomplete. `nmcp-router`'s ring still resolves through `ToolProvider::tool_names` and
-//! still consults its own compiled-in policy table, so this PR changes no dispatch decision.
-//! Wiring the ring through [`IndexedToolRegistry`] and [`nmcp_schema::authorize`] is one
-//! atomic change, owner I-047d, because dispatch cannot hand a provider a
-//! `GrantedAuthority` until it produces one and it cannot produce one until it reads the
-//! declaration this index holds.
+//! I-047c landed this index unwired; I-047d put the ring on it. `nmcp-router`'s `Router` holds
+//! an `Arc<dyn ToolRegistry>`, resolves through [`ToolRegistry::resolve`], authorizes against
+//! [`ToolRegistry::authority_of`] and answers `tools/list` from
+//! [`ToolRegistry::list_for`]. The compiled-in policy table the ring used to consult is gone.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -143,7 +140,6 @@ fn build_slice(
     // Read once. RC-9 is the requirement: a provider whose catalogue is remote must not be
     // asked to produce it again on any path that is not `register` or `refresh`.
     let contracts = provider.contracts();
-    let published = published_entries(provider, &provider_id);
 
     let mut claimed: HashMap<String, Arc<IndexEntry>> = HashMap::new();
     let mut tools: Vec<Arc<IndexEntry>> = Vec::with_capacity(contracts.len());
@@ -183,10 +179,22 @@ fn build_slice(
             });
         }
 
+        // RC-21. A first-party tool's annotations are derived from its declared authority by
+        // `to_list_entry`, so one that also published its own would be two sources that can
+        // disagree about one tool. That is the defect RC-A4 exists to make unrepresentable, and
+        // an optional field with no refusal behind it would reintroduce it quietly. Refused
+        // rather than ignored, so the provider author learns it instead of wondering later why
+        // the annotations they wrote never appeared.
+        if provider_id.is_empty() && contract.published_annotations.is_some() {
+            return Err(RegistrationError::PublishedAnnotationsFromFirstParty {
+                name: public_name,
+            });
+        }
+
         let entry = Arc::new(IndexEntry {
             provider: Arc::clone(provider),
             local_name: contract.name.clone(),
-            list_entry: list_entry_for(&provider_id, contract, &public_name, published.as_ref()),
+            list_entry: list_entry_for(&provider_id, contract, &public_name),
             public_name,
             authority: Arc::new(contract.authority.clone()),
             keys,
@@ -249,62 +257,45 @@ fn schema_defines(schema: &Value, arg: &str) -> bool {
         .is_some_and(|properties| properties.contains_key(arg))
 }
 
-/// The entries an upstream published, keyed by local name, or `None` for a first-party
-/// provider whose entries this server derives itself.
-fn published_entries(
-    provider: &Arc<dyn ToolProvider>,
-    provider_id: &str,
-) -> Option<HashMap<String, Value>> {
-    if provider_id.is_empty() {
-        return None;
-    }
-    Some(
-        provider
-            .tool_list()
-            .into_iter()
-            .filter_map(|entry| {
-                let name = entry.get("name").and_then(Value::as_str)?.to_string();
-                Some((name, entry))
-            })
-            .collect(),
-    )
-}
-
 /// The `tools/list` entry for one tool, computed once at registration.
 ///
 /// `ToolContract::to_list_entry` is called for **first-party providers only**. A proxied
-/// upstream is somebody else's software: this server keeps whatever annotations the upstream
-/// published and invents none, which is the existing rule in `nmcp-router`'s merged tool list
-/// and stays the rule (RC-8).
+/// upstream is somebody else's software: this server can vouch for what its own tools do and
+/// cannot vouch for theirs, so it invents no annotation on their behalf (RC-8). That is the
+/// rule `nmcp-router`'s merged tool list has always applied and it stays the rule.
 ///
-/// Named gap, per INV-6. What an upstream published is read from `ToolProvider::tool_list`,
-/// which I-047d deletes, and `ToolContract` has no field for a published annotation. So at
-/// I-047d either the contract grows one or an upstream's annotations are lost. Owner I-047d,
-/// flagged here rather than discovered there. The fallback below is what that world looks
-/// like: name, description and schema, and no annotation invented on somebody else's behalf.
-fn list_entry_for(
-    provider_id: &str,
-    contract: &ToolContract,
-    public_name: &str,
-    published: Option<&HashMap<String, Value>>,
-) -> Value {
+/// An upstream's own annotations reach the catalogue through
+/// [`ToolContract::published_annotations`], emitted verbatim (RC-21). I-047c read them from
+/// `ToolProvider::tool_list`, which section 4.3 deletes; the escalation that raised it produced
+/// NMCP-SPEC-003 v1.3 rather than a deferral, because a channel that only matters once
+/// `nmcp-gateway` lands is exactly the one that gets forgotten between the commit that removes
+/// it and the commit that needs it.
+///
+/// Verbatim is the whole requirement. This server rewrites the name, because the public name is
+/// the one thing it owns, and touches nothing else: not to add `destructiveHint: false`, which
+/// is this product's guarantee about its own tools and not a claim it can make for somebody
+/// else's, and not to derive `readOnlyHint` from the upstream's declared `effect`, which would
+/// be inventing an annotation on its behalf out of data it controls.
+///
+/// The absent case still matters and is still the honest answer: an upstream that published
+/// nothing gets nothing, and its tools reach a client under the MCP defaults. A first-party
+/// tool cannot reach this branch at all, because `build_slice` refuses one that supplies the
+/// field.
+fn list_entry_for(provider_id: &str, contract: &ToolContract, public_name: &str) -> Value {
     if provider_id.is_empty() {
         return contract.to_list_entry(public_name);
     }
-    match published.and_then(|entries| entries.get(&contract.name)) {
-        Some(entry) => {
-            let mut entry = entry.clone();
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("name".into(), json!(public_name));
-            }
-            entry
-        }
-        None => json!({
-            "name": public_name,
-            "description": contract.description,
-            "inputSchema": contract.input_schema,
-        }),
+    let mut entry = json!({
+        "name": public_name,
+        "description": contract.description,
+        "inputSchema": contract.input_schema,
+    });
+    if let Some(published) = contract.published_annotations.clone()
+        && let Some(object) = entry.as_object_mut()
+    {
+        object.insert("annotations".into(), published);
     }
+    entry
 }
 
 /// The tools one caller may reach, when policy restricts that caller to an explicit list.
@@ -507,8 +498,8 @@ mod tests {
     use async_trait::async_trait;
     use nmcp_policy::{Permission, RootRule};
     use nmcp_schema::{
-        CONTRACT_SCHEMA_VERSION, CallContext, CapabilityGrant, ToolCallResult, ToolEffect,
-        ToolReach,
+        CONTRACT_SCHEMA_VERSION, CallContext, CapabilityGrant, GrantedAuthority, ToolCallResult,
+        ToolEffect, ToolReach,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -535,14 +526,16 @@ mod tests {
                 effect: ToolEffect::Observe,
                 reach: ToolReach::Local,
             },
+            // `None` is what every first-party tool carries and the only value a first-party
+            // provider may carry (RC-21). The upstream fixtures below set it explicitly.
+            published_annotations: None,
         }
     }
 
     /// A provider that declares whatever it is told to and counts how often it is asked.
     ///
-    /// It overrides nothing beyond the three methods NMCP-SPEC-003 section 4.3 requires, so
-    /// `tool_names` and `tool_list` come from the trait's default bodies and this fixture also
-    /// exercises them.
+    /// It implements exactly the four methods NMCP-SPEC-003 section 4.3 freezes, which after
+    /// I-047d is the whole trait: the transitional `tool_names` and `tool_list` are gone.
     struct TestProvider {
         id: String,
         version: u32,
@@ -591,37 +584,13 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.declared.read().clone()
         }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
-            ToolCallResult::ok(args)
-        }
-    }
-
-    /// An upstream that publishes its own `tools/list` entries, annotations and all.
-    ///
-    /// This is the shape the gateway's `UpstreamProvider` has: the entries are somebody else's
-    /// JSON, read off a remote server, and the contracts are what this workspace derived from
-    /// them.
-    struct PublishingProvider {
-        id: String,
-        declared: Vec<ToolContract>,
-        published: Vec<Value>,
-    }
-
-    #[async_trait]
-    impl ToolProvider for PublishingProvider {
-        fn contract_version(&self) -> u32 {
-            CONTRACT_SCHEMA_VERSION
-        }
-        fn provider_id(&self) -> &str {
-            &self.id
-        }
-        fn contracts(&self) -> Vec<ToolContract> {
-            self.declared.clone()
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            self.published.clone()
-        }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(args)
         }
     }
@@ -882,9 +851,8 @@ mod tests {
     }
 
     /// The same property for an upstream, whose `contracts()` is the expensive one because it
-    /// reads a cache filled from a remote server. The count after registration is not pinned,
-    /// because a provider taking the default `tool_list` body legitimately enumerates twice
-    /// while that method still exists; what is pinned is that no amount of resolving moves it.
+    /// reads a cache filled from a remote server. What is pinned is that no amount of resolving
+    /// moves the count.
     #[test]
     fn resolving_an_upstream_tool_never_re_reads_its_catalogue() {
         let registry = registry();
@@ -893,6 +861,12 @@ mod tests {
             .register(Arc::clone(&provider) as Arc<dyn ToolProvider>)
             .expect("register");
         let after_registration = provider.reads();
+        // Pinned at I-047d rather than left open. This used to read "not pinned, because a
+        // provider taking the default `tool_list` body legitimately enumerates twice while that
+        // method still exists"; the method is gone, so an upstream's expensive catalogue read
+        // happens exactly once per registration like anybody else's. Additive: the assertion
+        // below is unchanged.
+        assert_eq!(after_registration, 1);
 
         for _ in 0..10_000 {
             assert!(registry.resolve("gateway_ping").is_some());
@@ -1344,57 +1318,139 @@ mod tests {
         assert_eq!(entry["annotations"]["destructiveHint"], false);
     }
 
-    /// An upstream keeps whatever annotations it published and gets none invented for it,
-    /// which is the existing rule in the router's merged tool list and stays the rule (RC-8).
-    /// Only the name is rewritten, because that is the one thing this server owns.
+    /// RC-21, first direction. An upstream's published annotations survive verbatim into
+    /// `tools/list`, and only the name is rewritten.
+    ///
+    /// Why it matters, stated rather than assumed: without the passthrough an upstream tool
+    /// lists with no annotations at all, and the MCP defaults for `destructiveHint` and
+    /// `openWorldHint` are both true. Every proxied tool would then be advertised to every
+    /// client as destructive and network-reaching, including a read-only one whose own server
+    /// took the trouble to say so. That is the failure `nmcp_proto::tool_annotations` was
+    /// written against in the first place, reappearing on the other side of the boundary.
+    ///
+    /// Verbatim means verbatim. The entry keeps a hint this server would never emit
+    /// (`readOnlyHint: false` alongside no `destructiveHint`), keeps a key this workspace has
+    /// no notion of (`title`), and gains nothing: not `destructiveHint: false`, which is this
+    /// product's guarantee about its own tools and not a claim it can make for somebody
+    /// else's.
     #[test]
     fn an_upstream_entry_passes_through_what_the_upstream_published() {
         let registry = registry();
+        let mut declared = contract("ping", None);
+        declared.published_annotations = Some(json!({
+            "readOnlyHint": false,
+            "openWorldHint": true,
+            "title": "Ping",
+        }));
         registry
-            .register(Arc::new(PublishingProvider {
-                id: "up".to_string(),
-                declared: vec![contract("ping", None)],
-                published: vec![json!({
-                    "name": "ping",
-                    "description": "somebody else's description",
-                    "inputSchema": {"type": "object"},
-                    "annotations": {"readOnlyHint": false, "title": "Ping"},
-                })],
-            }))
+            .register(TestProvider::new("up", vec![declared]))
             .expect("register");
 
         let listed = registry.list_for(&CatalogView::default());
         assert_eq!(listed.len(), 1);
         let entry = &listed[0];
         assert_eq!(entry["name"], "up_ping", "only the name is rewritten");
-        assert_eq!(entry["description"], "somebody else's description");
-        assert_eq!(entry["annotations"]["title"], "Ping");
+        assert_eq!(entry["description"], "ping description");
         assert_eq!(entry["annotations"]["readOnlyHint"], false);
+        assert_eq!(entry["annotations"]["openWorldHint"], true);
+        assert_eq!(entry["annotations"]["title"], "Ping");
         assert!(
             entry["annotations"].get("destructiveHint").is_none(),
-            "this server invents no annotation on somebody else's behalf"
+            "this server invents no annotation on somebody else's behalf, not even the one it \
+             guarantees about its own tools"
         );
     }
 
-    /// An upstream that published no annotations gets none. The other half of the rule above,
-    /// separated because an implementation that fell back to `to_list_entry` would pass that
-    /// one and fail this.
+    /// RC-21, second direction. A first-party provider supplying published annotations is
+    /// refused at registration, and the refusal is the point rather than tidiness.
+    ///
+    /// First-party annotations are derived from the declared authority by `to_list_entry`, so a
+    /// first-party tool carrying its own would be two sources that can disagree about one tool.
+    /// That is exactly the defect RC-A4 exists to make unrepresentable, and an optional field
+    /// with no refusal behind it would reintroduce it quietly: the annotations would simply be
+    /// ignored, and whoever wrote them would find out from a client rather than from the
+    /// registry. All-or-nothing applies as it does to every other refusal, so the provider's
+    /// other tools do not register either.
+    #[test]
+    fn a_first_party_provider_may_not_supply_published_annotations() {
+        let registry = registry();
+        let mut declared = contract("echo", None);
+        declared.published_annotations = Some(json!({"readOnlyHint": true}));
+
+        let refused = registry
+            .register(TestProvider::new(
+                "",
+                vec![contract("first", None), declared, contract("last", None)],
+            ))
+            .expect_err("a first-party tool may not publish its own annotations");
+        match &refused {
+            RegistrationError::PublishedAnnotationsFromFirstParty { name } => {
+                assert_eq!(
+                    name, "echo",
+                    "the refusal names the tool an author has to fix"
+                );
+            }
+            other => panic!("expected PublishedAnnotationsFromFirstParty, got {other:?}"),
+        }
+        assert!(
+            refused
+                .to_string()
+                .contains("only a proxied upstream may carry"),
+            "the message must say who may carry it: {refused}"
+        );
+        assert!(
+            registry.is_empty(),
+            "all or nothing: the valid tools either side of it registered nothing"
+        );
+
+        // The same declaration under a non-empty provider id is fine, which is what makes the
+        // refusal about provenance rather than about the field.
+        registry
+            .register(TestProvider::new("up", vec![declared_upstream()]))
+            .expect("an upstream may carry what its own server published");
+        assert_eq!(
+            registry.list_for(&CatalogView::default())[0]["annotations"]["readOnlyHint"],
+            true
+        );
+    }
+
+    /// The contract for that last step, kept out of the test body so the two halves read as one
+    /// declaration differing only in who registers it.
+    fn declared_upstream() -> ToolContract {
+        let mut declared = contract("echo", None);
+        declared.published_annotations = Some(json!({"readOnlyHint": true}));
+        declared
+    }
+
+    /// An upstream that published nothing gets nothing, which is the honest answer rather than
+    /// a convenient one. Separated from the passthrough above because an implementation that
+    /// fell back to `to_list_entry` for a missing field would pass that test and fail this, and
+    /// it would do so by asserting this product's no-destructive-action guarantee about
+    /// somebody else's software.
     #[test]
     fn an_upstream_that_published_no_annotations_is_given_none() {
         let registry = registry();
+        let mut declared = contract("ping", None);
+        // Declared read-only and local, which for a first-party tool would emit two hints and
+        // the guarantee. For an upstream it emits none: the declaration came off a remote
+        // server and is untrusted input (RC-D4), so it is used to authorize and never to
+        // advertise.
+        declared.authority.effect = ToolEffect::Observe;
+        declared.authority.reach = ToolReach::Local;
+        assert!(declared.published_annotations.is_none());
         registry
-            .register(Arc::new(PublishingProvider {
-                id: "up".to_string(),
-                declared: vec![contract("ping", None)],
-                published: vec![json!({
-                    "name": "ping",
-                    "description": "bare",
-                    "inputSchema": {"type": "object"},
-                })],
-            }))
+            .register(TestProvider::new("up", vec![declared]))
             .expect("register");
+
         let listed = registry.list_for(&CatalogView::default());
-        assert!(listed[0].get("annotations").is_none());
+        assert_eq!(listed.len(), 1);
+        let entry = &listed[0];
+        assert_eq!(entry["name"], "up_ping", "the public name is this server's");
+        assert_eq!(entry["description"], "ping description");
+        assert!(
+            entry.get("annotations").is_none(),
+            "this server invents no annotation on somebody else's behalf"
+        );
     }
 
     /// G6-8. A session scoped to a gateway profile sees the upstreams that profile names and

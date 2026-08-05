@@ -34,4 +34,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# The registry `Router` dispatches through, for the three tests that drive a real ring
+# end to end. Test-only: NMCP-SPEC-003 RC-D1 puts the index in `nmcp-host`, and this crate's
+# production code depends on `nmcp-router` and `nmcp-schema` and not on the kernel (RC-12).
+nmcp-host = { path = "../nmcp-host", version = "0.1.0" }
 nmcp-memory = { path = "../nmcp-memory", version = "0.1.0" }

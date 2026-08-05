@@ -26,10 +26,3 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
-# Test-only, and only for the one test that grades this provider's declared authority against
-# the kernel tables NMCP-SPEC-003 RC-D3 makes derived: `READ_ONLY_TOOLS` and
-# `OPEN_WORLD_TOOLS` live here. Deleted with those tables at I-047d. RC-12 is unaffected: it
-# forbids a provider crate depending on `nmcp-host`, which this is not.
-nmcp-proto = { path = "../nmcp-proto", version = "0.1.0" }

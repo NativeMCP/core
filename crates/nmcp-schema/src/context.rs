@@ -7,18 +7,20 @@
 //!
 //! `CallContext` takes exactly the two changes 4.3 requires and no others: `matched_root`
 //! becomes private with a reader, and a private `secrets` field appears with a reader.
-//! `ToolCallResult` is unchanged. `ToolProvider` itself does not move here in I-047b and
-//! neither does dispatch: 4.3 changes `call` to take a `&GrantedAuthority` and replaces
-//! `tool_names`/`tool_list` with `contracts`, and those three changes are one atomic unit,
-//! because a provider cannot be handed a [`GrantedAuthority`](crate::GrantedAuthority)
-//! until dispatch produces one, dispatch cannot produce one until it calls
-//! [`authorize`](crate::authorize), and `authorize` needs the declaration only `contracts`
-//! supplies. Named gap per INV-6, owner I-047c.
+//! `ToolCallResult` is unchanged.
+//!
+//! I-047d closed the last of it. The builder that set `matched_root` took an
+//! `Option<RootRule>`, so the privacy stopped anything from *assigning* the resolved root
+//! without stopping anything from *deciding* it. [`CallContext::with_granted`] now takes the
+//! [`GrantedAuthority`](crate::GrantedAuthority) that resolved it, and that token has no
+//! constructor outside [`authorize`](crate::authorize), so the resolved root a provider reads
+//! and the proof it was resolved are the same object.
 
 use nmcp_policy::RootRule;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::authority::GrantedAuthority;
 use crate::scope::MemoryScope;
 use crate::secrets::ResolvedSecrets;
 
@@ -39,11 +41,11 @@ pub struct CallContext {
     /// `None` for tools that don't operate on a filesystem path.
     ///
     /// Private, read through [`CallContext::matched_root`], and set only by
-    /// [`CallContext::with_root`]. NMCP-SPEC-003 section 4.3 requires the privacy: the
-    /// field is `pub` in the base, so anything holding a `CallContext` can set the resolved
-    /// root, and once `ToolProvider::call` takes a `&GrantedAuthority` that token would
-    /// prove only that root resolution happened while the caller of `call` remained free to
-    /// fabricate what it resolved to.
+    /// [`CallContext::with_granted`]. NMCP-SPEC-003 section 4.3 requires the privacy: the
+    /// field is `pub` in the base, so anything holding a `CallContext` could set the resolved
+    /// root, and `ToolProvider::call`'s `&GrantedAuthority` would then prove only that root
+    /// resolution happened while the caller of `call` remained free to fabricate what it
+    /// resolved to. The one setter takes that proof, so the two cannot disagree.
     matched_root: Option<RootRule>,
     /// For proxied (gateway) calls: the upstream ID this will be forwarded to.
     /// `None` for local providers.
@@ -142,23 +144,30 @@ impl CallContext {
         self
     }
 
-    /// Resolve the memory scope from the matched root, falling back to session.
+    /// Carry the root an authorization resolved, and scope memory to it.
     ///
-    /// The only setter for `matched_root`, and a waypoint rather than the destination. What
-    /// the privacy buys today is narrow and worth stating plainly: the field can be set by
-    /// one named method in this crate instead of by an assignment anywhere, so the setting
-    /// is greppable and the reader is the only way back out. The kernel still resolves the
-    /// root itself and still hands the answer in here. I-047c replaces this builder with
-    /// construction from a [`GrantedAuthority`](crate::GrantedAuthority), at which point a
-    /// resolved root reaches a context only as a consequence of an authorization having
-    /// happened, which is the property RC-A2 is actually after. Until then, do not read the
-    /// privacy as more than it is.
+    /// The only setter for `matched_root`, and it takes the proof rather than the answer.
+    /// I-047b left a `with_root(Option<RootRule>)` builder here and said plainly that the
+    /// privacy bought little on its own: the kernel resolved the root itself and handed the
+    /// answer in, so anything that could build a `RootRule` could still decide what this call
+    /// had resolved to. I-047d closes that. The only way to obtain a
+    /// [`GrantedAuthority`](crate::GrantedAuthority) is [`authorize`](crate::authorize)
+    /// returning `Ok`, so a resolved root now reaches a context only as a consequence of an
+    /// authorization having happened, which is the property RC-A2 is actually after.
+    ///
+    /// A borrow rather than an owned token, because the ring hands the same proof to
+    /// `ToolProvider::call` afterwards and there is exactly one of it per call.
+    ///
+    /// Both halves of the old builder are kept: the root is recorded, and the memory scope
+    /// follows it, falling back to whatever the session set when no root was resolved.
     #[must_use]
-    pub fn with_root(mut self, root: Option<RootRule>) -> Self {
-        if let Some(ref r) = root {
-            self.memory_scope = MemoryScope::root(&r.id);
+    pub fn with_granted(mut self, granted: &GrantedAuthority) -> Self {
+        if let Some(root) = granted.matched_root() {
+            self.memory_scope = MemoryScope::root(&root.id);
+            self.matched_root = Some(root.clone());
+        } else {
+            self.matched_root = None;
         }
-        self.matched_root = root;
         self
     }
 
@@ -296,9 +305,10 @@ mod tests {
         clippy::panic
     )]
     use super::CallContext;
+    use crate::authority::{HeldAuthority, ToolAuthority, ToolEffect, ToolReach, authorize};
     use nmcp_policy::{Permission, RootRule};
+    use serde_json::json;
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
 
     /// G3-11 RS-11. A caller's token must never reach an upstream, and here it cannot,
     /// because there is no field for one to travel in. `CallContext` is everything a
@@ -344,7 +354,12 @@ mod tests {
 
     /// The reader is the whole of the new surface, so it is worth pinning that it reports
     /// what the one setter set and that the memory scope still follows the root. Both halves
-    /// of `with_root` are behaviour `nmcp-router` depends on and neither changed in the move.
+    /// of the old `with_root` are behaviour `nmcp-router` depends on and neither changed when
+    /// the setter started taking the proof instead of the answer.
+    ///
+    /// Only the setup moved: the root now arrives through an [`authorize`] that resolved it,
+    /// because I-047d deleted the builder that took a bare `RootRule`. The two assertions are
+    /// the ones this test has always made.
     #[test]
     fn the_reader_reports_the_root_the_only_setter_set() {
         let ctx = CallContext::new(Some("sess".to_string()));
@@ -353,12 +368,56 @@ mod tests {
 
         let root = RootRule {
             id: "docs".to_string(),
-            path: PathBuf::from("/tmp"),
+            path: std::env::temp_dir().join("nmcp-context-root"),
             permissions: BTreeSet::from([Permission::Read]),
         };
-        let ctx = ctx.with_root(Some(root));
+        let granted = authorize(
+            &ToolAuthority {
+                permission: Some(Permission::Read),
+                path_args: vec!["path".to_string()],
+                grants: Vec::new(),
+                effect: ToolEffect::Observe,
+                reach: ToolReach::Local,
+            },
+            &HeldAuthority {
+                roots: vec![root.clone()],
+                grants: BTreeSet::new(),
+                agent_id: None,
+            },
+            &json!({ "path": root.path.join("file.txt").display().to_string() }),
+        )
+        .expect("a read inside a read root authorizes");
+
+        let ctx = ctx.with_granted(&granted);
         assert_eq!(ctx.matched_root().map(|r| r.id.as_str()), Some("docs"));
         assert_eq!(ctx.memory_scope.to_string(), "root:docs");
+    }
+
+    /// The other half of the setter: an authorization that resolved no root leaves the context
+    /// carrying none, and leaves the session scope alone. That is the shape every tool with no
+    /// declared path argument takes, which is most of the memory and execution surface.
+    #[test]
+    fn an_authorization_that_resolved_no_root_carries_none() {
+        let granted = authorize(
+            &ToolAuthority {
+                permission: None,
+                path_args: Vec::new(),
+                grants: Vec::new(),
+                effect: ToolEffect::Observe,
+                reach: ToolReach::Local,
+            },
+            &HeldAuthority {
+                roots: Vec::new(),
+                grants: BTreeSet::new(),
+                agent_id: None,
+            },
+            &json!({}),
+        )
+        .expect("a tool needing no root-scoped authority authorizes holding nothing");
+
+        let ctx = CallContext::new(Some("sess".to_string())).with_granted(&granted);
+        assert!(ctx.matched_root().is_none());
+        assert_eq!(ctx.memory_scope.to_string(), "session:sess");
     }
 
     /// Every call carries an empty `ResolvedSecrets`, and the accessor is a borrow. The

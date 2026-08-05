@@ -1,13 +1,20 @@
 //! DEV Tier 3 developer workflow tools: git ops, test runner, dep graph.
 //!
-//! Implements [`nmcp_router::ToolProvider`] for the dev.* tool namespace.
-//! Every tool performs provider-local policy checks in addition to router enforcement.
+//! Implements [`nmcp_schema::ToolProvider`] for the dev.* tool namespace.
+//!
+//! No tool here performs a policy check. It did until I-047d, and the contract always
+//! forbade it; what changed is that the ring stopped needing it. NMCP-SPEC-003 RC-20 records
+//! why the two facts had to be separated in time: the kernel authorized against a compiled-in
+//! list of path-argument names these tools' schemas do not define, so the check was load
+//! bearing while the contract said it should not exist. The ring now authorizes the
+//! schema-filtered declaration, which is the same argument these tools read.
 
 use async_trait::async_trait;
 use nmcp_policy::{Permission, PolicyConfig};
 use nmcp_router::ToolProvider;
 use nmcp_schema::{
-    CallContext, ToolAuthority, ToolCallResult, ToolContract, ToolEffect, ToolReach,
+    CallContext, GrantedAuthority, ToolAuthority, ToolCallResult, ToolContract, ToolEffect,
+    ToolReach,
 };
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -37,31 +44,6 @@ fn reject_dev_delete_intent(args_str: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn check_provider_permission(
-    policy: &PolicyConfig,
-    permission: Permission,
-    path: &str,
-) -> Option<ToolCallResult> {
-    match policy.require(permission, path) {
-        Ok(_) => None,
-        Err(err) => Some(ToolCallResult::err_with_metadata(
-            format!("Policy denied: {err}"),
-            "policy_denied",
-            Some("Use a path covered by a policy root with the required permission."),
-        )),
-    }
-}
-
-fn dev_tool_permission(name: &str) -> Option<Permission> {
-    match name {
-        "dev.git_log" | "dev.git_blame" | "dev.git_diff" | "dev.git_stash_list" => {
-            Some(Permission::Read)
-        }
-        "dev.test_run" | "dev.dep_graph" => Some(Permission::Execute),
-        _ => None,
-    }
 }
 
 fn truncate(s: String, max: usize) -> (String, bool) {
@@ -486,6 +468,21 @@ fn dep_graph(args: &Value) -> ToolCallResult {
     }))
 }
 
+/// The one policy check this crate keeps, and the reason it is not the one I-047d deleted.
+///
+/// `DevToolsProvider::call` used to re-check the ring's own decision on the ring's own
+/// argument, which is what the `ToolProvider` contract forbids and what RC-20 made safe to
+/// remove. This is a different question. `git_publish` runs `git rev-parse --show-toplevel`
+/// and publishes from the **repository root**, which is discovered at run time by executing
+/// git and is routinely an ancestor of the `path` the caller sent. The ring cannot authorize
+/// it: it is not an argument, so no `path_args` entry can name it and no declaration can
+/// express it. A worktree path inside a governed root whose toplevel sits outside one is an
+/// outbound publish from ungoverned bytes, and this is what refuses it.
+///
+/// The call on `path` before it is a duplicate of what the ring now decides, and it is kept
+/// rather than trimmed because `git_publish` takes a `&PolicyConfig` and a future caller
+/// reaching it by another route would otherwise get the toplevel check and not the argument
+/// check, which is the harder half to notice missing.
 fn check_git_publish_permission(policy: &PolicyConfig, path: &str) -> Option<ToolCallResult> {
     match policy.require(Permission::GitPublish, path) {
         Ok(_) => None,
@@ -772,27 +769,31 @@ impl DevToolsProvider {
 /// What a dev tool needs in order to run, declared rather than looked up.
 ///
 /// NMCP-SPEC-003 RC-D3: the descriptor carries its own governance metadata, and the five
-/// tables the kernel used to consult become derived rather than authoritative. Every value
-/// here is derived from what the kernel says about this tool **today**, and the derivation is
-/// graded rather than eyeballed: `declared_authority_matches_the_kernel_tables_it_replaces`
-/// reads `nmcp_router::tool_policy_spec`, `nmcp_proto::READ_ONLY_TOOLS` and
-/// `nmcp_proto::OPEN_WORLD_TOOLS` and asserts the correspondence tool by tool. That test and
-/// those tables are deleted together at I-047d, once dispatch reads the declaration instead.
+/// tables the kernel used to consult become derived rather than authoritative. I-047c derived
+/// every value here from what the kernel said about this tool then, and graded the derivation
+/// tool by tool against `nmcp_router::tool_policy_spec`, `nmcp_proto::READ_ONLY_TOOLS` and
+/// `nmcp_proto::OPEN_WORLD_TOOLS`. I-047d deleted those tables, so that grading moved to where
+/// the tables now live: the whole of `tool_policy_spec` is captured as test data in
+/// `nmcp-router`'s `authorize_agrees_with_the_deleted_table_except_where_the_contract_says_otherwise`,
+/// which grades the new authorization path against it in both directions, and the annotation
+/// half is unrepresentable rather than checked, because `readOnlyHint` and `openWorldHint` are
+/// now read off the two fields below (RC-A4).
 ///
 /// Two derivations are worth stating because they are not identity mappings.
 ///
 /// `permission` is `tool_policy_spec`'s permission unchanged. `path_args` is that spec's
 /// `path_args` **filtered to the names this tool's own input schema defines**, which is
-/// `["path"]` for all seven: the kernel's `PATH_ARG_REPO` and `PATH_ARG_DEV` lists are shared
-/// across tool families and name arguments such as `repo_path` and `cwd` that no dev tool
+/// `["path"]` for all seven: the kernel's `PATH_ARG_REPO` and `PATH_ARG_DEV` lists were shared
+/// across tool families and named arguments such as `repo_path` and `cwd` that no dev tool
 /// accepts. The filter is required by RC-D5, which refuses a declared path argument the
-/// schema cannot receive, and it is a narrowing in the safe direction: under the kernel table
-/// a caller passing `repo` resolved the root from `repo` while `git_log` read `path`, so the
-/// root that was authorized and the path that was used could differ. Declaring `path` alone
-/// makes them the same argument.
+/// schema cannot receive, and RC-20 makes it load-bearing rather than hygienic: under the
+/// kernel table a caller passing `repo` resolved the root from `repo` while `git_log` read
+/// `path`, so the root that was authorized and the path that was used could differ. Declaring
+/// `path` alone makes them the same argument, which is what let this provider's own policy
+/// re-check be deleted. `the_ring_authorizes_the_argument_the_provider_reads` is that proof.
 ///
-/// `grants` is empty for every dev tool because `require_windows_api` is false for every one
-/// of them, which the fidelity test asserts rather than assumes.
+/// `grants` is empty for every dev tool because `require_windows_api` was false for every one
+/// of them in the table this replaces.
 fn dev_tool_authority(name: &str) -> ToolAuthority {
     // Exhaustive over the seven tools this provider declares, with no wildcard arm. A tool
     // added to `contracts` without a line here does not compile, which is the point: an
@@ -854,12 +855,11 @@ impl ToolProvider for DevToolsProvider {
 
     /// The seven tools this provider owns, fully declared.
     ///
-    /// Replaces the `tool_names` and `tool_list` pair this impl carried, which had to agree
-    /// and were never checked against each other. Both still exist on the trait and both are
-    /// now derived from here by the default bodies, so the name list and the advertised
-    /// entries cannot disagree; I-047d deletes them. `provider_advertises_the_same_entries_it_always_did`
-    /// asserts the derived `tool_list` is byte-identical to what this impl published before,
-    /// annotations included.
+    /// Replaces the `tool_names` and `tool_list` pair this impl carried, which had to agree and
+    /// were never checked against each other. I-047c derived both from here through the trait's
+    /// default bodies; I-047d deleted them, so this is the only place a dev tool is described
+    /// and there is nothing left for it to disagree with. The registry derives the public name
+    /// and the `tools/list` entry from what is returned here.
     fn contracts(&self) -> Vec<ToolContract> {
         dev_tool_descriptors()
             .into_iter()
@@ -876,6 +876,12 @@ impl ToolProvider for DevToolsProvider {
                     .to_string();
                 ToolContract {
                     authority: dev_tool_authority(&name),
+                    // RC-21: `None`, and it has to be. This provider is first party, so its
+                    // annotations are derived from the authority above by `to_list_entry` and a
+                    // second source that could disagree with the first is the defect RC-A4
+                    // makes unrepresentable. The registry refuses a first-party provider that
+                    // sets this, so the rule is enforced rather than remembered.
+                    published_annotations: None,
                     description: entry
                         .get("description")
                         .and_then(Value::as_str)
@@ -891,25 +897,35 @@ impl ToolProvider for DevToolsProvider {
             .collect()
     }
 
-    async fn call(&self, name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
-        // Defense-in-depth provider policy check for the governed path.
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-
+    async fn call(
+        &self,
+        name: &str,
+        args: Value,
+        _ctx: &CallContext,
+        _granted: &GrantedAuthority,
+    ) -> ToolCallResult {
+        // No policy check here, and its absence is the point rather than an omission.
+        //
+        // This impl used to re-check `policy.require` on `args["path"]` and call it
+        // defense in depth. It was not: it was the only thing standing between the kernel's
+        // mismatched path-argument table and a confused deputy, and it is exactly the check
+        // the `ToolProvider` contract forbids a provider to write. NMCP-SPEC-003 v1.2 RC-20
+        // made the sequencing explicit, and it is the sequencing that made the deletion safe:
+        // the ring now authorizes on `path_args`, filtered by RC-D5 to the arguments this
+        // tool's own schema defines, which is `["path"]` for all seven, so the argument the
+        // kernel authorizes and the argument the handlers below read are the same argument.
+        // `the_ring_authorizes_the_argument_the_provider_reads` is that proof and it was
+        // landed and passing before this block was removed.
+        //
+        // The `path.is_empty()` refusal went with it and nothing changed for a caller: every
+        // handler below returns the identical "missing required arg: path" when it is absent,
+        // and the ring refuses the call as `Denial::MissingPathArgument` before reaching here.
+        //
+        // The policy handle stays because `git_publish` reads it for the remote, branch and
+        // dry-run rules the declaration does not model. That is not an authorization check;
+        // `authorize` has already required `git.publish` on the resolved root by the time this
+        // line runs.
         let policy = self.policy.read().clone();
-        if name != "dev.git_publish" {
-            if path.is_empty() {
-                return ToolCallResult::err("missing required arg: path");
-            }
-            if let Some(permission) = dev_tool_permission(name)
-                && let Some(denied) = check_provider_permission(&policy, permission, &path)
-            {
-                return denied;
-            }
-        }
 
         let name = name.to_string();
         tokio::task::spawn_blocking(move || match name.as_str() {
@@ -1067,10 +1083,12 @@ mod tests {
         assert!(call_block.contains("devtools worker failed"));
     }
 
+    /// The seven names, read off `contracts` now that `tool_names` is deleted. Setup only:
+    /// every assertion below is the one this test has always made.
     #[test]
     fn provider_tool_names_complete() {
         let p = make_provider();
-        let names = p.tool_names();
+        let names: Vec<String> = p.contracts().into_iter().map(|c| c.name).collect();
         assert_eq!(names.len(), 7);
         assert!(names.contains(&"dev.git_log".to_string()));
         assert!(names.contains(&"dev.git_blame".to_string()));
@@ -1081,126 +1099,169 @@ mod tests {
         assert!(names.contains(&"dev.git_publish".to_string()));
     }
 
-    /// The proof that the migration is faithful, rather than the claim that it is.
+    /// RC-20, and the proof NMCP-SPEC-003 v1.2 requires **before** the defense-in-depth
+    /// policy re-check in `DevToolsProvider::call` may be deleted.
     ///
-    /// NMCP-SPEC-003 RC-D3 makes `tool_policy_spec`, `READ_ONLY_TOOLS` and `OPEN_WORLD_TOOLS`
-    /// derived rather than authoritative, and this provider is the first one to declare what
-    /// those tables used to say about it. A derivation nobody checked is a migration nobody
-    /// can trust, so every field of every declared [`ToolAuthority`] is graded here against
-    /// the table it replaces, tool by tool, with no tool exempt.
+    /// The finding it exists for: the kernel's `tool_policy_spec` gave the dev tools
+    /// `PATH_ARG_REPO = ["repo", "repo_path", "repository", "repository_path", "path"]` and
+    /// `PATH_ARG_DEV = ["path", "repo", "repo_path", "cwd"]`, `matched_root_for_call` took the
+    /// first of those present in the arguments, and every one of these tools reads `path`. So a
+    /// call carrying `{"repo": <readable>, "path": <not readable>}` had its root resolved from
+    /// `repo` while the effect ran on `path`: a confused deputy in the enforcement path itself.
+    /// What prevented it was this provider re-checking policy on `args["path"]`, which is
+    /// precisely the check the `ToolProvider` contract tells providers not to write.
     ///
-    /// `path_args` is the one field that is not an identity mapping, and the assertion below
-    /// states the rule exactly rather than pinning the answer: the declaration must be the
-    /// kernel's list **filtered to the arguments this tool's own schema defines**, in the
-    /// kernel's order. RC-D5 forces the filter, because a declared path argument the schema
-    /// cannot receive is a registration error. It is a narrowing and never a widening: the
-    /// declaration is a subsequence of the kernel's list, so no argument the kernel would not
-    /// have tried can resolve a root here.
+    /// Three claims, in the order the sequencing constraint requires them.
     ///
-    /// This test is deleted at I-047d together with the tables it reads.
+    /// 1. Every tool this provider owns reads `args["path"]`, and none of them reads any other
+    ///    argument the kernel table would have resolved a root from. Read out of this file's
+    ///    own production source, so a tool that started reading `repo` fails here rather than
+    ///    quietly reopening the gap.
+    /// 2. Every declared path argument is a property of that tool's own input schema. RC-5
+    ///    refuses the alternative at registration; asserting it here puts the reason next to the
+    ///    declaration.
+    /// 3. The root the ring resolves comes from that same argument. Given the exact call the
+    ///    deleted table authorized, `nmcp_schema::authorize` refuses and names `path`; given the
+    ///    mirror image it resolves the root containing `path`.
+    ///
+    /// Together those three are what make removing the provider-side check safe rather than
+    /// merely tidy: the set the kernel authorizes on and the set the tool reads are the same
+    /// set, so the composed behaviour with the check removed is the composed behaviour with it
+    /// present. This test was landed and passing with that check still in the file, and the
+    /// check was deleted only afterwards.
+    // Three claims about one property, and separating them into three tests would let two of
+    // them pass while the third was deleted.
+    #[allow(clippy::too_many_lines)]
     #[test]
-    fn declared_authority_matches_the_kernel_tables_it_replaces() {
+    fn the_ring_authorizes_the_argument_the_provider_reads() {
+        use nmcp_schema::{CapabilityGrant, Denial, HeldAuthority, authorize};
+        use std::collections::BTreeSet;
+
+        // - Claim 1: what the handlers read -
+        let source = include_str!("lib.rs");
+        let production = &source[..source.find("mod tests").expect("tests module")];
+        // Every argument the deleted kernel table would have resolved a root from, other than
+        // the one these tools actually read.
+        for never_read in ["repo", "repo_path", "repository", "repository_path", "cwd"] {
+            assert!(
+                !production.contains(&format!("args.get(\"{never_read}\")")),
+                "a dev tool reads {never_read}, which the declaration does not authorize"
+            );
+        }
+        for handler in [
+            "fn git_log(",
+            "fn git_blame(",
+            "fn git_diff(",
+            "fn test_run(",
+            "fn dep_graph(",
+            "fn git_stash_list(",
+            "fn git_publish(",
+        ] {
+            let start = production
+                .find(handler)
+                .unwrap_or_else(|| panic!("{handler} is defined in this file"));
+            let body = &production[start..];
+            // Bounded by the next top-level item rather than by this one's closing brace: a
+            // literal closing brace in this file's source unbalances `scripts/inv1_scan.py`,
+            // which tracks `#[cfg(test)]` by counting braces and would then read the rest of
+            // this module as production code.
+            let end = body
+                .get(1..)
+                .and_then(|rest| rest.find("\nfn "))
+                .map_or(body.len(), |offset| offset + 1);
+            assert!(
+                body.get(..end)
+                    .is_some_and(|body| body.contains("args.get(\"path\")")),
+                "{handler} does not read the argument the ring authorizes"
+            );
+        }
+
+        // - Claim 2: every declared path argument is a property of the tool's own schema -
         let provider = make_provider();
         let contracts = provider.contracts();
-        assert_eq!(contracts.len(), 7, "every dev tool must be declared");
-
-        for contract in contracts {
-            let public = nmcp_schema::public_tool_name("", &contract.name);
-            let spec = nmcp_router::tool_policy_spec(&public)
-                .unwrap_or_else(|| panic!("{public} has no kernel policy spec to grade against"));
-            let declared = &contract.authority;
-
+        assert_eq!(contracts.len(), 7);
+        for contract in &contracts {
             assert_eq!(
-                declared.permission,
-                Some(spec.permission),
-                "{public}: declared permission must be the one the ring requires today"
+                contract.authority.path_args,
+                vec!["path".to_string()],
+                "{}: the declaration must name the argument the tool reads and no other",
+                contract.name
             );
-
-            // The kernel's list, keeping only what this tool's schema can actually receive.
-            let expected: Vec<String> = spec
-                .path_args
-                .iter()
-                .filter(|arg| {
+            for arg in &contract.authority.path_args {
+                assert!(
                     contract
                         .input_schema
                         .get("properties")
                         .and_then(Value::as_object)
-                        .is_some_and(|properties| properties.contains_key(**arg))
-                })
-                .map(|arg| (*arg).to_string())
-                .collect();
-            assert_eq!(
-                declared.path_args, expected,
-                "{public}: declared path arguments must be the kernel's list filtered to the \
-                 schema, in the kernel's order"
-            );
-            assert!(
-                declared
-                    .path_args
-                    .iter()
-                    .all(|arg| spec.path_args.contains(&arg.as_str())),
-                "{public}: the declaration must never add a path argument the kernel would not \
-                 have tried"
-            );
-            assert!(
-                !declared.path_args.is_empty(),
-                "{public}: dropping every path argument would stop resolving a root at all"
-            );
-
-            // `require_windows_api` is the only grant the kernel table can demand, and no dev
-            // tool demands it. Asserted rather than assumed, so a table edit that made one
-            // Windows-gated would fail here instead of silently dropping the gate.
-            assert!(
-                !spec.require_windows_api,
-                "{public}: the kernel demands win.api, which the declaration does not carry"
-            );
-            assert!(
-                declared.grants.is_empty(),
-                "{public}: declared a grant the kernel table never required"
-            );
-
-            assert_eq!(
-                declared.effect == ToolEffect::Observe,
-                nmcp_proto::READ_ONLY_TOOLS.contains(&public.as_str()),
-                "{public}: declared effect disagrees with READ_ONLY_TOOLS"
-            );
-            assert_eq!(
-                declared.reach == ToolReach::Remote,
-                nmcp_proto::OPEN_WORLD_TOOLS.contains(&public.as_str()),
-                "{public}: declared reach disagrees with OPEN_WORLD_TOOLS"
-            );
+                        .is_some_and(|properties| properties.contains_key(arg)),
+                    "{}: declared path argument {arg} is not a property of its own schema",
+                    contract.name
+                );
+            }
         }
-    }
 
-    /// The declaration replaced two methods without changing a byte this provider publishes.
-    ///
-    /// `tool_names` and `tool_list` now come from the trait's default bodies, derived from
-    /// `contracts`. This asserts the derived entries carry the same names, descriptions and
-    /// schemas the impl used to return literally, and that the annotations the derivation adds
-    /// are the ones `nmcp_proto::tool_annotations` would have added downstream. Both halves
-    /// matter: the first is that nothing was lost, the second is that the router's annotation
-    /// step, which only fires when an entry carries none, now has nothing left to add and
-    /// would have added the same thing.
-    #[test]
-    fn provider_advertises_the_same_entries_it_always_did() {
-        let provider = make_provider();
-        let published = provider.tool_list();
-        let descriptors = dev_tool_descriptors();
-        assert_eq!(published.len(), descriptors.len());
+        // - Claim 3: the ring resolves the root from that same argument -
+        let governed = std::env::temp_dir().join("nmcp-devtools-rc20-governed");
+        let ungoverned = std::env::temp_dir().join("nmcp-devtools-rc20-ungoverned");
+        let held = HeldAuthority {
+            roots: vec![RootRule {
+                id: "repo".into(),
+                path: governed.clone(),
+                permissions: [
+                    Permission::Read,
+                    Permission::Execute,
+                    Permission::GitPublish,
+                ]
+                .into_iter()
+                .collect(),
+            }],
+            grants: BTreeSet::from([
+                CapabilityGrant::new(Permission::Read.as_str()),
+                CapabilityGrant::new(Permission::Execute.as_str()),
+                CapabilityGrant::new(Permission::GitPublish.as_str()),
+            ]),
+            agent_id: None,
+        };
 
-        for (entry, descriptor) in published.iter().zip(descriptors.iter()) {
-            assert_eq!(entry["name"], descriptor["name"]);
-            assert_eq!(entry["description"], descriptor["description"]);
-            assert_eq!(entry["inputSchema"], descriptor["inputSchema"]);
-
-            let public = nmcp_schema::public_tool_name(
-                "",
-                entry["name"].as_str().expect("an entry names its tool"),
+        for contract in &contracts {
+            // Every argument the kernel table would have tried before `path`, all pointing
+            // somewhere the caller may read, and `path` pointing somewhere it may not. This is
+            // the call the deleted table authorized.
+            let confused = json!({
+                "repo": governed.join("readable").display().to_string(),
+                "repo_path": governed.join("readable").display().to_string(),
+                "repository": governed.join("readable").display().to_string(),
+                "repository_path": governed.join("readable").display().to_string(),
+                "cwd": governed.join("readable").display().to_string(),
+                "path": ungoverned.join("secret").display().to_string(),
+            });
+            let denial = authorize(&contract.authority, &held, &confused)
+                .expect_err("the argument the tool reads is outside every root");
+            assert!(
+                matches!(&denial, Denial::OutsideRoots { arg } if arg == "path"),
+                "{}: the refusal must name path, got {denial:?}",
+                contract.name
             );
+
+            // The mirror image, which is the direction that looks like a widening and is not:
+            // the table refused because `repo` was ungoverned, while the effect was always
+            // going to run on `path`, which is inside a root the caller holds the declared
+            // permission on.
+            let mirrored = json!({
+                "repo": ungoverned.join("elsewhere").display().to_string(),
+                "path": governed.join("readable").display().to_string(),
+            });
+            let granted = authorize(&contract.authority, &held, &mirrored).unwrap_or_else(|err| {
+                panic!(
+                    "{}: the argument the tool reads is governed: {err:?}",
+                    contract.name
+                )
+            });
             assert_eq!(
-                entry["annotations"],
-                nmcp_proto::tool_annotations(&public),
-                "{public}: the derived annotations differ from the ones the router would add"
+                granted.matched_root().map(|root| root.id.as_str()),
+                Some("repo"),
+                "{}: the resolved root must be the one containing the argument the tool reads",
+                contract.name
             );
         }
     }
@@ -1211,7 +1272,8 @@ mod tests {
         let banned = [
             "delete", "remove", "drop", "destroy", "purge", "wipe", "truncate", "rm",
         ];
-        for name in p.tool_names() {
+        for contract in p.contracts() {
+            let name = contract.name;
             let lower = name.to_lowercase();
             for b in &banned {
                 assert!(
@@ -1222,8 +1284,20 @@ mod tests {
         }
     }
 
+    /// A sibling directory whose name shares a prefix with a governed root is not inside it.
+    ///
+    /// The assertion is the one this test has always made and the case is the same case: a root
+    /// at `.../repo` and a sibling at `.../repo-sibling`, which a prefix comparison would
+    /// wrongly admit. What moved is where the comparison happens. It used to be
+    /// `check_provider_permission` calling `PolicyConfig::require` inside this provider; that
+    /// function is deleted with the provider-side check, so the claim is now made against
+    /// `nmcp_schema::authorize`, which is the only thing that decides it, and against this
+    /// provider's real declaration rather than a permission passed in by hand.
     #[test]
     fn provider_permission_uses_policy_require_not_prefix_matching() {
+        use nmcp_schema::{HeldAuthority, authorize};
+        use std::collections::BTreeSet;
+
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
@@ -1233,41 +1307,51 @@ mod tests {
         let sibling = base.join("repo-sibling");
         std::fs::create_dir_all(&root).expect("mkdir root");
         std::fs::create_dir_all(&sibling).expect("mkdir sibling");
-        let policy = PolicyConfig {
+        let held = HeldAuthority {
             roots: vec![RootRule {
                 id: "repo".into(),
                 path: root.clone(),
                 permissions: [Permission::Read].into_iter().collect(),
             }],
-            ..PolicyConfig::default()
+            grants: BTreeSet::new(),
+            agent_id: None,
         };
+        let declared = dev_tool_authority("dev.git_log");
+        assert_eq!(declared.permission, Some(Permission::Read));
 
+        assert!(authorize(&declared, &held, &json!({ "path": root.to_str().unwrap() })).is_ok());
         assert!(
-            check_provider_permission(&policy, Permission::Read, root.to_str().unwrap()).is_none()
-        );
-        assert!(
-            check_provider_permission(&policy, Permission::Read, sibling.to_str().unwrap())
-                .is_some()
+            authorize(
+                &declared,
+                &held,
+                &json!({ "path": sibling.to_str().unwrap() })
+            )
+            .is_err()
         );
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
     fn dev_tool_permission_matches_risk_profile() {
-        assert_eq!(dev_tool_permission("dev.git_log"), Some(Permission::Read));
-        assert_eq!(dev_tool_permission("dev.git_blame"), Some(Permission::Read));
+        // Read off the declaration now that `dev_tool_permission` is deleted with the
+        // provider-side check it fed. Setup only: every pairing below is the one this test has
+        // always asserted, and it is now asserted about the value the ring authorizes against.
+        fn permission_of(name: &str) -> Option<Permission> {
+            dev_tool_authority(name).permission
+        }
+        assert_eq!(permission_of("dev.git_log"), Some(Permission::Read));
+        assert_eq!(permission_of("dev.git_blame"), Some(Permission::Read));
+        assert_eq!(permission_of("dev.git_stash_list"), Some(Permission::Read));
+        assert_eq!(permission_of("dev.test_run"), Some(Permission::Execute));
+        assert_eq!(permission_of("dev.dep_graph"), Some(Permission::Execute));
+        // The two the old helper answered `None` for, which was never a claim that they need
+        // no permission: `git_publish` needed `git.publish` and the helper simply did not
+        // cover it, because the provider check it fed skipped that tool by name.
         assert_eq!(
-            dev_tool_permission("dev.git_stash_list"),
-            Some(Permission::Read)
+            permission_of("dev.git_publish"),
+            Some(Permission::GitPublish)
         );
-        assert_eq!(
-            dev_tool_permission("dev.test_run"),
-            Some(Permission::Execute)
-        );
-        assert_eq!(
-            dev_tool_permission("dev.dep_graph"),
-            Some(Permission::Execute)
-        );
+        assert_eq!(permission_of("dev.git_diff"), Some(Permission::Read));
     }
 
     #[test]
