@@ -1,0 +1,32 @@
+[package]
+name = "nmcp-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ToolProvider trait, Router, and middleware ring for the Model Context Platform."
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-identity.workspace = true
+nmcp-memory = { path = "../nmcp-memory", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-proto = { path = "../nmcp-proto", version = "0.1.0" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
