@@ -195,13 +195,38 @@ impl Permission {
         }
     }
 
+    /// The permission this canonical name denotes, or `None`.
+    ///
+    /// The exact inverse of [`Permission::as_str`], and NMCP-SPEC-003 RC-17 is the reason it
+    /// exists as a direct form. An inverse was already reachable through `Deserialize`, but
+    /// routing a capability grant through `serde_json` on every authorized call buys a
+    /// `Value` allocation and an error string to answer a question that is a search over
+    /// eighteen `&'static str`. `nmcp_schema::authorize` calls this per call.
+    ///
+    /// Cannot drift from `as_str`, because it is defined over [`Permission::ALL`] and
+    /// `as_str` rather than over a second hand-written match:
+    /// `assert_permission_all_is_exhaustive` makes `ALL` exhaustive at compile time, and
+    /// `permission_round_trips_through_from_canonical` asserts both directions.
+    ///
+    /// A retired name resolves to `None` rather than to its replacement. Resolving it would
+    /// hand back the capability RC-19 retired, and the operator-facing sentence naming the
+    /// replacement belongs on the policy-load path, which is [`Permission::from_wire`].
+    #[must_use]
+    pub fn from_canonical(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == name)
+    }
+
     /// Parse the canonical string form, refusing a retired name by name.
     ///
     /// The `Err` is the operator-facing sentence, not a code: it is handed straight to
     /// `serde::de::Error::custom` and ends up in [`PolicyError::MalformedJson`], which is what
     /// `NativeMCPctl validate`, daemon startup and hot reload all print.
+    ///
+    /// Delegates the success half to [`Permission::from_canonical`] so the two entry points
+    /// cannot disagree about which names resolve. What this one adds is the refusal
+    /// vocabulary, which the allocation-free form deliberately does not carry.
     fn from_wire(name: &str) -> Result<Self, String> {
-        if let Some(found) = Self::ALL.into_iter().find(|p| p.as_str() == name) {
+        if let Some(found) = Self::from_canonical(name) {
             return Ok(found);
         }
         if let Some((_, replacement)) = RETIRED_PERMISSIONS.iter().find(|(n, _)| *n == name) {
@@ -3160,6 +3185,70 @@ mod tests {
             assert_eq!(
                 restored, permission,
                 "the hand-written Deserialize disagrees with Serialize for {permission:?}"
+            );
+        }
+    }
+
+    /// RC-17. `from_canonical` is the direct inverse `nmcp_schema::authorize` calls per call,
+    /// and its whole value is that it agrees with the two paths that already existed. So it
+    /// is graded against both: `as_str` in one direction, and the hand-written `Deserialize`
+    /// in the other. Iterating `Permission::ALL` rather than a written-out list is deliberate
+    /// here; `assert_permission_all_is_exhaustive` already makes `ALL` exhaustive at compile
+    /// time, so a new variant arrives in this loop without anybody remembering to add it.
+    #[test]
+    fn permission_round_trips_through_from_canonical() {
+        for permission in Permission::ALL {
+            assert_eq!(
+                Permission::from_canonical(permission.as_str()),
+                Some(permission),
+                "from_canonical is not the inverse of as_str for {permission:?}"
+            );
+
+            // Agreement with the serde path, which is the other inverse in this crate. Two
+            // inverses of one function that disagree is worse than one inverse, because the
+            // decision then depends on which caller you are.
+            let via_serde: Permission =
+                serde_json::from_value(serde_json::json!(permission.as_str()))
+                    .expect("every canonical name must deserialize");
+            assert_eq!(
+                Permission::from_canonical(permission.as_str()),
+                Some(via_serde),
+                "from_canonical disagrees with Deserialize for {permission:?}"
+            );
+        }
+    }
+
+    /// RC-19 plus RC-D3. A retired name must be refused by every inverse, not resolved by the
+    /// fast one. `from_canonical` fails closed by returning `None`, which `authorize` turns
+    /// into `Denial::UnknownGrant`; the sentence naming the replacement stays on the
+    /// policy-load path, where an operator is reading a file they can edit.
+    #[test]
+    fn a_retired_permission_name_is_refused_by_both_inverses() {
+        for (retired, _) in RETIRED_PERMISSIONS {
+            assert_eq!(
+                Permission::from_canonical(retired),
+                None,
+                "from_canonical resolved the retired name `{retired}`"
+            );
+            let via_serde: Result<Permission, _> =
+                serde_json::from_value(serde_json::json!(retired));
+            assert!(
+                via_serde.is_err(),
+                "Deserialize resolved the retired name `{retired}`"
+            );
+        }
+    }
+
+    /// A name that was never a permission resolves to nothing, which is the case
+    /// `Denial::UnknownGrant` exists for. Asserted separately from the retired case because
+    /// the two reach `None` by different arms and a change could break one and not the other.
+    #[test]
+    fn from_canonical_refuses_a_name_no_permission_defines() {
+        for name in ["", "read ", "Read", "read.write", "not.a.permission"] {
+            assert_eq!(
+                Permission::from_canonical(name),
+                None,
+                "from_canonical resolved `{name}`, which no permission defines"
             );
         }
     }

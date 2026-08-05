@@ -62,35 +62,17 @@ pub enum MemoryError {
 /// Shorthand result type for fallible memory operations.
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
-// ── MemoryScope (legacy, kept for router/audit compatibility) ─────────────────
+// ── MemoryScope (defined in nmcp-schema, re-exported here) ────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-/// A memory scope label kept for router/audit compatibility.
-pub struct MemoryScope(pub String);
-
-impl MemoryScope {
-    /// A root-anchored scope.
-    #[must_use]
-    pub fn root(id: impl Into<String>) -> Self {
-        Self(format!("root:{}", id.into()))
-    }
-    /// A session-anchored scope.
-    #[must_use]
-    pub fn session(id: impl Into<String>) -> Self {
-        Self(format!("session:{}", id.into()))
-    }
-    /// A named scope, used verbatim.
-    #[must_use]
-    pub fn named(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-}
-
-impl std::fmt::Display for MemoryScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+/// A memory scope label kept for router and audit compatibility.
+///
+/// Defined in `nmcp-schema` and re-exported here so nothing that used it broke (RC-2).
+/// The move is the point rather than a tidy-up: the kernel needs this type on its call
+/// context, so while it lived here the kernel had to depend on this crate, so this crate
+/// could not depend on the kernel to ship its own provider and the provider had to live
+/// in the server crate instead. That is the cycle NMCP-SPEC-003 RC-D1 breaks, and this
+/// newtype over a `String` with no tie to storage was the whole reason the edge existed.
+pub use nmcp_schema::MemoryScope;
 
 // ── MemoryFact ────────────────────────────────────────────────────────────────
 
