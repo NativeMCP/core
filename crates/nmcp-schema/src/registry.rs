@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::authority::{HeldAuthority, ToolAuthority};
 use crate::provider::ToolProvider;
+use crate::secret_ref::SecretSlotError;
 
 /// Why a provider was refused at registration. Every variant is a condition the base
 /// detected at call time on a caller's request, or not at all.
@@ -24,6 +25,16 @@ use crate::provider::ToolProvider;
 /// and it came from a caller NMCP-SPEC-002 had nothing to do with, exactly as
 /// `Denial::MissingPathArgument` did at v1.1. Two markings taken for one spec's benefit have
 /// now each paid for themselves against a different one.
+///
+/// I-032 is the marking finally paying out for the spec it was taken for, in
+/// [`RegistrationError::UndeclaredSecretSlot`] and [`RegistrationError::MalformedSecretSlot`].
+/// **SB-6's `MissingRequiredSecret` is not among them and arrives with I-036.** That refusal
+/// asks whether the operator has stored the key a slot names, which needs a store to ask, and
+/// I-032 lands the declaration only: no store, no sealer, no resolution (I-033, I-034). A
+/// variant added now could be raised by nothing, and an enum variant nothing can produce is a
+/// placeholder INV-6 forbids however carefully it is worded. The `non_exhaustive` marking is
+/// exactly what makes adding it then a non-breaking change. Owner: I-036, with I-033's store
+/// as its precondition.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RegistrationError {
@@ -101,6 +112,59 @@ pub enum RegistrationError {
         /// The tool that was refused.
         name: String,
     },
+
+    /// A declared `secret_ref` slot sits somewhere the tool's own input schema gives it no
+    /// argument to bind, so nothing could ever be resolved into it (NMCP-SPEC-002 SB-3).
+    ///
+    /// The sibling of [`RegistrationError::UndeclaredPathArgument`] and refused for the same
+    /// reason RC-5 refuses that one: a declaration the schema cannot deliver on is a defect an
+    /// operator can fix at wire-up and a caller can only be confused by. The direction of the
+    /// failure is what makes it worth a refusal rather than a warning. A slot the kernel
+    /// cannot see is a slot nothing injects into, so the tool runs without the credential it
+    /// declared, which fails open.
+    #[error(
+        "tool {name:?} declares a secret slot at {at:?}, which its own input schema does not define as a property"
+    )]
+    UndeclaredSecretSlot {
+        /// The tool that was refused.
+        name: String,
+        /// JSON pointer into `input_schema` locating the annotation.
+        at: String,
+    },
+
+    /// A declared `secret_ref` slot's injection modality is not one SB-4 defines, or is
+    /// missing the name that SB-4 requires the contract rather than the caller to supply.
+    #[error("tool {name:?} declares a malformed secret slot: {source}")]
+    MalformedSecretSlot {
+        /// The tool that was refused.
+        name: String,
+        /// What was wrong with the declaration.
+        ///
+        /// Named in the `Display` message as well as carried as a source, because an operator
+        /// reads whatever the wire-up path printed and error chains are routinely not walked.
+        #[source]
+        source: SecretSlotError,
+    },
+}
+
+impl SecretSlotError {
+    /// Attribute a malformed secret-slot declaration to the tool that made it.
+    ///
+    /// The mapping lives beside the variants it maps rather than in the kernel that calls it,
+    /// so a variant added to either enum is a variant added in the same file as the match that
+    /// has to account for it. `nmcp-host` supplies the public tool name, because the
+    /// local-to-public mapping belongs to the registry (RC-D6) and deriving it a second time
+    /// here is the shape of the defect NMCP-SPEC-003 section 1 measures.
+    #[must_use]
+    pub fn at_tool(self, name: impl Into<String>) -> RegistrationError {
+        let name = name.into();
+        match self {
+            Self::NotAProperty { pointer } => {
+                RegistrationError::UndeclaredSecretSlot { name, at: pointer }
+            }
+            source => RegistrationError::MalformedSecretSlot { name, source },
+        }
+    }
 }
 
 /// The index every governed call resolves through.

@@ -47,6 +47,16 @@
 //! from the declared authority by [`ToolContract::to_list_entry`] so they cannot disagree with
 //! what the kernel authorizes against (RC-21, RC-A4).
 //!
+//! I-032 added the `secret_ref` slot type, which is NMCP-SPEC-002's first landing here rather
+//! than NMCP-SPEC-003's: [`SecretRef`], [`SecretSlot`], [`InjectionModality`] and
+//! [`secret_slots`]. It adds no field to either frozen descriptor and could not: SB-3 rules
+//! that the modality rides in the slot's own schema annotation, which is part of
+//! [`ToolContract::input_schema`] and therefore inside the one field NMCP-SPEC-003 G-4 deferred
+//! to that spec. The extractor is a free function for the same reason, since section 4.2
+//! freezes an `impl` block as well as a struct. Nothing here resolves or injects anything;
+//! I-033 and I-034 own the store, the sealer and the resolution, and [`ResolvedSecrets`] is
+//! still empty by construction until they land.
+//!
 //! I-049 added the request lifecycle: [`RequestState`] and the guard types that walk it. It
 //! arrived here at NMCP-SPEC-003 v1.4 from `nmcp-host`, which re-exports it, and it belongs
 //! here on the merits rather than for reach: the lifecycle is part of what every participant in
@@ -64,6 +74,7 @@ mod names;
 mod provider;
 mod registry;
 mod scope;
+mod secret_ref;
 mod secrets;
 
 pub use authority::{
@@ -82,6 +93,10 @@ pub use names::{
 pub use provider::ToolProvider;
 pub use registry::{CatalogView, RegistrationError, ToolRegistry};
 pub use scope::MemoryScope;
+pub use secret_ref::{
+    InjectionModality, RESERVED_SECRET_NAMESPACES, SECRET_NAME_MAX_CHARS, SECRET_REF_PREFIX,
+    SECRET_SLOT_ANNOTATION, SecretRef, SecretRefError, SecretSlot, SecretSlotError, secret_slots,
+};
 pub use secrets::ResolvedSecrets;
 
 /// Semantic version of this crate, taken from the workspace manifest.
