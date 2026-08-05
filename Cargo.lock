@@ -461,6 +461,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nmcp-devtools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nmcp-audit",
+ "nmcp-policy",
+ "nmcp-router",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "nmcp-exec"
 version = "0.1.0"
 dependencies = [
