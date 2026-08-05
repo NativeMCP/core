@@ -933,17 +933,26 @@ mod tests {
         };
         let fs_svc = FileSystemService::new(policy, audit);
         let file = root.join("doc.md");
+        // The fixture deliberately contains a suspicious marker, because
+        // `inspect_file_integrity` exists to find them and the assertion below
+        // checks that it did. The token is assembled from fragments so it is
+        // data under test rather than a placeholder in tracked source: a
+        // literal one trips the repo-wide INV-6 gate, which cannot tell the
+        // difference. Same technique the gate itself uses on its own pattern.
+        let marker = format!("{}{}", "TO", "DO");
         fs::write(
             &file,
-            "# Title
+            format!(
+                "# Title
 
 ```text
 body
 ```
 
 ## Details
-TODO: verify
-",
+{marker}: verify
+"
+            ),
         )
         .expect("write");
         let report = fs_svc.inspect_file_integrity(&file, 3).expect("inspect");
