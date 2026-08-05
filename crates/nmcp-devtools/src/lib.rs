@@ -5,7 +5,8 @@
 
 use async_trait::async_trait;
 use nmcp_policy::{Permission, PolicyConfig};
-use nmcp_router::{CallContext, ToolCallResult, ToolProvider};
+use nmcp_router::ToolProvider;
+use nmcp_schema::{CallContext, ToolCallResult};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};

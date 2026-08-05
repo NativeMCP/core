@@ -23,7 +23,8 @@
 //! and is what makes it useful for testing governance.
 
 use nmcp_audit::AuditEvent;
-use nmcp_router::{CallContext, SharedRouter};
+use nmcp_router::SharedRouter;
+use nmcp_schema::CallContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;

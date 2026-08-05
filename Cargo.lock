@@ -756,6 +756,7 @@ dependencies = [
  "nmcp-memory",
  "nmcp-policy",
  "nmcp-router",
+ "nmcp-schema",
  "parking_lot",
  "regex",
  "serde",
@@ -788,6 +789,7 @@ dependencies = [
  "nmcp-audit",
  "nmcp-policy",
  "nmcp-router",
+ "nmcp-schema",
  "parking_lot",
  "serde",
  "serde_json",
@@ -838,6 +840,7 @@ dependencies = [
  "futures-util",
  "nmcp-audit",
  "nmcp-router",
+ "nmcp-schema",
  "serde",
  "serde_json",
  "tokio",
@@ -891,7 +894,6 @@ dependencies = [
  "async-trait",
  "nmcp-audit",
  "nmcp-identity",
- "nmcp-memory",
  "nmcp-policy",
  "nmcp-proto",
  "nmcp-schema",
@@ -912,6 +914,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
