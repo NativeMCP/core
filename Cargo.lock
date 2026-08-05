@@ -369,6 +369,14 @@ dependencies = [
 [[package]]
 name = "nmcp-policy"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nmcp-identity",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "nmcp-proto"
