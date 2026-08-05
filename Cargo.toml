@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+"crates/nmcp-memory",
 "crates/nmcp-identity",
 "crates/nmcp-proto",
 "crates/nmcp-policy",
@@ -52,6 +53,8 @@ strip = "symbols"
 debug = "line-tables-only"
 
 [workspace.dependencies]
+regex = "1.11.1"
+async-trait = "0.1.83"
 uuid = { version = "1.12.1", features = ["v4", "serde"] }
 tokio = { version = "1.43.0", features = ["full"] }
 sha2 = "0.10.8"
