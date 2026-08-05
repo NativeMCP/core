@@ -18,32 +18,43 @@
 //!
 //! ## What is here, and what is not here yet
 //!
-//! I-047a lands the value types: [`ToolAuthority`] and its parts, [`ToolContract`],
+//! I-047a landed the value types: [`ToolAuthority`] and its parts, [`ToolContract`],
 //! [`GrantedAuthority`], [`Denial`], [`authorize`], [`RegistrationError`], [`CatalogView`],
-//! [`MemoryScope`], and the public tool name derivation.
+//! [`MemoryScope`], and the public tool name derivation. I-047b adds the two types
+//! section 4.3 moves alongside the trait: [`CallContext`], with `matched_root` private
+//! behind a reader and a private [`ResolvedSecrets`] channel, and [`ToolCallResult`]
+//! unchanged. `nmcp-router` re-exports both, so no `use` path breaks.
 //!
-//! Named gaps, per INV-6, with owners rather than as silent absences. `ToolProvider`,
-//! `CallContext` and `ToolCallResult` are still in `nmcp-router`; moving them is I-047b,
-//! and doing it here would have meant moving the middleware ring in the same commit. The
-//! `ToolRegistry` trait and the indexed registry that implements it are I-047c, which is
-//! also where RC-6's property test lands, because its oracle is the base's per-tool policy
-//! table and reading that table needs the kernel internals I-047b moves. Nothing here
-//! changes any behaviour in `nmcp-router`: the ring does not call [`authorize`] yet.
+//! Named gaps, per INV-6, with owners rather than as silent absences. `ToolProvider` is
+//! still in `nmcp-router` and so is dispatch. Section 4.3 changes `call` to take a
+//! `&GrantedAuthority` and replaces `tool_names`/`tool_list` with `contracts`, and those
+//! are one atomic unit rather than three: a provider cannot be handed a
+//! [`GrantedAuthority`] until dispatch produces one, dispatch cannot produce one until it
+//! calls [`authorize`], and [`authorize`] needs the declaration only `contracts` supplies.
+//! Owner I-047c, which is also where the `ToolRegistry` trait, the indexed registry and
+//! RC-6's property test land, because that test's oracle is the base's per-tool policy
+//! table and reading it needs the dispatch internals I-047c moves. Nothing in I-047b
+//! changes any behaviour in `nmcp-router`: the ring does not call [`authorize`] yet, and
+//! it reads the matched root through the new reader rather than off the field.
 
 mod authority;
+mod context;
 mod contract;
 mod names;
 mod registry;
 mod scope;
+mod secrets;
 
 pub use authority::{
     CapabilityGrant, Denial, GrantedAuthority, HeldAuthority, ToolAuthority, ToolEffect, ToolReach,
     authorize,
 };
+pub use context::{CallContext, ToolCallResult};
 pub use contract::ToolContract;
 pub use names::{is_valid_public_tool_name, public_tool_name};
 pub use registry::{CatalogView, RegistrationError};
 pub use scope::MemoryScope;
+pub use secrets::ResolvedSecrets;
 
 /// Semantic version of this crate, taken from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

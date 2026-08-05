@@ -7,8 +7,8 @@ vendor name compiled into the dispatcher, one crate deeper and harder to see.
 RC-19 makes it concrete for Microsoft 365, which leaves the kernel entirely and
 reaches the server through the gateway as an upstream like any other.
 
-Scope: production Rust in `nmcp-policy`, `nmcp-proto`, `nmcp-router` and
-`nmcp-host`. Modelled on `scripts/inv1_scan.py`: `#[cfg(test)]` modules are
+Scope: production Rust in `nmcp-policy`, `nmcp-proto`, `nmcp-router`,
+`nmcp-host` and `nmcp-schema`. Modelled on `scripts/inv1_scan.py`: `#[cfg(test)]` modules are
 excluded by brace depth and comments are stripped, because a test fixture named
 after somebody's product is a fixture, and a sentence in a doc comment is not a
 coupling. Both are excluded on purpose and that is a deliberate limit of this
@@ -38,11 +38,24 @@ import sys
 # Crates the gate covers. `nmcp-policy` is here because the deepest instance of
 # the coupling was there, in the crate that decides authority, rather than in
 # the one that dispatches (RC-11).
+#
+# `nmcp-schema` is here from I-047b, which is wider than the four crates RC-11
+# names. RC-11 was written before RC-D1 moved the provider contract, and it
+# enumerates the crates that were kernel at the time. `nmcp-schema` now holds
+# the declared authority every governed call is authorized against, the call
+# context, and from I-047c the provider trait and the registry index, and both
+# the kernel and every provider link it. A gate that covers less code than the
+# kernel executes is a gate with a hole in exactly the place the next vendor
+# name would go. Widening scope only ever refuses more, so RC-11's acceptance
+# criteria still hold on the four crates it names; the fifth is additional.
+# I-047a flagged this and correctly left it alone, because widening a ratified
+# gate is a decision and not a tidy-up.
 SCOPED_DIRS = (
     "crates/nmcp-policy/src/",
     "crates/nmcp-proto/src/",
     "crates/nmcp-router/src/",
     "crates/nmcp-host/src/",
+    "crates/nmcp-schema/src/",
 )
 
 # Commercial product and service names. Each one, appearing in kernel

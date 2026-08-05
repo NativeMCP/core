@@ -25,7 +25,7 @@ use chrono::{DateTime, Local, Timelike, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::AbacRule;
-use nmcp_router::CallContext;
+use nmcp_schema::CallContext;
 use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -502,7 +502,7 @@ pub fn verify_manifest_signature(
 impl nmcp_router::AbacCheck for AbacStage {
     fn evaluate(
         &self,
-        ctx: &nmcp_router::CallContext,
+        ctx: &CallContext,
         tool_name: &str,
         args: &serde_json::Value,
     ) -> nmcp_router::AbacDecision {
@@ -518,7 +518,7 @@ impl nmcp_router::AbacCheck for AbacStage {
 
     fn wait_for_approval<'a>(
         &'a self,
-        ctx: &'a nmcp_router::CallContext,
+        ctx: &'a CallContext,
         tool_name: &'a str,
         args: &'a serde_json::Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -855,7 +855,8 @@ mod tests {
     #[tokio::test]
     async fn configured_deny_rule_denies_through_router_dispatch() {
         use async_trait::async_trait;
-        use nmcp_router::{CallContext, Router, ToolCallResult, ToolProvider};
+        use nmcp_router::{Router, ToolProvider};
+        use nmcp_schema::{CallContext, ToolCallResult};
 
         let policy_arc = Arc::new(parking_lot::RwLock::new(nmcp_policy::PolicyConfig {
             abac_rules: vec![AbacRule::CallerIdentity {
@@ -920,7 +921,8 @@ mod tests {
 
     #[tokio::test]
     async fn delete_guard_precedes_abac_through_router() {
-        use nmcp_router::{CallContext, Router};
+        use nmcp_router::Router;
+        use nmcp_schema::CallContext;
 
         let policy_arc = make_policy_arc();
         let audit = make_audit();
@@ -952,7 +954,8 @@ mod tests {
     #[tokio::test]
     async fn the_shipped_third_party_template_restricts_that_client_through_router_dispatch() {
         use async_trait::async_trait;
-        use nmcp_router::{CallContext, Router, ToolCallResult, ToolProvider};
+        use nmcp_router::{Router, ToolProvider};
+        use nmcp_schema::{CallContext, ToolCallResult};
 
         let template: nmcp_policy::PolicyConfig = serde_json::from_str(include_str!(
             "../../../examples/policy.persona.third-party-client.example.json"
