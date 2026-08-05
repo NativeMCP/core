@@ -68,11 +68,12 @@ use nmcp_policy::{Permission, PolicyConfig};
 use nmcp_schema::{
     CapabilityGrant, CatalogView, Denial, GrantedAuthority, HeldAuthority, InjectionModality,
     RegistrationError, RequestReceived, ResolvedSecrets, SECRET_SLOT_MARKER, SealedSecret,
-    SecretRef, SecretSlotCatalog, SettledRequest, ToolAuthority, ToolEffect, ToolRegistry,
-    authorize,
+    SecretRef, SecretSlotCatalog, SecretTripwire, SettledRequest, ToolAuthority, ToolEffect,
+    ToolRegistry, authorize,
 };
 use nmcp_secrets::{BindingRequest, SealedStore, SecretName};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -298,11 +299,26 @@ struct SecretUseStamp {
     rule: Option<String>,
 }
 
-/// Everything one successful stage 5b run produces: the channel for the provider and the
-/// stamp for the audit pair.
+/// One resolved slot the stage-8 tripwire watches (NMCP-SPEC-002 SB-9).
+///
+/// The key name, the slot argument and a shared handle to the resolved material: the name is
+/// what `[nmcp:redacted/<name>]` reads and what a trip record names, the slot is the other half
+/// of what the record names, and the value is compared against the serialized result. The handle
+/// is an [`Arc`] share of the same sealed buffer the provider was given, not a second copy of
+/// material; it drops when the ring finishes the scan (SB-5).
+struct TrippableSlot {
+    key: String,
+    slot: String,
+    version: String,
+    value: SealedSecret,
+}
+
+/// Everything one successful stage 5b run produces: the channel for the provider, the stamp
+/// for the audit pair, and the targets the stage-8 tripwire scans for (SB-9).
 struct ResolvedForCall {
     secrets: ResolvedSecrets,
     stamp: SecretUseStamp,
+    trippables: Vec<TrippableSlot>,
 }
 
 /// A stage 5b refusal: the denial the caller sees and the stamp the denied record carries.
@@ -389,6 +405,7 @@ fn resolve_secret_slots(
     let mut names: Vec<String> = Vec::new();
     let mut versions: Vec<String> = Vec::new();
     let mut rules: Vec<String> = Vec::new();
+    let mut trippables: Vec<TrippableSlot> = Vec::new();
 
     for slot in slots {
         let Some(supplied) = args.get(&slot.arg) else {
@@ -438,6 +455,15 @@ fn resolve_secret_slots(
         // argues; both allocations zeroize on their own drop, and the store's drops here.
         let carrier = sealed.with_exposed(|bytes| SealedSecret::new(bytes.clone()));
         drop(sealed);
+        // A shared handle for the stage-8 tripwire, carrying the key and slot the trip record
+        // names (SB-9). An Arc share, not a copy of material: one buffer, erased once when the
+        // last handle drops at the end of the call (SB-5).
+        trippables.push(TrippableSlot {
+            key: name.to_string(),
+            slot: slot.arg.clone(),
+            version: grant_version_of(&versions),
+            value: carrier.clone(),
+        });
         secrets.insert(slot.arg.clone(), slot.modality, carrier);
 
         // The reference is removed from the arguments the provider sees: material travels
@@ -459,7 +485,17 @@ fn resolve_secret_slots(
             version: Some(versions.join(",")),
             rule: Some(rules.join(",")),
         },
+        trippables,
     }))
+}
+
+/// The version just pushed onto the running list, for the trippable being built beside it.
+///
+/// The slot's version was pushed onto `versions` immediately above, so the last element is this
+/// slot's; reading it here rather than re-deriving keeps the trippable's version aligned with the
+/// stamp's index for index.
+fn grant_version_of(versions: &[String]) -> String {
+    versions.last().cloned().unwrap_or_default()
 }
 
 // - AuditRing -
@@ -596,6 +632,46 @@ fn audit_record(
 
     if let Err(e) = sink.append(&event) {
         warn!(call_id = %ctx.call_id, "AuditRing: failed to write audit event: {e}");
+    }
+}
+
+/// Write a `secret_trip` record for one key whose value the tripwire caught (NMCP-SPEC-002 SB-9).
+///
+/// Stage 8's third record, written between the outcome-bearing scan and the outcome record, when
+/// an armed injected value occurred in the serialized result. It carries the key, the slot(s) it
+/// was injected through and the version, with the rule `tripwire`, and never the value or a
+/// value-derived length or digest (SB-1): the summary names the key, slot and rule, and the
+/// structured fields carry the same. Its decision is [`nmcp_audit::SECRET_TRIP_DECISION`], which
+/// [`nmcp_audit::event_log_severity`] maps to `Error`, so SB-7's requirement that a trip be
+/// distinguishable from a routine refusal holds at the SIEM. On the same `call_id` as the call's
+/// intent and outcome records, so a reader pairs the exfiltration with the use that produced it.
+fn audit_trip(
+    sink: &AuditSink,
+    tool_name: &str,
+    ctx: &CallContext,
+    key: &str,
+    slots: &str,
+    version: &str,
+) {
+    let mut event = AuditEvent::new(
+        tool_name,
+        format!(
+            "secret_trip tool={tool_name} key={key} slot={slots} rule={}",
+            nmcp_audit::TRIPWIRE_RULE
+        ),
+    );
+    event.decision = nmcp_audit::SECRET_TRIP_DECISION.to_string();
+    stamp_caller(&mut event, ctx);
+    event.secret_name = Some(key.to_string());
+    if !version.is_empty() {
+        event.secret_version = Some(version.to_string());
+    }
+    event.secret_rule = Some(nmcp_audit::TRIPWIRE_RULE.to_string());
+    if let Some(root) = ctx.matched_root() {
+        event.normalized_path = Some(root.path.display().to_string());
+    }
+    if let Err(e) = sink.append(&event) {
+        warn!(call_id = %ctx.call_id, "AuditRing: failed to write secret_trip event: {e}");
     }
 }
 
@@ -1104,9 +1180,13 @@ impl Router {
                 }
             }
         };
-        let (ctx, secret_use) = match resolved_use {
-            Some(resolved) => (ctx.with_secrets(resolved.secrets), Some(resolved.stamp)),
-            None => (ctx, None),
+        let (ctx, secret_use, trippables) = match resolved_use {
+            Some(resolved) => (
+                ctx.with_secrets(resolved.secrets),
+                Some(resolved.stamp),
+                resolved.trippables,
+            ),
+            None => (ctx, None, Vec::new()),
         };
 
         // - Stage 6: audit intent record -
@@ -1130,14 +1210,31 @@ impl Router {
         // The provider sees arguments, context and proof, and nothing else. `granted` is
         // unforgeable outside `nmcp-schema`, so there is no expression that reaches this line
         // without stage 4 having returned `Ok` (RC-A2).
-        let result = provider.call(&local_name, args, &ctx, &granted).await;
+        let mut result = provider.call(&local_name, args, &ctx, &granted).await;
         // Whatever the provider answered, including an error of its own, the ring executed the
         // call. A provider-level failure is not a refusal, which is why there is no
         // `Executed -> Rejected` edge to take here.
         let state = state.executed();
 
-        // - Stage 8: audit outcome record -
+        // - Stage 8: the exfiltration tripwire scrub, then the outcome record -
         //
+        // NMCP-SPEC-002 SB-9, NMCP-SPEC-003 4.6: the scrub sits at stage 8, before `Completed`,
+        // and after `provider.call` returns and before the outcome record. It scans the full
+        // serialized result the caller would receive against this call's armed injected values;
+        // on a hit it redacts in place, writes a `secret_trip` record and applies the key's
+        // on-trip policy, and the scrubbed result is what the caller receives. The material's
+        // lifetime runs to the end of this scan, one stage past `Executed`, which is why the
+        // ring drops its scanning handles here rather than carrying them further.
+        if !trippables.is_empty()
+            && let Some(resolution) = stage5b.as_ref()
+        {
+            self.run_tripwire(tool_name, &resolution.store, &trippables, &ctx, &mut result);
+        }
+        // The scan is done: the ring's own material handles end their life here, before the
+        // outcome record, making the SB-5 window visible in the drop order. The context still
+        // holds its handle for a few lines until this function returns, which is the last one.
+        drop(trippables);
+
         // The other half of SB-7's pair: the outcome record of a call that resolved secrets
         // carries the same key, version and rule as its intent record, on one call_id.
         audit_record(
@@ -1151,6 +1248,103 @@ impl Router {
         );
 
         state.completed().settle(result)
+    }
+
+    /// The stage-8 scrub: scan the serialized result, redact hits, audit and apply policy (SB-9).
+    ///
+    /// Called from exactly one place in [`Router::walk_the_ring`], the way stage 0 calls
+    /// `delete_guard_check` and stage 5b calls `resolve_secret_slots`: the stage stays inline in
+    /// the ring, the mechanics live here. It arms [`SecretTripwire`] against this call's resolved
+    /// values, filtered by the store's floor so a below-floor value is not watched (T14), and
+    /// scans the whole caller-visible payload, `content` and `structuredContent`, plus the
+    /// `audit_payload`, so a value cannot ride into the outcome record this precedes even though
+    /// that field never reaches the caller. On each key that hit it writes a `secret_trip` record
+    /// naming the key, its slot(s) and version and the rule `tripwire`, then applies the key's
+    /// on-trip policy through the store, which is an FSM write and never a file operation (INV-1).
+    /// The redaction is in place, so the mutated `result` is what the caller receives.
+    ///
+    /// Applying policy is best-effort in the same sense the audit writes are: a store write that
+    /// refuses is logged and does not fail the call, because the redaction and the trip record,
+    /// which are what protect the value and record the event, have already happened, and failing
+    /// the caller's result over a suspension that did not take would be a worse outcome than a
+    /// logged warning an operator reads beside the trip record.
+    fn run_tripwire(
+        &self,
+        tool_name: &str,
+        store: &SealedStore,
+        trippables: &[TrippableSlot],
+        ctx: &CallContext,
+        result: &mut ToolCallResult,
+    ) {
+        let floor = usize::try_from(store.tripwire_floor()).unwrap_or(usize::MAX);
+        let tripwire = SecretTripwire::armed(
+            floor,
+            trippables
+                .iter()
+                .map(|target| (target.key.clone(), target.value.clone())),
+        );
+        if tripwire.is_empty() {
+            return;
+        }
+
+        // The full caller-visible payload, then the audit payload, so no leaf carries the value.
+        let mut hits: BTreeSet<String> = BTreeSet::new();
+        for item in &mut result.content {
+            hits.extend(tripwire.redact_json(item));
+        }
+        if let Some(structured) = result.structured_content.as_mut() {
+            hits.extend(tripwire.redact_json(structured));
+        }
+        if let Some(payload) = result.audit_payload.as_mut() {
+            hits.extend(tripwire.redact_json(payload));
+        }
+        if hits.is_empty() {
+            return;
+        }
+
+        for key in &hits {
+            // Every slot this key was injected through, and the version any of them carried
+            // (all the same version for one key in one call). Joined for the record, which
+            // names the slot (SB-9) without a per-slot record for one key.
+            let carrying: Vec<&TrippableSlot> = trippables
+                .iter()
+                .filter(|target| &target.key == key)
+                .collect();
+            let slots = carrying
+                .iter()
+                .map(|target| target.slot.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let version = carrying
+                .first()
+                .map_or("", |target| target.version.as_str());
+            audit_trip(&self.audit, tool_name, ctx, key, &slots, version);
+
+            // Apply the key's on-trip policy: an FSM write in the store (INV-1 scanner-clean),
+            // not a file operation here. Below-floor keys never reached this loop, because they
+            // did not arm, so this is only ever an armed key (T14).
+            match SecretName::parse(key) {
+                Ok(name) => match store.apply_on_trip(&name) {
+                    Ok(action) => {
+                        info!(tool = tool_name, key = key.as_str(), action = %action, "SecretRing: tripwire caught an injected value; applied on-trip policy");
+                    }
+                    Err(err) => {
+                        warn!(
+                            tool = tool_name,
+                            key = key.as_str(),
+                            "SecretRing: on-trip policy write failed: {err}"
+                        );
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        tool = tool_name,
+                        key = key.as_str(),
+                        "SecretRing: tripwire hit names an unparseable key: {err}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3504,6 +3698,7 @@ mod tests {
                         uses,
                         window_secs: 3_600,
                     }),
+                    on_trip: None,
                 },
             )
             .unwrap();
@@ -3785,6 +3980,413 @@ mod tests {
         let observed = provider.observed.lock().unwrap().clone().expect("called");
         assert!(observed.channel_empty);
         assert_eq!(observed.args["credential"], DEPLOY_REF);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // - NMCP-SPEC-002 SB-9: the exfiltration tripwire at ring stage 8 (I-035) -
+
+    /// A provider that echoes the resolved value of the `credential` slot straight into its
+    /// result, modelling the T1 threat: an allowlisted program made to emit the injected value.
+    /// The ring's stage-8 scan is what must catch it; this provider does no redaction itself.
+    struct EchoingSecretProvider;
+
+    #[async_trait]
+    impl ToolProvider for EchoingSecretProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
+        fn provider_id(&self) -> &str {
+            ""
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            let mut contract = test_contract("keyed_run", ToolEffect::Observe);
+            contract.input_schema = json!({
+                "type": "object",
+                "properties": {
+                    "credential": {
+                        "type": "string",
+                        SECRET_SLOT_ANNOTATION: {"inject": "env", "var": "DATABASE_URL"},
+                    },
+                    "program": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            });
+            vec![contract]
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            _args: Value,
+            ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
+            let echoed = ctx.secrets().get("credential").map_or_else(
+                || "no credential resolved".to_string(),
+                |(_, value)| value.with_exposed(|bytes| String::from_utf8_lossy(bytes).to_string()),
+            );
+            // The whole tool result, not just a stdout field: a structured payload too, so the
+            // scan proves it covers more than one string (SB-9 scope).
+            let mut result = ToolCallResult::ok(Value::String(format!("program output: {echoed}")));
+            result.structured_content = Some(json!({"captured": {"stdout": echoed, "exit": 0}}));
+            result
+        }
+    }
+
+    /// A router registering the echoing provider and wiring stage 5b against `store`.
+    fn echoing_router(store: &Arc<SealedStore>) -> (std::path::PathBuf, Router) {
+        let (path, audit) = temp_audit("tripwire");
+        let policy = Arc::new(parking_lot::RwLock::new(PolicyConfig::default()));
+        let registry = Arc::new(IndexedToolRegistry::new(Arc::clone(&policy)));
+        let router = Router::new(
+            policy,
+            audit,
+            Arc::clone(&registry) as Arc<dyn ToolRegistry>,
+        );
+        router.set_secrets(SecretResolution::new(Arc::clone(store), registry));
+        router
+            .register(Arc::new(EchoingSecretProvider))
+            .expect("the echoing tool registers");
+        (path, router)
+    }
+
+    /// A store holding `deploy.db` bound to `keyed_run`/`local`, valued `value`, with the given
+    /// on-trip override; no budget, so the budget does not confound a tripwire test.
+    fn tripwire_store(
+        value: &[u8],
+        on_trip: Option<nmcp_secrets::OnTripAction>,
+    ) -> Arc<SealedStore> {
+        let store = Arc::new(SealedStore::ephemeral());
+        let key = SecretName::parse("deploy.db").unwrap();
+        store.set(&key, Sealed::new(value.to_vec())).unwrap();
+        store
+            .bind(
+                &key,
+                KeyBinding {
+                    tools: vec!["keyed_run".to_string()],
+                    programs: vec!["deployctl".to_string()],
+                    roots: Vec::new(),
+                    callers: vec!["local".to_string()],
+                    expires_at_unix_ms: None,
+                    budget: None,
+                    on_trip,
+                },
+            )
+            .unwrap();
+        store
+    }
+
+    /// No byte window of `material` (four bytes or longer) appears in `rendered` (the SB-1
+    /// measurement discipline: not the value, and nothing that could reconstruct part of it).
+    fn assert_no_material_window(rendered: &str, material: &[u8]) {
+        let bytes = rendered.as_bytes();
+        for width in 4..=material.len() {
+            for window in material.windows(width) {
+                assert!(
+                    !bytes.windows(width).any(|candidate| candidate == window),
+                    "a {width}-byte window of the material appears in: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// T1 end to end: a program echoes the injected value; the caller's result carries the
+    /// marker and no byte window of the value; a trip record is on the chain with Error
+    /// severity; the key is Suspended afterward; and a subsequent dispatch refuses at
+    /// evaluation naming key-state. The SB-1 sweep over the trip record runs here too.
+    #[tokio::test]
+    async fn a_trip_redacts_audits_and_suspends_end_to_end() {
+        let store = tripwire_store(SECRET_MATERIAL, None);
+        let (path, router) = echoing_router(&store);
+
+        let result = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        // The caller's result is scrubbed: the marker stands where the value was, and no byte
+        // window of the value survives anywhere in the serialized result.
+        let material = String::from_utf8_lossy(SECRET_MATERIAL).to_string();
+        let rendered = serde_json::to_string(&result.content).expect("content");
+        let structured = serde_json::to_string(&result.structured_content).expect("structured");
+        assert!(rendered.contains("[nmcp:redacted/deploy.db]"), "{rendered}");
+        assert!(
+            structured.contains("[nmcp:redacted/deploy.db]"),
+            "{structured}"
+        );
+        assert_no_material_window(&rendered, SECRET_MATERIAL);
+        assert_no_material_window(&structured, SECRET_MATERIAL);
+        assert!(!rendered.contains(&material));
+
+        // The chain: intent, then the trip record, then the outcome. The trip record names the
+        // key, the slot and the rule, and never the value (the SB-1 sweep).
+        let events = audit_lines(&path);
+        let trip = events
+            .iter()
+            .find(|event| event["decision"] == nmcp_audit::SECRET_TRIP_DECISION)
+            .expect("a secret_trip record is on the chain");
+        assert_eq!(trip["secret_name"], "deploy.db");
+        assert_eq!(trip["secret_rule"], "tripwire");
+        assert!(
+            trip["summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("slot=credential"),
+            "the trip record names the slot: {trip}"
+        );
+        let trip_line = serde_json::to_string(trip).expect("trip line");
+        assert_no_material_window(&trip_line, SECRET_MATERIAL);
+
+        // Error severity: SB-7 requires a trip be distinguishable from a routine refusal.
+        let event: nmcp_audit::AuditEvent =
+            serde_json::from_value(trip.clone()).expect("trip parses as an audit event");
+        assert_eq!(
+            nmcp_audit::event_log_severity(&event),
+            nmcp_audit::EventLogSeverity::Error
+        );
+
+        // The key is Suspended, and the value is still on disk (an FSM write, not a delete).
+        let meta = store
+            .names()
+            .into_iter()
+            .find(|meta| meta.name.as_str() == "deploy.db")
+            .expect("deploy.db is listed");
+        assert_eq!(meta.state, nmcp_secrets::KeyState::Suspended);
+
+        // A subsequent dispatch refuses at evaluation naming key-state.
+        let again = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(again.is_error);
+        let text = again.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("key-state"), "{text}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The below-floor case: the same echo, but the value is under the arming floor, so it
+    /// passes through with no redaction, no trip record is written, the key stays Active, and
+    /// the store's below-floor fact is readable. Detection off is a fact, not a failure (T14).
+    #[tokio::test]
+    async fn a_below_floor_value_is_not_watched_and_the_fact_is_readable() {
+        let short = b"pin-1234"; // eight bytes, below the sixteen-byte floor
+        let store = tripwire_store(short, None);
+        let (path, router) = echoing_router(&store);
+
+        let result = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        // The value passes through: detection is off for it.
+        let rendered = serde_json::to_string(&result.content).expect("content");
+        assert!(
+            rendered.contains("pin-1234"),
+            "a below-floor value is not redacted: {rendered}"
+        );
+        assert!(!rendered.contains("[nmcp:redacted/"));
+
+        // No trip record, and the key stays Active.
+        let events = audit_lines(&path);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["decision"] != nmcp_audit::SECRET_TRIP_DECISION),
+            "a below-floor value does not trip"
+        );
+        let meta = store
+            .names()
+            .into_iter()
+            .find(|meta| meta.name.as_str() == "deploy.db")
+            .expect("listed");
+        assert_eq!(meta.state, nmcp_secrets::KeyState::Active);
+        // The store's below-floor fact is readable, which is what I-037's warning reads.
+        assert!(
+            meta.below_tripwire_floor,
+            "detection is off, and the store records it"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Oracle honesty (T13): a miss costs nothing observable, and a hit is one-shot because
+    /// suspension follows. A call whose program does not echo the value produces no trip and no
+    /// state change (the miss); a call that does echo it trips once and suspends, after which the
+    /// key no longer resolves, so a second confirmed guess is not available (the one-shot bound).
+    #[tokio::test]
+    async fn the_redaction_marker_is_a_one_shot_confirmation_oracle() {
+        // The miss: a provider that echoes nothing of the value. The KeyedProvider echoes the
+        // arguments, which carry the marker rather than the value, so nothing trips.
+        let store = bound_store(3);
+        let (path, router, _provider) = keyed_router(&store);
+        let result = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!result.is_error);
+        let events = audit_lines(&path);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["decision"] != nmcp_audit::SECRET_TRIP_DECISION),
+            "a miss costs nothing observable: no trip record"
+        );
+        assert_eq!(
+            store
+                .names()
+                .into_iter()
+                .find(|meta| meta.name.as_str() == "deploy.db")
+                .expect("listed")
+                .state,
+            nmcp_secrets::KeyState::Active,
+            "a miss changes no key state"
+        );
+        let _ = std::fs::remove_file(path);
+
+        // The hit: it is one-shot, because suspension follows and the key then resolves nothing,
+        // so the oracle cannot be queried a second time on the same key.
+        let store = tripwire_store(SECRET_MATERIAL, None);
+        let (path, router) = echoing_router(&store);
+        let first = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!first.is_error);
+        let second = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(
+            second.is_error,
+            "the hit suspended the key, so the oracle is not available a second time"
+        );
+        assert!(
+            second.content[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("key-state")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Multi-value: two keys injected into one call, only one echoed, and only that one trips.
+    /// The other resolves and injects but is never in the output, so it is neither redacted nor
+    /// suspended, which is the tripwire acting per value rather than per call.
+    #[tokio::test]
+    async fn only_the_echoed_key_of_two_injected_trips() {
+        // A provider declaring two env slots, echoing only the first.
+        struct TwoSlotProvider;
+        #[async_trait]
+        impl ToolProvider for TwoSlotProvider {
+            fn contract_version(&self) -> u32 {
+                1
+            }
+            fn provider_id(&self) -> &str {
+                ""
+            }
+            fn contracts(&self) -> Vec<ToolContract> {
+                let mut contract = test_contract("two_slot", ToolEffect::Observe);
+                contract.input_schema = json!({
+                    "type": "object",
+                    "properties": {
+                        "primary": {
+                            "type": "string",
+                            SECRET_SLOT_ANNOTATION: {"inject": "env", "var": "PRIMARY_URL"},
+                        },
+                        "secondary": {
+                            "type": "string",
+                            SECRET_SLOT_ANNOTATION: {"inject": "env", "var": "SECONDARY_URL"},
+                        },
+                    },
+                });
+                vec![contract]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                _args: Value,
+                ctx: &CallContext,
+                _granted: &GrantedAuthority,
+            ) -> ToolCallResult {
+                // Echo only the primary slot's value; the secondary is resolved and injected
+                // but never printed.
+                let echoed = ctx.secrets().get("primary").map_or_else(
+                    || "none".to_string(),
+                    |(_, value)| value.with_exposed(|b| String::from_utf8_lossy(b).to_string()),
+                );
+                ToolCallResult::ok(Value::String(format!("printed {echoed}")))
+            }
+        }
+
+        const PRIMARY: &[u8] = b"pr1-9qz2vk7x-8kn2m-hp5jd";
+        const SECONDARY: &[u8] = b"sec-4wkzn8rjt4-pm9hd-qx7v";
+
+        let store = Arc::new(SealedStore::ephemeral());
+        for (name, value) in [("primary.key", PRIMARY), ("secondary.key", SECONDARY)] {
+            let key = SecretName::parse(name).unwrap();
+            store.set(&key, Sealed::new(value.to_vec())).unwrap();
+            store
+                .bind(
+                    &key,
+                    KeyBinding {
+                        tools: vec!["two_slot".to_string()],
+                        programs: Vec::new(),
+                        roots: Vec::new(),
+                        callers: vec!["local".to_string()],
+                        expires_at_unix_ms: None,
+                        budget: None,
+                        on_trip: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let (path, audit) = temp_audit("tripwire-two");
+        let policy = Arc::new(parking_lot::RwLock::new(PolicyConfig::default()));
+        let registry = Arc::new(IndexedToolRegistry::new(Arc::clone(&policy)));
+        let router = Router::new(
+            policy,
+            audit,
+            Arc::clone(&registry) as Arc<dyn ToolRegistry>,
+        );
+        router.set_secrets(SecretResolution::new(Arc::clone(&store), registry));
+        router
+            .register(Arc::new(TwoSlotProvider))
+            .expect("register");
+
+        let result = router
+            .dispatch(
+                "two_slot",
+                json!({
+                    "primary": "nmcp://secret/primary.key",
+                    "secondary": "nmcp://secret/secondary.key",
+                }),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        let rendered = serde_json::to_string(&result.content).expect("content");
+        assert!(
+            rendered.contains("[nmcp:redacted/primary.key]"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("[nmcp:redacted/secondary.key]"));
+        assert_no_material_window(&rendered, PRIMARY);
+
+        // Exactly one trip record, for the primary key; the secondary never appeared, so it
+        // is neither audited nor suspended.
+        let trips: Vec<_> = audit_lines(&path)
+            .into_iter()
+            .filter(|event| event["decision"] == nmcp_audit::SECRET_TRIP_DECISION)
+            .collect();
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0]["secret_name"], "primary.key");
+
+        let states: std::collections::BTreeMap<String, nmcp_secrets::KeyState> = store
+            .names()
+            .into_iter()
+            .map(|meta| (meta.name.to_string(), meta.state))
+            .collect();
+        assert_eq!(states["primary.key"], nmcp_secrets::KeyState::Suspended);
+        assert_eq!(
+            states["secondary.key"],
+            nmcp_secrets::KeyState::Active,
+            "the key that never appeared in output does not trip"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

@@ -77,7 +77,9 @@ mod sealed;
 mod sealer;
 mod store;
 
-pub use binding::{BINDING_SCHEMA_VERSION, BindingDenial, BindingRequest, KeyBinding, UseBudget};
+pub use binding::{
+    BINDING_SCHEMA_VERSION, BindingDenial, BindingRequest, KeyBinding, OnTripAction, UseBudget,
+};
 pub use file_sealer::{
     FileSealer, KEY_DIR_MODE, KEY_FILE, KEY_FILE_MODE, KeyProtection, MemorySealer, default_key_dir,
 };
@@ -87,9 +89,10 @@ pub use name::{SecretName, SecretNameError, Version, VersionError};
 pub use sealed::Sealed;
 pub use sealer::{SECRET_ENTROPY, SealContext, SealError, Sealer, SealerId};
 pub use store::{
-    DEFAULT_OVERLAP_WINDOW_SECS, MigrationEntry, MigrationReport, ResolveError, SECRETS_DIR,
-    STORE_CONFIG_FILE, STORE_SCHEMA_VERSION, SealedStore, SecretMeta, SkippedEntry, StoreError,
-    UnreadableEntry, UnreadableReason, VersionMeta,
+    DEFAULT_OVERLAP_WINDOW_SECS, DEFAULT_TRIPWIRE_FLOOR, MigrationEntry, MigrationReport,
+    ResolveError, SECRETS_DIR, STORE_CONFIG_FILE, STORE_SCHEMA_VERSION, SealedStore, SecretMeta,
+    SkippedEntry, StoreError, TRIPWIRE_FLOOR_MINIMUM, UnreadableEntry, UnreadableReason,
+    VersionMeta,
 };
 
 /// Semantic version of this crate, taken from the workspace manifest.
