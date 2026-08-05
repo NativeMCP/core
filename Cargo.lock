@@ -788,6 +788,7 @@ dependencies = [
  "async-trait",
  "nmcp-audit",
  "nmcp-policy",
+ "nmcp-proto",
  "nmcp-router",
  "nmcp-schema",
  "parking_lot",
@@ -826,6 +827,14 @@ dependencies = [
 [[package]]
 name = "nmcp-host"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nmcp-policy",
+ "nmcp-schema",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "nmcp-identity"
@@ -910,6 +919,7 @@ dependencies = [
 name = "nmcp-schema"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "nmcp-policy",
  "serde",
  "serde_json",

@@ -56,3 +56,41 @@ pub fn is_valid_public_tool_name(name: &str) -> bool {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
+
+/// Tool names INV-1 forbids outright, whatever a provider says about them.
+///
+/// Kernel-owned and not delegable (RC-D4): a provider that declares itself non-destructive is
+/// a provider grading its own homework, so the list is compared against rather than consulted
+/// for advice. It moved here from `nmcp-router` for the same reason
+/// [`public_tool_name`] did at I-047a and no other: the registry refuses a delete-denied name
+/// at registration (`RegistrationError::DeleteDeniedName`) and the registry does not live in
+/// the crate that dispatches. `nmcp-router` imports it privately, so the dispatch-time guard
+/// and the registration-time refusal compare against one table rather than two that can drift.
+///
+/// This is the one exception RC-11 names to "the kernel names no tool": a guarantee cannot
+/// enumerate what it refuses without saying the names.
+pub const DELETE_DENIED_NAMES: &[&str] = &[
+    "delete",
+    "delete_file",
+    "remove",
+    "remove_root",
+    "uninstall",
+    "drop",
+    "drop_table",
+    "destroy",
+    "purge",
+    "wipe",
+    "truncate",
+    "rm",
+];
+
+/// Whether `tool_name` is one of the names INV-1 refuses.
+///
+/// Equality against [`DELETE_DENIED_NAMES`] after lowercasing, which is the base's rule and
+/// stays the rule: a substring test would refuse `list_directory` for containing `rm` in
+/// `format`, and a prefix test would refuse nothing useful that equality does not.
+#[must_use]
+pub fn contains_delete_intent(tool_name: &str) -> bool {
+    let lower = tool_name.to_ascii_lowercase();
+    DELETE_DENIED_NAMES.iter().any(|denied| lower == *denied)
+}

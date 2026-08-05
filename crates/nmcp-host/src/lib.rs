@@ -2,6 +2,23 @@
 //!
 //! Part of the NativeMCP `core` workspace. The governance invariants in
 //! `docs/GOVERNANCE.md` are normative for every item in this crate.
+//!
+//! ## The tool registry
+//!
+//! NMCP-SPEC-003 section 4.4, RATIFIED v1.1, splits the registry in two: the `ToolRegistry`
+//! trait lives in `nmcp-schema` where every provider can see it, and [`IndexedToolRegistry`]
+//! implements it here because the kernel owns dispatch and owns INV-1.
+//!
+//! It is not wired into dispatch yet, which is a named gap and not an omission. `nmcp-router`
+//! still resolves through `ToolProvider::tool_names` and still authorizes from its own
+//! compiled-in table, so this crate's arrival changes no dispatch decision. Moving the ring
+//! onto this index and onto [`nmcp_schema::authorize`] is one atomic change, owner I-047d,
+//! because dispatch cannot hand a provider a `GrantedAuthority` until it produces one and
+//! cannot produce one until it reads the declaration this index holds.
+
+mod registry;
+
+pub use registry::IndexedToolRegistry;
 
 /// Semantic version of this crate, taken from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

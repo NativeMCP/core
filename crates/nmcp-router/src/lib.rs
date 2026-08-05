@@ -15,7 +15,6 @@
 //! Providers implement [`ToolProvider`] and register with [`Router`].
 //! The ring applies identically to local and proxied (gateway) calls.
 
-use async_trait::async_trait;
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::{Permission, PolicyConfig, RootRule};
 use serde_json::{Value, json};
@@ -51,28 +50,20 @@ pub use nmcp_schema::{is_valid_public_tool_name, public_tool_name};
 
 // - ToolProvider -
 
-/// The single interface every tool provider implements.
+/// The provider trait, re-exported from `nmcp-schema`.
 ///
-/// Providers **must not** perform policy checks or audit writes - those happen
-/// in the middleware ring before and after `call()`. Providers also must not
-/// call other tools directly; cross-tool composition belongs at the router level.
-#[async_trait]
-pub trait ToolProvider: Send + Sync {
-    /// Stable, unique prefix for this provider's tools.
-    /// Local providers use `""` (no prefix). Upstream providers use their ID
-    /// so tool names become `upstream_id::tool_name`.
-    fn provider_id(&self) -> &str;
-
-    /// Tool names owned by this provider (without prefix).
-    fn tool_names(&self) -> Vec<String>;
-
-    /// MCP-formatted tool list entries (the `tools` array element schema).
-    fn tool_list(&self) -> Vec<Value>;
-
-    /// Execute a single tool call. The provider receives args and context only.
-    /// Policy and audit are already handled by the ring.
-    async fn call(&self, name: &str, args: Value, ctx: &CallContext) -> ToolCallResult;
-}
+/// It moved there under NMCP-SPEC-003 section 4.3, RATIFIED v1.1, for RC-D1's reason: a
+/// provider crate depends on the contract and never on the kernel, which is what makes the
+/// open-core split hold at the dependency level rather than by convention. Re-exported here so
+/// every existing `use nmcp_router::ToolProvider` keeps compiling.
+///
+/// It gained [`contract_version`](ToolProvider::contract_version) and
+/// [`contracts`](ToolProvider::contracts) in the move and kept `tool_names` and `tool_list`,
+/// which are now defaulted from `contracts` and which I-047d deletes. `call` keeps its four
+/// parameters: 4.3's frozen signature adds `granted: &GrantedAuthority`, and landing it is the
+/// same atomic change as rewiring dispatch through
+/// [`authorize`](nmcp_schema::authorize). Nothing about dispatch changed here.
+pub use nmcp_schema::ToolProvider;
 
 // - AbacCheck trait -
 
@@ -110,24 +101,14 @@ pub trait AbacCheck: Send + Sync {
 
 // - DeleteGuard -
 
-const DELETE_DENIED_NAMES: &[&str] = &[
-    "delete",
-    "delete_file",
-    "remove",
-    "remove_root",
-    "uninstall",
-    "drop",
-    "drop_table",
-    "destroy",
-    "purge",
-    "wipe",
-    "truncate",
-    "rm",
-];
-fn contains_delete_intent(tool_name: &str) -> bool {
-    let lower = tool_name.to_ascii_lowercase();
-    DELETE_DENIED_NAMES.iter().any(|d| lower == *d)
-}
+/// The INV-1 denylist and its predicate, imported from `nmcp-schema`.
+///
+/// Both moved there with the registry, which refuses a delete-denied name at registration
+/// (`RegistrationError::DeleteDeniedName`, RC-A3) and does not live in this crate. A private
+/// import rather than a re-export: this crate's public surface is unchanged, and the point of
+/// the move is that the dispatch-time guard below and the registration-time refusal compare
+/// against one table instead of two that can drift.
+use nmcp_schema::contains_delete_intent;
 
 /// Unconditional last stage of the ring. Panics in debug builds; returns a
 /// governed error in release. Applied to every call - local, proxied, OS, memory.
@@ -146,11 +127,22 @@ fn delete_guard_check(tool_name: &str) -> Option<ToolCallResult> {
 
 // - PolicyRing -
 
+/// What the kernel's compiled-in table says a first-party tool requires.
+///
+/// Public only so a provider migrating to a declared [`nmcp_schema::ToolAuthority`] can be
+/// graded against it: NMCP-SPEC-003 RC-D3 makes this table derived rather than authoritative,
+/// and a migration nobody checked is a migration nobody can trust.
+/// `nmcp-devtools`' `declared_authority_matches_the_kernel_tables_it_replaces` is the one
+/// consumer. It is still the table dispatch consults, and it is deleted together with that
+/// test at I-047d, once dispatch reads the declaration instead.
 #[derive(Debug, Clone, Copy)]
-struct ToolPolicySpec {
-    permission: Permission,
-    path_args: &'static [&'static str],
-    require_windows_api: bool,
+pub struct ToolPolicySpec {
+    /// Root-scoped permission the ring requires for this tool.
+    pub permission: Permission,
+    /// Argument names the ring tries, in order, when resolving the matched root.
+    pub path_args: &'static [&'static str],
+    /// Whether the tool additionally requires the `win.api` grant.
+    pub require_windows_api: bool,
 }
 
 const PATH_ARG_PATH: &[&str] = &["path"];
@@ -160,7 +152,12 @@ const PATH_ARG_REPO: &[&str] = &["repo", "repo_path", "repository", "repository_
 const PATH_ARG_PROGRAM: &[&str] = &["program"];
 const PATH_ARG_DEV: &[&str] = &["path", "repo", "repo_path", "cwd"];
 
-fn tool_policy_spec(tool_name: &str) -> Option<ToolPolicySpec> {
+/// The kernel's compiled-in policy spec for `tool_name`, or `None` for a tool it has never
+/// heard of, which is every tool from every admitted upstream.
+///
+/// Public for the reason on [`ToolPolicySpec`], and for no other. Deleted at I-047d.
+#[must_use]
+pub fn tool_policy_spec(tool_name: &str) -> Option<ToolPolicySpec> {
     let n = tool_name.replace('.', "_");
     let spec = match n.as_str() {
         "execute" | "execute_start" => ToolPolicySpec {
@@ -794,6 +791,10 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    // The trait moved to `nmcp-schema` and the ring no longer names the attribute, but the
+    // test providers below still implement an async trait method and so still need it.
+    use async_trait::async_trait;
+    use nmcp_schema::{ToolAuthority, ToolContract, ToolEffect, ToolReach};
     use std::sync::Arc;
 
     /// M4-1. The Event Log class comes from the permission the ring required, and the mapping
@@ -895,12 +896,40 @@ mod tests {
         Router::new(policy, audit)
     }
 
+    /// One declared tool for a test provider.
+    ///
+    /// NMCP-SPEC-003 section 4.3 makes `contract_version` and `contracts` required, so every
+    /// provider in this module gains both. Nothing in the ring reads them: `resolve` and
+    /// `merged_tool_list_for` still go through `tool_names` and `tool_list`, which every
+    /// provider here still overrides byte for byte. That is why every assertion in this file
+    /// is the assertion it was before the trait moved.
+    fn test_contract(name: &str, effect: ToolEffect) -> ToolContract {
+        ToolContract {
+            name: name.to_string(),
+            description: name.to_string(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            authority: ToolAuthority {
+                permission: None,
+                path_args: Vec::new(),
+                grants: Vec::new(),
+                effect,
+                reach: ToolReach::Local,
+            },
+        }
+    }
+
     struct EchoProvider;
 
     #[async_trait]
     impl ToolProvider for EchoProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             ""
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("echo", ToolEffect::Observe)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["echo".into()]
@@ -919,8 +948,14 @@ mod tests {
 
     #[async_trait]
     impl ToolProvider for WriteProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             ""
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("write_text_file", ToolEffect::Mutate)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["write_text_file".into()]
@@ -1067,8 +1102,14 @@ mod tests {
 
     #[async_trait]
     impl ToolProvider for ThirdPartyProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             "vendor"
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("do_something", ToolEffect::Observe)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["do_something".into()]
@@ -1158,6 +1199,43 @@ mod tests {
         fn contract_result(_: nmcp_schema::ToolCallResult) {}
         contract_context(CallContext::new(None));
         contract_result(ToolCallResult::ok(json!({})));
+    }
+
+    /// The same claim as the test above, for the trait I-047c moved. `ToolProvider` is defined
+    /// in `nmcp-schema` and re-exported here, so a provider crate can keep its
+    /// `use nmcp_router::ToolProvider` while depending only on the contract. Written as a
+    /// function taking the contract crate's trait object and handed one built through the
+    /// re-export, so the two are pinned to the same type rather than merely to the same name.
+    #[test]
+    fn the_re_exported_provider_trait_is_the_one_the_contract_crate_defines() {
+        fn contract_provider(provider: &Arc<dyn nmcp_schema::ToolProvider>) -> String {
+            provider.provider_id().to_string()
+        }
+        let provider: Arc<dyn ToolProvider> = Arc::new(EchoProvider);
+        assert_eq!(contract_provider(&provider), "");
+    }
+
+    /// Adding `contracts` to the trait changed nothing about what this crate resolves against.
+    /// `resolve` and `merged_tool_list_for` still read `tool_names` and `tool_list`, which
+    /// every provider here still overrides, and the declaration is carried and unread until
+    /// I-047d wires the ring through the registry.
+    #[test]
+    fn the_declaration_is_carried_and_not_yet_consulted_by_the_ring() {
+        let provider = EchoProvider;
+        assert_eq!(provider.contract_version(), 1);
+        let declared = provider.contracts();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].name, "echo");
+        assert_eq!(provider.tool_names(), vec!["echo".to_string()]);
+        // The advertised entry is still the literal this provider publishes, not one derived
+        // from the declaration: the default body exists for implementors that dropped the
+        // override, and this one has not.
+        let listed = provider.tool_list();
+        assert_eq!(listed[0]["description"], "Echo args back");
+        assert!(
+            listed[0].get("annotations").is_none(),
+            "the ring's annotation step is what adds these today, and it still is"
+        );
     }
 
     #[tokio::test]
@@ -1406,8 +1484,14 @@ mod tests {
 
     #[async_trait]
     impl ToolProvider for PublishProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             ""
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("dev.git_publish", ToolEffect::Mutate)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["dev.git_publish".into()]
@@ -1424,8 +1508,14 @@ mod tests {
 
     #[async_trait]
     impl ToolProvider for NamespacedProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             "upstream"
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("ping", ToolEffect::Observe)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["ping".into()]
@@ -1444,8 +1534,14 @@ mod tests {
 
     #[async_trait]
     impl ToolProvider for OtherUpstreamProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
         fn provider_id(&self) -> &str {
             "partner"
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            vec![test_contract("fetch", ToolEffect::Observe)]
         }
         fn tool_names(&self) -> Vec<String> {
             vec!["fetch".into()]

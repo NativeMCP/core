@@ -573,6 +573,31 @@ mod tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Declare the tools a test provider owns.
+    ///
+    /// NMCP-SPEC-003 section 4.3 makes `contracts` required, so the two providers in this
+    /// module gain it. Nothing in this crate reads it: ABAC evaluates a tool name and the
+    /// arguments, and the router still resolves through `tool_names`. Derived from
+    /// `tool_names` on purpose, so the declaration cannot drift from the surface these tests
+    /// were written against.
+    fn declare(names: &[String]) -> Vec<nmcp_schema::ToolContract> {
+        names
+            .iter()
+            .map(|name| nmcp_schema::ToolContract {
+                name: name.clone(),
+                description: name.clone(),
+                input_schema: json!({"type": "object"}),
+                authority: nmcp_schema::ToolAuthority {
+                    permission: None,
+                    path_args: Vec::new(),
+                    grants: Vec::new(),
+                    effect: nmcp_schema::ToolEffect::Observe,
+                    reach: nmcp_schema::ToolReach::Local,
+                },
+            })
+            .collect()
+    }
+
     fn make_audit() -> AuditSink {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -873,8 +898,14 @@ mod tests {
         struct Echo;
         #[async_trait]
         impl ToolProvider for Echo {
+            fn contract_version(&self) -> u32 {
+                1
+            }
             fn provider_id(&self) -> &str {
                 ""
+            }
+            fn contracts(&self) -> Vec<nmcp_schema::ToolContract> {
+                declare(&self.tool_names())
             }
             fn tool_names(&self) -> Vec<String> {
                 vec!["echo".into()]
@@ -976,8 +1007,14 @@ mod tests {
         struct Surface;
         #[async_trait]
         impl ToolProvider for Surface {
+            fn contract_version(&self) -> u32 {
+                1
+            }
             fn provider_id(&self) -> &str {
                 ""
+            }
+            fn contracts(&self) -> Vec<nmcp_schema::ToolContract> {
+                declare(&self.tool_names())
             }
             fn tool_names(&self) -> Vec<String> {
                 vec![

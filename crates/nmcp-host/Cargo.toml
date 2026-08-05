@@ -16,5 +16,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+parking_lot.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true

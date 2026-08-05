@@ -6,7 +6,9 @@
 use async_trait::async_trait;
 use nmcp_policy::{Permission, PolicyConfig};
 use nmcp_router::ToolProvider;
-use nmcp_schema::{CallContext, ToolCallResult};
+use nmcp_schema::{
+    CallContext, ToolAuthority, ToolCallResult, ToolContract, ToolEffect, ToolReach,
+};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::process::{Command, Stdio};
@@ -767,8 +769,82 @@ impl DevToolsProvider {
     }
 }
 
+/// What a dev tool needs in order to run, declared rather than looked up.
+///
+/// NMCP-SPEC-003 RC-D3: the descriptor carries its own governance metadata, and the five
+/// tables the kernel used to consult become derived rather than authoritative. Every value
+/// here is derived from what the kernel says about this tool **today**, and the derivation is
+/// graded rather than eyeballed: `declared_authority_matches_the_kernel_tables_it_replaces`
+/// reads `nmcp_router::tool_policy_spec`, `nmcp_proto::READ_ONLY_TOOLS` and
+/// `nmcp_proto::OPEN_WORLD_TOOLS` and asserts the correspondence tool by tool. That test and
+/// those tables are deleted together at I-047d, once dispatch reads the declaration instead.
+///
+/// Two derivations are worth stating because they are not identity mappings.
+///
+/// `permission` is `tool_policy_spec`'s permission unchanged. `path_args` is that spec's
+/// `path_args` **filtered to the names this tool's own input schema defines**, which is
+/// `["path"]` for all seven: the kernel's `PATH_ARG_REPO` and `PATH_ARG_DEV` lists are shared
+/// across tool families and name arguments such as `repo_path` and `cwd` that no dev tool
+/// accepts. The filter is required by RC-D5, which refuses a declared path argument the
+/// schema cannot receive, and it is a narrowing in the safe direction: under the kernel table
+/// a caller passing `repo` resolved the root from `repo` while `git_log` read `path`, so the
+/// root that was authorized and the path that was used could differ. Declaring `path` alone
+/// makes them the same argument.
+///
+/// `grants` is empty for every dev tool because `require_windows_api` is false for every one
+/// of them, which the fidelity test asserts rather than assumes.
+fn dev_tool_authority(name: &str) -> ToolAuthority {
+    // Exhaustive over the seven tools this provider declares, with no wildcard arm. A tool
+    // added to `contracts` without a line here does not compile, which is the point: an
+    // authority guessed by a fallback is an authority nobody decided.
+    let (permission, effect, reach) = match name {
+        "dev.git_log" | "dev.git_blame" | "dev.git_diff" | "dev.git_stash_list" => {
+            (Permission::Read, ToolEffect::Observe, ToolReach::Local)
+        }
+        "dev.dep_graph" => (Permission::Execute, ToolEffect::Observe, ToolReach::Local),
+        "dev.test_run" => (Permission::Execute, ToolEffect::Mutate, ToolReach::Remote),
+        "dev.git_publish" => (
+            Permission::GitPublish,
+            ToolEffect::Mutate,
+            ToolReach::Remote,
+        ),
+        other => return unknown_tool_authority(other),
+    };
+    ToolAuthority {
+        permission: Some(permission),
+        path_args: vec!["path".to_string()],
+        grants: Vec::new(),
+        effect,
+        reach,
+    }
+}
+
+/// The authority of a tool this crate declares and has no line for.
+///
+/// Unreachable through [`DevToolsProvider::contracts`], whose seven names are literals in the
+/// same file as the match above, and written anyway because the alternative to a fail-closed
+/// arm is a fallback that grants something. This one grants nothing that can be satisfied: it
+/// requires a capability grant no `Permission` defines, which `authorize` refuses as
+/// [`nmcp_schema::Denial::UnknownGrant`] on every call, loudly and by name. A tool that
+/// reached here would be visible and uncallable rather than callable and ungoverned.
+fn unknown_tool_authority(name: &str) -> ToolAuthority {
+    ToolAuthority {
+        permission: Some(Permission::Read),
+        path_args: vec!["path".to_string()],
+        grants: vec![nmcp_schema::CapabilityGrant::new(format!(
+            "nmcp.undeclared.{name}"
+        ))],
+        effect: ToolEffect::Mutate,
+        reach: ToolReach::Remote,
+    }
+}
+
 #[async_trait]
 impl ToolProvider for DevToolsProvider {
+    fn contract_version(&self) -> u32 {
+        1
+    }
+
     // The trait declares `-> &str`; an impl cannot narrow it to a static
     // lifetime on its own.
     #[allow(clippy::unnecessary_literal_bound)]
@@ -776,117 +852,43 @@ impl ToolProvider for DevToolsProvider {
         ""
     }
 
-    fn tool_names(&self) -> Vec<String> {
-        vec![
-            "dev.git_log".into(),
-            "dev.git_blame".into(),
-            "dev.git_diff".into(),
-            "dev.test_run".into(),
-            "dev.dep_graph".into(),
-            "dev.git_stash_list".into(),
-            "dev.git_publish".into(),
-        ]
-    }
-
-    fn tool_list(&self) -> Vec<Value> {
-        vec![
-            json!({
-                "name": "dev.git_log",
-                "description": "Show git log for a repository path.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Repository path"},
-                        "limit": {"type": "integer", "default": 20, "maximum": 100},
-                        "author": {"type": "string"},
-                        "since": {"type": "string"}
-                    },
-                    "required": ["path"]
+    /// The seven tools this provider owns, fully declared.
+    ///
+    /// Replaces the `tool_names` and `tool_list` pair this impl carried, which had to agree
+    /// and were never checked against each other. Both still exist on the trait and both are
+    /// now derived from here by the default bodies, so the name list and the advertised
+    /// entries cannot disagree; I-047d deletes them. `provider_advertises_the_same_entries_it_always_did`
+    /// asserts the derived `tool_list` is byte-identical to what this impl published before,
+    /// annotations included.
+    fn contracts(&self) -> Vec<ToolContract> {
+        dev_tool_descriptors()
+            .into_iter()
+            .map(|entry| {
+                // The three descriptive fields come off the descriptor, so the declaration and
+                // the advertised entry are one source rather than two that must agree. A
+                // descriptor that lost its `name` derives the empty public name, which the
+                // registry refuses as `InvalidToolName` rather than registering a tool nothing
+                // can address.
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                ToolContract {
+                    authority: dev_tool_authority(&name),
+                    description: entry
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    input_schema: entry
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    name,
                 }
-            }),
-            json!({
-                "name": "dev.git_blame",
-                "description": "Show git blame for a file.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path"},
-                        "start_line": {"type": "integer"},
-                        "end_line": {"type": "integer"}
-                    },
-                    "required": ["path"]
-                }
-            }),
-            json!({
-                "name": "dev.git_diff",
-                "description": "Show git diff for a repository.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "ref_a": {"type": "string", "default": "HEAD"},
-                        "ref_b": {"type": "string"},
-                        "file_filter": {"type": "string"}
-                    },
-                    "required": ["path"]
-                }
-            }),
-            json!({
-                "name": "dev.test_run",
-                "description": "Run tests using cargo, npm, python, or pytest.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "command": {"type": "string", "enum": ["cargo", "npm", "python", "pytest"]},
-                        "extra_args": {"type": "array", "items": {"type": "string"}},
-                        "timeout_ms": {"type": "integer", "default": 60000}
-                    },
-                    "required": ["path", "command"]
-                }
-            }),
-            json!({
-                "name": "dev.dep_graph",
-                "description": "Show dependency graph using cargo, npm, or pip.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "manager": {"type": "string", "enum": ["cargo", "npm", "pip"]},
-                        "depth": {"type": "integer", "default": 3},
-                        "package": {"type": "string"}
-                    },
-                    "required": ["path", "manager"]
-                }
-            }),
-            json!({
-                "name": "dev.git_stash_list",
-                "description": "List git stashes in a repository.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"}
-                    },
-                    "required": ["path"]
-                }
-            }),
-            json!({
-                "name": "dev.git_publish",
-                "description": "Governed git publish path requiring explicit git.publish root permission.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "remote": {"type": "string"},
-                        "remote_url": {"type": "string"},
-                        "branch": {"type": "string"},
-                        "expected_head": {"type": "string"},
-                        "dry_run": {"type": "boolean"}
-                    },
-                    "required": ["path"]
-                }
-            }),
-        ]
+            })
+            .collect()
     }
 
     async fn call(&self, name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
@@ -923,6 +925,113 @@ impl ToolProvider for DevToolsProvider {
         .await
         .unwrap_or_else(|err| ToolCallResult::err(format!("devtools worker failed: {err}")))
     }
+}
+
+/// The name, description and input schema of every tool this provider advertises.
+///
+/// These are the seven descriptors this impl used to return from `tool_list`, unchanged. They
+/// live in a free function rather than in `contracts` so the declaration reads as a table
+/// rather than as a hundred-line method, and so the fidelity tests can compare against them
+/// directly.
+fn dev_tool_descriptors() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "dev.git_log",
+            "description": "Show git log for a repository path.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repository path"},
+                    "limit": {"type": "integer", "default": 20, "maximum": 100},
+                    "author": {"type": "string"},
+                    "since": {"type": "string"}
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "dev.git_blame",
+            "description": "Show git blame for a file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"}
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "dev.git_diff",
+            "description": "Show git diff for a repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "ref_a": {"type": "string", "default": "HEAD"},
+                    "ref_b": {"type": "string"},
+                    "file_filter": {"type": "string"}
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "dev.test_run",
+            "description": "Run tests using cargo, npm, python, or pytest.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "command": {"type": "string", "enum": ["cargo", "npm", "python", "pytest"]},
+                    "extra_args": {"type": "array", "items": {"type": "string"}},
+                    "timeout_ms": {"type": "integer", "default": 60000}
+                },
+                "required": ["path", "command"]
+            }
+        }),
+        json!({
+            "name": "dev.dep_graph",
+            "description": "Show dependency graph using cargo, npm, or pip.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "manager": {"type": "string", "enum": ["cargo", "npm", "pip"]},
+                    "depth": {"type": "integer", "default": 3},
+                    "package": {"type": "string"}
+                },
+                "required": ["path", "manager"]
+            }
+        }),
+        json!({
+            "name": "dev.git_stash_list",
+            "description": "List git stashes in a repository.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "dev.git_publish",
+            "description": "Governed git publish path requiring explicit git.publish root permission.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "remote": {"type": "string"},
+                    "remote_url": {"type": "string"},
+                    "branch": {"type": "string"},
+                    "expected_head": {"type": "string"},
+                    "dry_run": {"type": "boolean"}
+                },
+                "required": ["path"]
+            }
+        }),
+    ]
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -970,6 +1079,130 @@ mod tests {
         assert!(names.contains(&"dev.dep_graph".to_string()));
         assert!(names.contains(&"dev.git_stash_list".to_string()));
         assert!(names.contains(&"dev.git_publish".to_string()));
+    }
+
+    /// The proof that the migration is faithful, rather than the claim that it is.
+    ///
+    /// NMCP-SPEC-003 RC-D3 makes `tool_policy_spec`, `READ_ONLY_TOOLS` and `OPEN_WORLD_TOOLS`
+    /// derived rather than authoritative, and this provider is the first one to declare what
+    /// those tables used to say about it. A derivation nobody checked is a migration nobody
+    /// can trust, so every field of every declared [`ToolAuthority`] is graded here against
+    /// the table it replaces, tool by tool, with no tool exempt.
+    ///
+    /// `path_args` is the one field that is not an identity mapping, and the assertion below
+    /// states the rule exactly rather than pinning the answer: the declaration must be the
+    /// kernel's list **filtered to the arguments this tool's own schema defines**, in the
+    /// kernel's order. RC-D5 forces the filter, because a declared path argument the schema
+    /// cannot receive is a registration error. It is a narrowing and never a widening: the
+    /// declaration is a subsequence of the kernel's list, so no argument the kernel would not
+    /// have tried can resolve a root here.
+    ///
+    /// This test is deleted at I-047d together with the tables it reads.
+    #[test]
+    fn declared_authority_matches_the_kernel_tables_it_replaces() {
+        let provider = make_provider();
+        let contracts = provider.contracts();
+        assert_eq!(contracts.len(), 7, "every dev tool must be declared");
+
+        for contract in contracts {
+            let public = nmcp_schema::public_tool_name("", &contract.name);
+            let spec = nmcp_router::tool_policy_spec(&public)
+                .unwrap_or_else(|| panic!("{public} has no kernel policy spec to grade against"));
+            let declared = &contract.authority;
+
+            assert_eq!(
+                declared.permission,
+                Some(spec.permission),
+                "{public}: declared permission must be the one the ring requires today"
+            );
+
+            // The kernel's list, keeping only what this tool's schema can actually receive.
+            let expected: Vec<String> = spec
+                .path_args
+                .iter()
+                .filter(|arg| {
+                    contract
+                        .input_schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| properties.contains_key(**arg))
+                })
+                .map(|arg| (*arg).to_string())
+                .collect();
+            assert_eq!(
+                declared.path_args, expected,
+                "{public}: declared path arguments must be the kernel's list filtered to the \
+                 schema, in the kernel's order"
+            );
+            assert!(
+                declared
+                    .path_args
+                    .iter()
+                    .all(|arg| spec.path_args.contains(&arg.as_str())),
+                "{public}: the declaration must never add a path argument the kernel would not \
+                 have tried"
+            );
+            assert!(
+                !declared.path_args.is_empty(),
+                "{public}: dropping every path argument would stop resolving a root at all"
+            );
+
+            // `require_windows_api` is the only grant the kernel table can demand, and no dev
+            // tool demands it. Asserted rather than assumed, so a table edit that made one
+            // Windows-gated would fail here instead of silently dropping the gate.
+            assert!(
+                !spec.require_windows_api,
+                "{public}: the kernel demands win.api, which the declaration does not carry"
+            );
+            assert!(
+                declared.grants.is_empty(),
+                "{public}: declared a grant the kernel table never required"
+            );
+
+            assert_eq!(
+                declared.effect == ToolEffect::Observe,
+                nmcp_proto::READ_ONLY_TOOLS.contains(&public.as_str()),
+                "{public}: declared effect disagrees with READ_ONLY_TOOLS"
+            );
+            assert_eq!(
+                declared.reach == ToolReach::Remote,
+                nmcp_proto::OPEN_WORLD_TOOLS.contains(&public.as_str()),
+                "{public}: declared reach disagrees with OPEN_WORLD_TOOLS"
+            );
+        }
+    }
+
+    /// The declaration replaced two methods without changing a byte this provider publishes.
+    ///
+    /// `tool_names` and `tool_list` now come from the trait's default bodies, derived from
+    /// `contracts`. This asserts the derived entries carry the same names, descriptions and
+    /// schemas the impl used to return literally, and that the annotations the derivation adds
+    /// are the ones `nmcp_proto::tool_annotations` would have added downstream. Both halves
+    /// matter: the first is that nothing was lost, the second is that the router's annotation
+    /// step, which only fires when an entry carries none, now has nothing left to add and
+    /// would have added the same thing.
+    #[test]
+    fn provider_advertises_the_same_entries_it_always_did() {
+        let provider = make_provider();
+        let published = provider.tool_list();
+        let descriptors = dev_tool_descriptors();
+        assert_eq!(published.len(), descriptors.len());
+
+        for (entry, descriptor) in published.iter().zip(descriptors.iter()) {
+            assert_eq!(entry["name"], descriptor["name"]);
+            assert_eq!(entry["description"], descriptor["description"]);
+            assert_eq!(entry["inputSchema"], descriptor["inputSchema"]);
+
+            let public = nmcp_schema::public_tool_name(
+                "",
+                entry["name"].as_str().expect("an entry names its tool"),
+            );
+            assert_eq!(
+                entry["annotations"],
+                nmcp_proto::tool_annotations(&public),
+                "{public}: the derived annotations differ from the ones the router would add"
+            );
+        }
     }
 
     #[test]
