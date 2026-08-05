@@ -1,0 +1,18 @@
+[package]
+name = "nmcp-identity"
+description = "Platform-neutral filesystem identity: product name, data root, and derived directory and file paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

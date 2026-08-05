@@ -274,6 +274,10 @@ name = "nmcp-host"
 version = "0.1.0"
 
 [[package]]
+name = "nmcp-identity"
+version = "0.1.0"
+
+[[package]]
 name = "nmcp-policy"
 version = "0.1.0"
 
