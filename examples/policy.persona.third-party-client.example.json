@@ -1,0 +1,52 @@
+{
+  "_comment": "Persona: a third-party MCP client (for example ChatGPT) that must reach a deliberate read-only subset and nothing else. See G3-12. Authenticating a client establishes who is calling and says nothing about what it may do; without the abac_rules block below, any authenticated client inherits the entire tool surface, including execute as the service account and the Microsoft 365 send surface. The mcp_clients digest here is all zeros so this template is fail-closed as shipped: replace it with a real SHA-256 before use.",
+  "admin_bind": "127.0.0.1:18769",
+  "mcp_bind": "127.0.0.1:18770",
+  "mcp_allowed_origins": [],
+  "mcp_require_client_auth": true,
+  "mcp_clients": [
+    {
+      "agent_id": "operator",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "agent_id": "third-party",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "require_upstream_pinning": true,
+  "auto_approve": false,
+  "audit_path": "C:\\ProgramData\\NativeMCP\\audit\\nativemcp-mcp.audit.jsonl",
+  "exec_state_dir": "C:\\ProgramData\\NativeMCP\\work\\exec-jobs",
+  "tool_paths": {},
+  "execution_profiles": {},
+  "roots": [
+    {
+      "id": "review",
+      "path": "D:\\projects",
+      "permissions": [
+        "list",
+        "read",
+        "search",
+        "scan",
+        "report"
+      ]
+    }
+  ],
+  "upstreams": [],
+  "abac_rules": [
+    {
+      "kind": "caller_tool_allowlist",
+      "caller": "third-party",
+      "allowed_tools": [
+        "list_roots",
+        "list_directory",
+        "read_file_window_report",
+        "inspect_file_integrity",
+        "search_repo",
+        "scan_repo"
+      ],
+      "action": "deny"
+    }
+  ]
+}

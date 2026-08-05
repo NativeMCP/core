@@ -1,0 +1,55 @@
+{
+  "admin_bind": "127.0.0.1:18769",
+  "mcp_bind": "127.0.0.1:18770",
+  "mcp_allowed_origins": [],
+  "mcp_require_client_auth": false,
+  "auto_approve": true,
+  "audit_path": "C:\\ProgramData\\NativeMCP\\audit\\nativemcp-mcp.audit.jsonl",
+  "exec_state_dir": "C:\\ProgramData\\NativeMCP\\work\\exec-jobs",
+  "tool_paths": {
+    "cargo": "C:\\Users\\<user>\\.cargo\\bin\\cargo.exe",
+    "rustc": "C:\\Users\\<user>\\.cargo\\bin\\rustc.exe",
+    "git": "C:\\Program Files\\Git\\cmd\\git.exe",
+    "gh": "C:\\Program Files\\GitHub CLI\\gh.exe",
+    "ssh": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+    "node": "C:\\Program Files\\nodejs\\node.exe",
+    "npm": "C:\\Program Files\\nodejs\\npm.cmd"
+  },
+  "execution_profiles": {
+    "dev": {
+      "path_prepend": [
+        "C:\\Users\\<user>\\.cargo\\bin",
+        "C:\\Program Files\\Git\\cmd",
+        "C:\\Program Files\\GitHub CLI",
+        "C:\\Windows\\System32\\OpenSSH",
+        "C:\\Program Files\\nodejs"
+      ],
+      "env": {
+        "GIT_TERMINAL_PROMPT": "0"
+      },
+      "inherit_service_env": true
+    }
+  },
+  "default_execution_profile": "dev",
+  "roots": [
+    {
+      "id": "projects",
+      "path": "D:\\dev",
+      "permissions": [
+        "list",
+        "read",
+        "search",
+        "create",
+        "write",
+        "modify",
+        "rename",
+        "move",
+        "backup",
+        "execute",
+        "scan",
+        "report",
+        "git.publish"
+      ]
+    }
+  ]
+}

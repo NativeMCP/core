@@ -1,0 +1,36 @@
+[package]
+name = "nmcp-abac"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Attribute-based access control ring stage for the Model Context Platform."
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ed25519-dalek = { version = "2.1", features = ["pkcs8"] }
+hex = "0.4"
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-router = { path = "../nmcp-router", version = "0.1.0" }
+parking_lot.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+nmcp-memory = { path = "../nmcp-memory", version = "0.1.0" }
