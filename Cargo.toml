@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+"crates/nmcp-fs",
 "crates/nmcp-exec",
 "crates/nmcp-memory",
 "crates/nmcp-identity",
