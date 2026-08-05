@@ -53,6 +53,7 @@ strip = "symbols"
 debug = "line-tables-only"
 
 [workspace.dependencies]
+nmcp-identity = { path = "crates/nmcp-identity", version = "0.1.0" }
 regex = "1.11.1"
 async-trait = "0.1.83"
 uuid = { version = "1.12.1", features = ["v4", "serde"] }
