@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+"crates/nmcp-router",
 "crates/nmcp-transport",
 "crates/nmcp-fs",
 "crates/nmcp-exec",
@@ -56,6 +57,7 @@ strip = "symbols"
 debug = "line-tables-only"
 
 [workspace.dependencies]
+tracing = "0.1.41"
 walkdir = "2.5.0"
 nmcp-identity = { path = "crates/nmcp-identity", version = "0.1.0" }
 regex = "1.11.1"
