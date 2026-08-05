@@ -11,6 +11,15 @@
 //! optional `store.json` holding store-level configuration. Every document carries the schema
 //! version (SB-10), and every sealed blob inside one records the [`SealerId`] that sealed it.
 //!
+//! From I-036 a document may also carry the key's binding block: the operator-written terms
+//! of use, their own schema version, and the use budget's spend state (SB-6 at v1.1, which
+//! rules that bindings are per-key store metadata and the crate that owns the store owns
+//! their evaluation). [`SealedStore::bind`] writes it, [`SealedStore::evaluate`] consumes it
+//! and mints the [`BindingGrant`] resolution costs; the model, the evaluation order and the
+//! budget decisions live in [`crate::binding`]'s documentation. A document without the block
+//! is every store written before bindings existed, and its keys refuse evaluation until
+//! bound, which is deny by default rather than a compatibility break.
+//!
 //! Per-secret files are the isolation SB-10 asks for, taken literally: a document that will
 //! not parse, or a blob that will not authenticate, takes out one key. The other keys load,
 //! list and resolve, the damaged file is reported by [`SealedStore::unreadable`] rather than
@@ -60,6 +69,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::binding::{
+    BINDING_SCHEMA_VERSION, BindingDenial, BindingRecord, BindingRequest, KeyBinding,
+};
 use crate::file_sealer::MemorySealer;
 use crate::grant::{BindingGrant, BindingRuleId};
 use crate::lifecycle::{IllegalTransition, KeyLifecycle, KeyState};
@@ -277,6 +289,13 @@ struct SecretDocument {
     schema: u32,
     name: SecretName,
     created_at_unix_ms: u64,
+    /// The key's binding, when the operator has written one (SB-6, v1.1). Absent means no
+    /// use: [`SealedStore::evaluate`] refuses an unbound key with the rule named, which is
+    /// deny by default made visible rather than a parse-time default. Absent is also what
+    /// every pre-binding document is, so stores written before this field exists open
+    /// unchanged and their keys refuse evaluation until bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding: Option<BindingRecord>,
     versions: BTreeMap<Version, VersionRecord>,
 }
 
@@ -530,6 +549,88 @@ impl SealedStore {
         self.sealer.unseal(&bytes, &context).map_err(unsealable)
     }
 
+    /// Evaluate `name`'s binding against `request` and mint the grant one resolution costs.
+    ///
+    /// The binding evaluator NMCP-SPEC-002 v1.1 places in this crate (SB-6, section 9), and
+    /// the only production path that constructs a [`BindingGrant`]: the constructor never
+    /// crosses a crate boundary, which is what makes the grant unforgeable (SB-15). The host
+    /// calls this at ring stage 5b with the request context and hands the grant to
+    /// [`SealedStore::resolve`]; the gates, their order, the use budget's home and the
+    /// decision that the budget decrements here rather than at resolution are all argued in
+    /// the binding module's documentation, `src/binding.rs`.
+    ///
+    /// Evaluation decides authorization and service state; it does not pre-flight the
+    /// cryptography. A grant can still be refused by `resolve` when the key was quarantined
+    /// between the two or the blob does not open under this store's sealer, and a budgeted
+    /// use spent on such a grant stays spent, which is the decrement-at-mint ruling.
+    ///
+    /// # Errors
+    ///
+    /// [`BindingDenial`], naming the one governing rule (SB-8): the first refusing gate in
+    /// the documented order. A key with no binding refuses with the rule named, which is
+    /// deny by default made visible, and a key with no version in service refuses here, at
+    /// the earliest point that knows, rather than minting a grant resolution would refuse.
+    pub fn evaluate(
+        &self,
+        name: &SecretName,
+        request: &BindingRequest,
+    ) -> Result<BindingGrant, BindingDenial> {
+        let mut state = self.state.lock();
+        let now = (self.clock)();
+        sweep(&mut state, now);
+        if is_damaged(&state, name) {
+            return Err(BindingDenial::DamagedEntry {
+                name: name.to_string(),
+            });
+        }
+        let Some(document) = state.secrets.get(name) else {
+            return Err(BindingDenial::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        let Some(record) = document.binding.as_ref() else {
+            return Err(BindingDenial::NoBinding {
+                name: name.to_string(),
+            });
+        };
+        crate::binding::admit(&record.terms, request, name, now)?;
+        let Some(version) = current_version(document) else {
+            // The current version's state, or the highest version's when nothing is in
+            // service, exactly as [`SealedStore::names`] reports it: a quarantined key says
+            // it is quarantined rather than saying nothing.
+            let state_now = document
+                .versions
+                .values()
+                .next_back()
+                .map_or(KeyState::Created, |record| record.lifecycle.state());
+            return Err(BindingDenial::NotInService {
+                name: name.to_string(),
+                state: state_now,
+            });
+        };
+        if let Some(budget) = record.terms.budget {
+            // The one gate that writes, reached only by a request every other gate
+            // admitted, and persisted before the grant exists: decrement at mint, argued in
+            // the binding module's documentation.
+            let spent = crate::binding::spend(budget, record.spent, name, now)?;
+            let mut updated = document.clone();
+            if let Some(updated_record) = updated.binding.as_mut() {
+                updated_record.spent = Some(spent);
+            }
+            persist_and_commit(&mut state, name, updated).map_err(|source| {
+                BindingDenial::UseNotRecorded {
+                    name: name.to_string(),
+                    source: Box::new(source),
+                }
+            })?;
+        }
+        Ok(BindingGrant::issue(
+            name.clone(),
+            version,
+            crate::binding::rule_for(name),
+        ))
+    }
+
     /// Store the first version of `name`.
     ///
     /// Refuses a name that already exists, and names [`SealedStore::rotate`] in the refusal:
@@ -558,6 +659,9 @@ impl SealedStore {
             schema: STORE_SCHEMA_VERSION,
             name: name.clone(),
             created_at_unix_ms: now,
+            // Deny by default (SB-6): a fresh secret has no binding, so nothing may use it
+            // until the operator binds it.
+            binding: None,
             versions: BTreeMap::from([(version, record)]),
         };
         persist_and_commit(&mut state, name, document)?;
@@ -739,6 +843,48 @@ impl SealedStore {
                 name: name.to_string(),
             });
         }
+        persist_and_commit(&mut state, name, updated)?;
+        Ok(())
+    }
+
+    /// Write `name`'s binding: what may use the key, per SB-6, replacing any prior binding.
+    ///
+    /// The fifth operator write (SB-13's "bind"), and like the other four it exists only on
+    /// the operator surface and is audited by its caller (SB-7 at I-034, `nmcpctl` at
+    /// I-038); no agent-reachable path leads here. Until a key is bound, nothing may use it:
+    /// [`SealedStore::evaluate`] refuses an unbound key with the rule named, so `bind` is
+    /// the grant of use, not a refinement of one.
+    ///
+    /// Replacement is whole and it resets the budget's spend state, deliberately: a new
+    /// binding is a new regime, and the operator writing it is the authority the budget
+    /// constrains callers against, not a caller the budget constrains (INV-4 bounds what a
+    /// caller supplies; an operator rewriting terms is the policy changing). A quarantined
+    /// or suspended key can be bound, because a binding is authorization metadata that takes
+    /// effect when the key returns to service, and refusing would order two operator steps
+    /// for no safety gain: evaluation still refuses the key on state either way. There is no
+    /// unbind and none is needed: an operator withdrawing use binds empty allowlists, which
+    /// admit nothing and stay visible, or quarantines the key; values are untouched either
+    /// way (INV-1).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged on disk, or the document cannot be
+    /// written.
+    pub fn bind(&self, name: &SecretName, binding: KeyBinding) -> Result<(), StoreError> {
+        let mut state = self.state.lock();
+        sweep(&mut state, (self.clock)());
+        ensure_not_damaged(&state, name)?;
+        let Some(document) = state.secrets.get(name) else {
+            return Err(StoreError::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        let mut updated = document.clone();
+        updated.binding = Some(BindingRecord {
+            schema: BINDING_SCHEMA_VERSION,
+            terms: binding,
+            spent: None,
+        });
         persist_and_commit(&mut state, name, updated)?;
         Ok(())
     }
@@ -1170,6 +1316,7 @@ fn read_document(
     {
         check_schema(&value, path)?;
     }
+    check_binding_schema(&value, path)?;
     let Ok(document) = serde_json::from_value::<SecretDocument>(value) else {
         return Ok(Err(UnreadableReason::NotASecretDocument));
     };
@@ -1215,6 +1362,34 @@ fn check_schema(value: &serde_json::Value, path: &Path) -> Result<(), StoreError
             path: path.display().to_string(),
             reason: "the document declares no schema".to_string(),
         }),
+    }
+}
+
+/// Refuse a binding block written to a schema this build does not know.
+///
+/// The same rule [`check_schema`] applies to the document, at the binding block's own
+/// version: a block declaring a newer schema is a store written by a newer build, refused
+/// rather than guessed at, and the check runs against the raw value because the newer
+/// block's unknown fields would otherwise fail the typed parse first and report the wrong
+/// thing, a foreign document instead of a newer store. A block with no numeric schema at all
+/// is left to the typed parse, which refuses it and isolates that one document: malformation
+/// costs a key, a newer format refuses the open.
+fn check_binding_schema(value: &serde_json::Value, path: &Path) -> Result<(), StoreError> {
+    let Some(found) = value
+        .get("binding")
+        .and_then(|block| block.get("schema"))
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok(());
+    };
+    if found == u64::from(BINDING_SCHEMA_VERSION) {
+        Ok(())
+    } else {
+        Err(StoreError::UnknownBindingSchema {
+            path: path.display().to_string(),
+            found,
+            known: BINDING_SCHEMA_VERSION,
+        })
     }
 }
 
@@ -1347,6 +1522,23 @@ pub enum StoreError {
         /// The schema the document declares.
         found: u64,
         /// The schema this build writes.
+        known: u32,
+    },
+
+    /// A document's binding block is written to a schema this build does not know.
+    ///
+    /// Refused for the reason [`StoreError::UnknownSchema`] refuses a newer document: it is
+    /// a store written by a newer build, and guessing at binding fields you do not know is
+    /// guessing at authorization, which is worse than guessing at layout.
+    #[error(
+        "secret store document {path} carries a binding at schema {found} and this build knows binding schema {known}; a newer store is refused rather than guessed at"
+    )]
+    UnknownBindingSchema {
+        /// The path involved.
+        path: String,
+        /// The binding schema the document declares.
+        found: u64,
+        /// The binding schema this build writes.
         known: u32,
     },
 
