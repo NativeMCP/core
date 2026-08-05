@@ -14,9 +14,35 @@
 //! policy table the ring used to consult is deleted. That had to be one change: dispatch cannot
 //! hand a provider a `GrantedAuthority` until it produces one, and it cannot produce one until
 //! it reads the declaration this index holds.
+//!
+//! ## The request state machine
+//!
+//! [`RequestState`] enumerates the request lifecycle and the transitions between its states,
+//! which is INV-5's "states are data" written as a type rather than inferred from which fields
+//! happen to be populated. NMCP-SPEC-003 RC-15 adds the `Received -> Rejected` edge, because
+//! ring stages 0 through 3 in section 4.6 refuse before `Authorizing` is entered and had no
+//! legal state to move to.
+//!
+//! The type is defined in `nmcp-schema` and re-exported here, so `nmcp_host::RequestState`
+//! still resolves and the transition tests below are the ones this crate always had. I-049 set
+//! out to wire it into dispatch and found it could not be done from here: dispatch is in
+//! `nmcp-router`, and `nmcp-router` cannot see this crate without inverting the
+//! `nmcp-host -> nmcp-router` edge RC-D1 declares and creating the cycle at I-031 that
+//! NMCP-SPEC-003 exists to prevent. That was escalated rather than decided in code, and it
+//! produced v1.4: the lifecycle is part of the contract every participant in a governed call
+//! must agree on, so it lives with the rest of the contract, and `nmcp-host` remains where the
+//! ring is composed.
+//!
+//! What v1.4 also names is worse than a placement question and is recorded here because this
+//! crate is where it was shipped: through v1.3 the transitions were correct, tested and inert.
+//! [`RequestState::can_transition_to`] returns a `bool` that nothing was obliged to call and
+//! nothing called, so INV-5 was a claim about a type rather than about the server.
+//! `nmcp_schema::SettledRequest` and the guard types beside it are what closed that, and
+//! `nmcp_router::Router::dispatch` walks them (RC-22).
 
 mod registry;
 
+pub use nmcp_schema::RequestState;
 pub use registry::IndexedToolRegistry;
 
 /// Semantic version of this crate, taken from the workspace manifest.
@@ -24,51 +50,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Crate identity as it appears in audit records and capability manifests.
 pub const COMPONENT: &str = "nmcp-host";
-
-/// Lifecycle states of a served request.
-///
-/// INV-5: state is data with an enumerated transition set, not something
-/// inferred from which fields happen to be populated. Every terminal
-/// state is reached deliberately, including the rejected one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RequestState {
-    /// Received off the transport, nothing evaluated yet.
-    Received,
-    /// Passed to the policy engine for authority and root resolution.
-    Authorizing,
-    /// Audit record written and durable. INV-3 gate.
-    Recorded,
-    /// Effect applied.
-    Executed,
-    /// Response handed back to the transport. Terminal.
-    Completed,
-    /// Refused by policy. Terminal, and audited like any other outcome.
-    Rejected,
-}
-
-impl RequestState {
-    /// Returns `true` when `next` is a legal successor of `self`.
-    ///
-    /// Note that `Executed` is reachable only from `Recorded`. That edge
-    /// is INV-3 expressed as a transition: there is no path to an effect
-    /// that does not pass through a durable audit record.
-    #[must_use]
-    pub fn can_transition_to(self, next: Self) -> bool {
-        matches!(
-            (self, next),
-            (Self::Received, Self::Authorizing)
-                | (Self::Authorizing, Self::Recorded | Self::Rejected)
-                | (Self::Recorded, Self::Executed | Self::Rejected)
-                | (Self::Executed, Self::Completed)
-        )
-    }
-
-    /// Returns `true` when no further transition is legal.
-    #[must_use]
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Rejected)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -122,5 +103,32 @@ mod tests {
     fn rejection_is_reachable_before_and_after_the_audit_gate() {
         assert!(RequestState::Authorizing.can_transition_to(RequestState::Rejected));
         assert!(RequestState::Recorded.can_transition_to(RequestState::Rejected));
+    }
+
+    /// RC-15, and the whole of it: one edge added, and the rest of the row unchanged.
+    ///
+    /// The two illegal transitions named here are named because they are the ones that would
+    /// matter. `Received -> Recorded` would let a refusal claim a durable intent record that
+    /// was never written, and `Received -> Executed` is the INV-3 gate itself. The value of
+    /// the new edge is that it is the only one, so this asserts the whole `Received` row
+    /// rather than the single addition.
+    #[test]
+    fn a_pre_authorization_refusal_has_a_state_to_move_to() {
+        assert!(
+            RequestState::Received.can_transition_to(RequestState::Rejected),
+            "ring stages 0 through 3 refuse before Authorizing is entered"
+        );
+        assert!(
+            !RequestState::Received.can_transition_to(RequestState::Recorded),
+            "a refusal never wrote an intent record, so it cannot claim one"
+        );
+        assert!(
+            !RequestState::Received.can_transition_to(RequestState::Executed),
+            "INV-3: the only predecessor of Executed is Recorded"
+        );
+        // The rest of the row, so "exactly one edge added" is asserted rather than described.
+        assert!(RequestState::Received.can_transition_to(RequestState::Authorizing));
+        assert!(!RequestState::Received.can_transition_to(RequestState::Received));
+        assert!(!RequestState::Received.can_transition_to(RequestState::Completed));
     }
 }

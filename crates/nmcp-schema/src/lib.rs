@@ -46,10 +46,20 @@
 //! provider supplying any is refused at registration, and first-party annotations stay derived
 //! from the declared authority by [`ToolContract::to_list_entry`] so they cannot disagree with
 //! what the kernel authorizes against (RC-21, RC-A4).
+//!
+//! I-049 added the request lifecycle: [`RequestState`] and the guard types that walk it. It
+//! arrived here at NMCP-SPEC-003 v1.4 from `nmcp-host`, which re-exports it, and it belongs
+//! here on the merits rather than for reach: the lifecycle is part of what every participant in
+//! a governed call must agree on, exactly like [`ToolAuthority`] and [`CallContext`]. The guard
+//! is what makes INV-5 a property of the server instead of a property of a type, since
+//! [`RequestState::can_transition_to`] is advice that nothing was obliged to take and nothing
+//! took for four spec versions. See [`SettledRequest`] for the piece that makes a skipped stage
+//! a compile error rather than an untested possibility.
 
 mod authority;
 mod context;
 mod contract;
+mod lifecycle;
 mod names;
 mod provider;
 mod registry;
@@ -62,6 +72,10 @@ pub use authority::{
 };
 pub use context::{CallContext, ToolCallResult};
 pub use contract::ToolContract;
+pub use lifecycle::{
+    RequestAuthorizing, RequestCompleted, RequestExecuted, RequestReceived, RequestRecorded,
+    RequestRejected, RequestState, SettledRequest,
+};
 pub use names::{
     DELETE_DENIED_NAMES, contains_delete_intent, is_valid_public_tool_name, public_tool_name,
 };
