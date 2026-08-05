@@ -1,12 +1,16 @@
-//! Registration refusals and the per-caller catalogue view.
+//! The registry contract: the trait, its refusals, and the per-caller catalogue view.
 //!
-//! NMCP-SPEC-003 section 4.4, RATIFIED v1.0, minus the `ToolRegistry` trait itself: that
-//! trait's methods take `Arc<dyn ToolProvider>`, and `ToolProvider` has not moved into
-//! this crate yet. Named gap, not a silent absence: the trait and the registry that
-//! implements it land with the rest of section 4.3 and 4.4, and the two value types here
-//! are the half that has no such dependency.
+//! NMCP-SPEC-003 section 4.4, RATIFIED v1.1. The trait lives here and the index that
+//! implements it lives in `nmcp-host`, which is the split section 4.4's own header states:
+//! the contract belongs where every provider can see it, and the implementation belongs in
+//! the kernel that owns the dispatch path.
 
-use crate::authority::HeldAuthority;
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::authority::{HeldAuthority, ToolAuthority};
+use crate::provider::ToolProvider;
 
 /// Why a provider was refused at registration. Every variant is a condition the base
 /// detected at call time on a caller's request, or not at all.
@@ -75,6 +79,62 @@ pub enum RegistrationError {
         /// The tool that was refused.
         name: String,
     },
+}
+
+/// The index every governed call resolves through.
+///
+/// Every method takes `&self` (RC-D7): wire-up has one mutability rule, so a registry behind
+/// an `Arc` is still a registry an upstream can be registered into at runtime. The asymmetry
+/// the base has, where `register` takes `&self` and `set_abac` takes `&mut self`, is
+/// defensible as an accident and not as a design.
+pub trait ToolRegistry: Send + Sync {
+    /// Register a provider, or refuse it with a reason.
+    ///
+    /// All-or-nothing (RC-D5): a provider whose third tool is a duplicate registers none of
+    /// its tools. A half-registered provider is a state no operator asked for and no error
+    /// message can describe.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RegistrationError`] naming what was refused and what an operator has to
+    /// change. There is deliberately no `EmptyProvider`: an upstream legitimately declares no
+    /// tools until its catalogue warms, so refusing an empty provider would refuse every
+    /// upstream (RC-D5, RC-18).
+    fn register(&self, provider: Arc<dyn ToolProvider>) -> Result<(), RegistrationError>;
+
+    /// Re-read one provider's `contracts()` and rebuild its slice of the index.
+    ///
+    /// The path a `notifications/tools/list_changed` and the upstream poll both take.
+    /// All-or-nothing like [`register`](ToolRegistry::register): a refresh that would
+    /// introduce a duplicate leaves the previous index in place, because a provider whose
+    /// catalogue half-updated is worse than one whose catalogue is stale, and the stale one
+    /// at least matches what the last successful registration said.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`RegistrationError`] set as [`register`](ToolRegistry::register).
+    fn refresh(&self, provider_id: &str) -> Result<(), RegistrationError>;
+
+    /// Remove a provider and all its tools. `true` if one was present.
+    fn unregister_provider(&self, provider_id: &str) -> bool;
+
+    /// Resolve a public tool name to its owner and local name.
+    ///
+    /// One hash lookup, no allocation beyond cloning the `Arc` and the local name. RC-9 is
+    /// the requirement this signature exists to satisfy: dispatch resolves without asking any
+    /// provider to enumerate anything.
+    fn resolve(&self, public_name: &str) -> Option<(Arc<dyn ToolProvider>, String)>;
+
+    /// The declaration for a public tool name.
+    ///
+    /// Returns an owned handle rather than a reference: the index sits behind an `RwLock`
+    /// because RC-D7 requires `&self` mutation, and a reference into it cannot outlive the
+    /// guard. Separate from [`resolve`](ToolRegistry::resolve) because authorization must read
+    /// the declaration without thereby obtaining the ability to call.
+    fn authority_of(&self, public_name: &str) -> Option<Arc<ToolAuthority>>;
+
+    /// The `tools/list` array for a caller.
+    fn list_for(&self, view: &CatalogView) -> Vec<Value>;
 }
 
 /// What a given caller may see in `tools/list`.

@@ -20,27 +20,29 @@
 //!
 //! I-047a landed the value types: [`ToolAuthority`] and its parts, [`ToolContract`],
 //! [`GrantedAuthority`], [`Denial`], [`authorize`], [`RegistrationError`], [`CatalogView`],
-//! [`MemoryScope`], and the public tool name derivation. I-047b adds the two types
+//! [`MemoryScope`], and the public tool name derivation. I-047b added the two types
 //! section 4.3 moves alongside the trait: [`CallContext`], with `matched_root` private
 //! behind a reader and a private [`ResolvedSecrets`] channel, and [`ToolCallResult`]
-//! unchanged. `nmcp-router` re-exports both, so no `use` path breaks.
+//! unchanged. I-047c adds [`ToolProvider`] itself and the [`ToolRegistry`] trait section 4.4
+//! freezes, whose index lives in `nmcp-host`. `nmcp-router` re-exports every moved item, so
+//! no `use` path breaks.
 //!
-//! Named gaps, per INV-6, with owners rather than as silent absences. `ToolProvider` is
-//! still in `nmcp-router` and so is dispatch. Section 4.3 changes `call` to take a
-//! `&GrantedAuthority` and replaces `tool_names`/`tool_list` with `contracts`, and those
-//! are one atomic unit rather than three: a provider cannot be handed a
+//! Named gaps, per INV-6, with owners rather than as silent absences. [`ToolProvider::call`]
+//! still takes four parameters and [`ToolProvider`] still carries
+//! [`tool_names`](ToolProvider::tool_names) and [`tool_list`](ToolProvider::tool_list).
+//! Section 4.3 adds `granted: &GrantedAuthority` to `call` and deletes both methods, and that
+//! is one atomic change rather than three: a provider cannot be handed a
 //! [`GrantedAuthority`] until dispatch produces one, dispatch cannot produce one until it
-//! calls [`authorize`], and [`authorize`] needs the declaration only `contracts` supplies.
-//! Owner I-047c, which is also where the `ToolRegistry` trait, the indexed registry and
-//! RC-6's property test land, because that test's oracle is the base's per-tool policy
-//! table and reading it needs the dispatch internals I-047c moves. Nothing in I-047b
-//! changes any behaviour in `nmcp-router`: the ring does not call [`authorize`] yet, and
-//! it reads the matched root through the new reader rather than off the field.
+//! calls [`authorize`], and [`authorize`] needs the declaration only
+//! [`contracts`](ToolProvider::contracts) supplies. Owner I-047d, which also lands RC-6's
+//! property test, because that test's oracle is the base's per-tool policy table and the
+//! table only stops being authoritative once dispatch reads the declaration instead.
 
 mod authority;
 mod context;
 mod contract;
 mod names;
+mod provider;
 mod registry;
 mod scope;
 mod secrets;
@@ -51,8 +53,11 @@ pub use authority::{
 };
 pub use context::{CallContext, ToolCallResult};
 pub use contract::ToolContract;
-pub use names::{is_valid_public_tool_name, public_tool_name};
-pub use registry::{CatalogView, RegistrationError};
+pub use names::{
+    DELETE_DENIED_NAMES, contains_delete_intent, is_valid_public_tool_name, public_tool_name,
+};
+pub use provider::ToolProvider;
+pub use registry::{CatalogView, RegistrationError, ToolRegistry};
 pub use scope::MemoryScope;
 pub use secrets::ResolvedSecrets;
 

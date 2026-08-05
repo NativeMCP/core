@@ -17,7 +17,6 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
 nmcp-identity.workspace = true
 nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
@@ -30,3 +29,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# The ring itself no longer names the attribute: `ToolProvider` moved to `nmcp-schema`,
+# which carries the dependency now. The test providers in this crate still implement an
+# async trait method, so the edge is real and is classified where it is used.
+async-trait.workspace = true
