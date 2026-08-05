@@ -431,7 +431,7 @@ pub enum EventLogClass {
     Change,
     /// A program ran.
     Execute,
-    /// Something left this host: Microsoft 365, a git publish, a gateway upstream.
+    /// Something left this host: a git publish, a gateway upstream.
     Egress,
     /// A credential was refused.
     Authentication,
@@ -489,7 +489,7 @@ pub fn event_log_class(event: &AuditEvent) -> EventLogClass {
             "create" | "write" | "modify" | "rename" | "move" | "backup" | "memory.write"
             | "win.api.write" => EventLogClass::Change,
             "execute" => EventLogClass::Execute,
-            "m365" | "git.publish" | "upstream.call" => EventLogClass::Egress,
+            "git.publish" | "upstream.call" => EventLogClass::Egress,
             _ => EventLogClass::Unclassified,
         };
     }
@@ -1353,7 +1353,7 @@ mod tests {
         assert_eq!(class_for_permission("write"), EventLogClass::Change);
         assert_eq!(class_for_permission("memory.write"), EventLogClass::Change);
         assert_eq!(class_for_permission("execute"), EventLogClass::Execute);
-        assert_eq!(class_for_permission("m365"), EventLogClass::Egress);
+        assert_eq!(class_for_permission("git.publish"), EventLogClass::Egress);
         assert_eq!(class_for_permission("upstream.call"), EventLogClass::Egress);
 
         // An effect record carries no permission, because the code performing the effect was

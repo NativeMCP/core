@@ -1,5 +1,5 @@
 {
-  "_comment": "Persona: a third-party MCP client (for example ChatGPT) that must reach a deliberate read-only subset and nothing else. See G3-12. Authenticating a client establishes who is calling and says nothing about what it may do; without the abac_rules block below, any authenticated client inherits the entire tool surface, including execute as the service account and the Microsoft 365 send surface. The mcp_clients digest here is all zeros so this template is fail-closed as shipped: replace it with a real SHA-256 before use.",
+  "_comment": "Persona: a third-party MCP client (for example ChatGPT) that must reach a deliberate read-only subset and nothing else. See G3-12. Authenticating a client establishes who is calling and says nothing about what it may do; without the abac_rules block below, any authenticated client inherits the entire tool surface, including execute as the service account and every write surface the roots permit. The mcp_clients digest here is all zeros so this template is fail-closed as shipped: replace it with a real SHA-256 before use.",
   "admin_bind": "127.0.0.1:18769",
   "mcp_bind": "127.0.0.1:18770",
   "mcp_allowed_origins": [],

@@ -139,6 +139,21 @@ jobs:
           # line-oriented grep could tell neither a comment from a call nor a
           # test from a handler. See scripts/inv1_scan.py.
           python3 scripts/inv1_scan.py
+      - name: "RC-11/RC-19: the kernel names no vendor"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # NMCP-SPEC-003 RC-11 and RC-19. A vendor name compiled into
+          # nmcp-policy, nmcp-proto, nmcp-router or nmcp-host is the coupling
+          # the provider registry exists to remove, and nmcp-policy is in scope
+          # because the deepest instance of it was in the crate that decides
+          # authority rather than the one that dispatches. Same scope discipline
+          # as the INV-1 scanner: production code only, cfg(test) excluded by
+          # brace depth, comments stripped. One exception, named in the script:
+          # the RETIRED_PERMISSIONS table, because RC-19 requires a policy file
+          # granting a retired permission to be refused with a message that
+          # names the replacement. See scripts/no_vendor_names.py.
+          python3 scripts/no_vendor_names.py
       - name: "INV-8: no legacy brand references"
         shell: bash
         run: |

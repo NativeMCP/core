@@ -103,7 +103,10 @@ pub enum PolicyError {
 }
 
 /// A capability a tool call may require.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+///
+/// `Deserialize` is written out rather than derived, because a name this enum once carried
+/// has to be refused by name. See [`RETIRED_PERMISSIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     /// Enumerate a directory.
@@ -142,9 +145,6 @@ pub enum Permission {
     #[serde(rename = "git.publish")]
     /// Publish to a git remote.
     GitPublish,
-    #[serde(rename = "m365")]
-    /// Reach Microsoft 365.
-    M365,
     #[serde(rename = "win.api.write")]
     /// Write via a Windows API surface.
     WindowsApiWrite,
@@ -190,10 +190,72 @@ impl Permission {
             Self::MemoryWrite => "memory.write",
             Self::WindowsApi => "win.api",
             Self::GitPublish => "git.publish",
-            Self::M365 => "m365",
             Self::WindowsApiWrite => "win.api.write",
             Self::UpstreamCall => "upstream.call",
         }
+    }
+
+    /// Parse the canonical string form, refusing a retired name by name.
+    ///
+    /// The `Err` is the operator-facing sentence, not a code: it is handed straight to
+    /// `serde::de::Error::custom` and ends up in [`PolicyError::MalformedJson`], which is what
+    /// `NativeMCPctl validate`, daemon startup and hot reload all print.
+    fn from_wire(name: &str) -> Result<Self, String> {
+        if let Some(found) = Self::ALL.into_iter().find(|p| p.as_str() == name) {
+            return Ok(found);
+        }
+        if let Some((_, replacement)) = RETIRED_PERMISSIONS.iter().find(|(n, _)| *n == name) {
+            return Err((*replacement).to_string());
+        }
+        Err(format!(
+            "unknown permission `{name}`, expected one of: {}",
+            Self::ALL.map(Self::as_str).join(", ")
+        ))
+    }
+}
+
+/// Permission names this build once accepted, each paired with the sentence that says where
+/// the capability went.
+///
+/// RC-19. A permission that stops parsing quietly is a permission a deployment believes it
+/// still has. Serde's own unknown-variant error names the string and lists the ones that
+/// remain, which tells an operator that their policy is wrong and nothing about what to write
+/// instead, so a retired name is refused here with its replacement spelled out.
+///
+/// This table is the one place in this crate that carries a vendor name, and
+/// `scripts/no_vendor_names.py` excepts it by name for exactly that reason: the refusal is
+/// only useful if it says which capability was retired.
+const RETIRED_PERMISSIONS: &[(&str, &str)] = &[(
+    "m365",
+    "the `m365` permission was retired: Microsoft 365 is no longer first-party tooling and is \
+     now reached through the gateway as an upstream MCP server. Admit that server under \
+     `upstreams` with `required_permission` set, and grant `upstream.call` on a root, instead \
+     of granting `m365` here",
+)];
+
+impl<'de> Deserialize<'de> for Permission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PermissionVisitor;
+
+        impl serde::de::Visitor<'_> for PermissionVisitor {
+            type Value = Permission;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a permission name")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Permission, E>
+            where
+                E: serde::de::Error,
+            {
+                Permission::from_wire(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(PermissionVisitor)
     }
 }
 
@@ -203,7 +265,7 @@ impl Permission {
     /// Exhaustive by construction: `assert_permission_all_is_exhaustive` below matches on the
     /// enum, so adding a variant without adding it here fails to compile rather than quietly
     /// producing a policy diff that omits it.
-    pub const ALL: [Permission; 19] = [
+    pub const ALL: [Permission; 18] = [
         Permission::List,
         Permission::Read,
         Permission::Search,
@@ -220,7 +282,6 @@ impl Permission {
         Permission::MemoryWrite,
         Permission::WindowsApi,
         Permission::GitPublish,
-        Permission::M365,
         Permission::WindowsApiWrite,
         Permission::UpstreamCall,
     ];
@@ -247,9 +308,8 @@ fn assert_permission_all_is_exhaustive(permission: Permission) -> usize {
         Permission::MemoryWrite => 13,
         Permission::WindowsApi => 14,
         Permission::GitPublish => 15,
-        Permission::M365 => 16,
-        Permission::WindowsApiWrite => 17,
-        Permission::UpstreamCall => 18,
+        Permission::WindowsApiWrite => 16,
+        Permission::UpstreamCall => 17,
     };
     debug_assert_eq!(Permission::ALL.get(index), Some(&permission));
     index
@@ -277,7 +337,6 @@ impl fmt::Display for Permission {
                 Permission::MemoryWrite => "memory.write",
                 Permission::WindowsApi => "win.api",
                 Permission::GitPublish => "git.publish",
-                Permission::M365 => "m365",
                 Permission::WindowsApiWrite => "win.api.write",
                 Permission::UpstreamCall => "upstream.call",
             }
@@ -635,8 +694,7 @@ pub struct UpstreamConfig {
     /// whether its tools are reachable at all, and that is what this declares: some root must
     /// grant this permission or every tool from this upstream is refused.
     ///
-    /// The same shape `m365` and `win.api` already use. Those are capability gates with no
-    /// path involved, and m365 is a third-party integration governed exactly this way, so this
+    /// The same shape `win.api` already uses: a capability gate with no path involved, so this
     /// generalises an existing pattern rather than adding a second one.
     ///
     /// Declared per upstream rather than per tool on purpose. A per-tool declaration is a line
@@ -814,93 +872,6 @@ pub enum AbacRule {
     },
 }
 
-/// Auth mode for the native Microsoft 365 provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum M365AuthMode {
-    /// Client-credentials (application permissions); headless service identity.
-    #[default]
-    AppOnly,
-    /// Device-code / on-behalf-of a signed-in user (delegated permissions).
-    Delegated,
-}
-
-/// Per-surface enable flags for the Microsoft 365 provider.
-// One independent flag per surface, serialized as policy: that is the shape.
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct M365Surfaces {
-    #[serde(default = "default_true")]
-    /// Whether the mail surface is enabled.
-    pub mail: bool,
-    #[serde(default = "default_true")]
-    /// Whether the calendar surface is enabled.
-    pub calendar: bool,
-    #[serde(default = "default_true")]
-    /// Whether the Teams surface is enabled.
-    pub teams: bool,
-    #[serde(default = "default_true")]
-    /// Whether the files surface is enabled.
-    pub files: bool,
-}
-
-impl Default for M365Surfaces {
-    fn default() -> Self {
-        Self {
-            mail: true,
-            calendar: true,
-            teams: true,
-            files: true,
-        }
-    }
-}
-
-/// Configuration for the native Microsoft 365 (Microsoft Graph) provider.
-/// The client secret is never stored inline: it is sourced by reference from an
-/// environment variable (`secret_env`) or a file (`secret_file`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct M365Config {
-    #[serde(default = "default_true")]
-    /// Whether this item is active.
-    pub enabled: bool,
-    /// Microsoft 365 tenant id.
-    pub tenant_id: String,
-    /// Microsoft 365 application (client) id.
-    pub client_id: String,
-    #[serde(default)]
-    /// How the provider authenticates.
-    pub auth_mode: M365AuthMode,
-    #[serde(default)]
-    /// Environment variable holding the client secret.
-    pub secret_env: Option<String>,
-    #[serde(default)]
-    /// File holding the client secret.
-    pub secret_file: Option<PathBuf>,
-    /// Default mailbox/user (id or UPN) for app-only calls when no `user_id` arg is given.
-    #[serde(default)]
-    pub default_user_id: Option<String>,
-    /// When false, write tools are not registered and are refused if called.
-    #[serde(default)]
-    pub allow_writes: bool,
-    #[serde(default)]
-    /// Which Microsoft 365 surfaces are enabled.
-    pub surfaces: M365Surfaces,
-    /// Maximum `@odata.nextLink` pages a single collection tool will follow.
-    #[serde(default = "default_page_cap")]
-    pub page_cap: usize,
-    #[serde(default = "default_graph_base")]
-    /// Microsoft Graph base URL.
-    pub graph_base: String,
-}
-
-fn default_page_cap() -> usize {
-    5
-}
-
-fn default_graph_base() -> String {
-    "https://graph.microsoft.com/v1.0".to_string()
-}
-
 /// The full governance policy this server enforces.
 // The policy file's own shape: each flag is an independent operator-facing
 // setting, serialized by name. Packing them would change the file format.
@@ -972,9 +943,6 @@ pub struct PolicyConfig {
     /// reserved for the broker, and is replaced ahead of expiry without an operator present.
     #[serde(default)]
     pub oauth_providers: BTreeMap<String, OAuthProviderConfig>,
-    /// Microsoft 365 (Graph) native provider config; absent disables the provider.
-    #[serde(default)]
-    pub m365: Option<M365Config>,
     /// Enable the SSE streaming lane (GET /mcp). Default true.
     #[serde(default = "default_true")]
     pub enable_sse_lane: bool,
@@ -1302,7 +1270,6 @@ impl Default for PolicyConfig {
             }],
             upstreams: Vec::new(),
             abac_rules: Vec::new(),
-            m365: None,
             enable_sse_lane: true,
             enable_ws_lane: false,
             task_tools: BTreeSet::new(),
@@ -1442,7 +1409,7 @@ impl PolicyConfig {
     /// Whether any root grants this permission, with no path involved.
     ///
     /// The capability question, as distinct from the path question `require` answers. Used by
-    /// the m365 and win.api gates and by upstream admission (G4-28).
+    /// the win.api gate and by upstream admission (G4-28).
     #[must_use]
     pub fn grants_capability(&self, permission: Permission) -> bool {
         self.roots
@@ -2525,7 +2492,6 @@ impl PolicyConfig {
             ],
             upstreams: Vec::new(),
             abac_rules: Vec::new(),
-            m365: None,
         }
     }
 
@@ -3177,7 +3143,6 @@ mod tests {
             Permission::MemoryWrite,
             Permission::WindowsApi,
             Permission::GitPublish,
-            Permission::M365,
             Permission::WindowsApiWrite,
             Permission::UpstreamCall,
         ] {
@@ -3186,6 +3151,15 @@ mod tests {
                 serialized,
                 serde_json::json!(permission.as_str()),
                 "as_str disagrees with serde for {permission:?}"
+            );
+            // `Deserialize` is hand-written so a retired name can be refused by name (RC-19).
+            // A hand-written half of a round trip is a half that can drift from the derived
+            // one, so every variant is read back here as well as written.
+            let restored: Permission = serde_json::from_value(serialized)
+                .expect("every permission serde writes must parse back");
+            assert_eq!(
+                restored, permission,
+                "the hand-written Deserialize disagrees with Serialize for {permission:?}"
             );
         }
     }
@@ -4000,6 +3974,64 @@ mod policy_load_tests {
             matches!(err, PolicyError::MalformedJson(_)),
             "unexpected: {err}"
         );
+    }
+
+    /// RC-19. The deployment that granted `m365` is the one that must not find out by having
+    /// the grant quietly disappear from a policy it still believes in. The retired name is
+    /// refused, and the refusal says where the capability went, because "unknown permission"
+    /// tells an operator their file is wrong and nothing about what to write instead.
+    #[test]
+    fn a_policy_granting_the_retired_m365_permission_is_refused_and_told_the_replacement() {
+        let json = valid_json().replace(r#""permissions":["read"]"#, r#""permissions":["m365"]"#);
+        let err = PolicyConfig::from_json_str(&json)
+            .expect_err("a retired permission must not load as if nothing happened");
+        assert!(
+            matches!(err, PolicyError::MalformedJson(_)),
+            "unexpected error kind: {err}"
+        );
+        let message = err.to_string();
+        for expected in ["m365", "gateway", "upstream", "upstream.call"] {
+            assert!(
+                message.contains(expected),
+                "the refusal must name the replacement; missing {expected:?} in: {message}"
+            );
+        }
+    }
+
+    /// The other half of the same guarantee: a name this build never carried is still refused,
+    /// and is refused differently, so a typo is not read as a retirement notice.
+    #[test]
+    fn a_permission_this_build_never_had_is_refused_with_the_ones_it_does_have() {
+        let json = valid_json().replace(r#""permissions":["read"]"#, r#""permissions":["reed"]"#);
+        let err = PolicyConfig::from_json_str(&json).expect_err("an unknown permission must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown permission") && message.contains("win.api"),
+            "an unknown name must be listed against the ones that exist: {message}"
+        );
+        assert!(
+            !message.contains("gateway"),
+            "a typo is not a retirement and must not be answered as one: {message}"
+        );
+    }
+
+    /// A permission that still exists must still parse. Deserialization is hand-written now,
+    /// so this is the assertion that the refusal path did not take the accept path with it.
+    #[test]
+    fn every_permission_this_build_has_still_loads_from_a_policy_file() {
+        for permission in Permission::ALL {
+            let json = valid_json().replace(
+                r#""permissions":["read"]"#,
+                &format!(r#""permissions":["{}"]"#, permission.as_str()),
+            );
+            let policy = PolicyConfig::from_json_str(&json)
+                .unwrap_or_else(|e| panic!("{} must load: {e}", permission.as_str()));
+            assert!(
+                policy.roots[0].permissions.contains(&permission),
+                "{} parsed into something else",
+                permission.as_str()
+            );
+        }
     }
 
     /// The back-compatibility half of G6-1. The live policy carries upstreams written before
