@@ -1,7 +1,9 @@
 //! The binding grant: proof that one resolution of one key was authorized.
 //!
-//! NMCP-SPEC-002 SB-15 and SB-A3, RATIFIED v1.0. The struct is frozen at ratification and
-//! implemented as written.
+//! NMCP-SPEC-002 SB-15 and SB-A3, RATIFIED v1.1. The struct is frozen at ratification and
+//! implemented as written; since I-036 the one production path that mints one is the binding
+//! evaluator, [`SealedStore::evaluate`](crate::SealedStore::evaluate), in this same crate,
+//! which is the v1.1 placement ruling.
 
 use std::fmt;
 
@@ -10,13 +12,21 @@ use crate::name::{SecretName, Version};
 /// The identifier of the binding rule that authorized a resolution, or refused one.
 ///
 /// SB-8 requires a refusal to name the governing rule and SB-R5 requires the audit record to
-/// carry it. It rides on the grant rather than being looked up again later, because policy can
-/// hot reload between the decision and the record, and a record naming a rule that no longer
-/// exists describes a decision nobody can reconstruct. NMCP-SPEC-002's G-1 records that the
-/// wider version of that problem, pinning policy per request, is open and owned by I-036.
+/// carry it. It rides on the grant rather than being looked up again later, because the terms
+/// can change between the decision and the record, and a record naming a rule that no longer
+/// exists describes a decision nobody can reconstruct. For binding rules the v1.1 relocation
+/// shrank that hazard: they live in the key's own store document, not in reloadable policy,
+/// and the rule is stamped here at mint. NMCP-SPEC-002's G-1, pinning a policy generation on
+/// the request and carrying it through the ring, remains open for the rest of the audit
+/// story and lands with the stage 5b wiring, which is the first code holding a request to
+/// stamp (I-034).
 ///
-/// An opaque identifier rather than a structured type. What a rule *is* belongs to SB-6's
-/// binding model, which is I-036's, and a shape guessed here would be a second owner of it.
+/// An opaque identifier rather than a structured type: what a rule *is* belongs to SB-6's
+/// binding model ([`KeyBinding`](crate::KeyBinding) and the binding module around it), and a
+/// shape here would be a second owner of it. Since I-036 the evaluator stamps
+/// `binding.<name>` on every grant it mints, because bindings are per key (v1.1) and the
+/// rule that authorized a resolution is the key's own binding; the rule a *refusal* names is
+/// [`BindingDenial::rule`](crate::BindingDenial::rule).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BindingRuleId(String);
 
@@ -61,18 +71,20 @@ impl fmt::Display for BindingRuleId {
 /// **Carries its justification.** [`BindingGrant::rule`] is what a refusal names (SB-8) and
 /// what the audit record carries (SB-R5).
 ///
-/// # Where a grant comes from at I-033: nowhere, deliberately
+/// # Where a grant comes from: the binding evaluator, and nowhere else
 ///
-/// The only constructor is `pub(crate)` and compiled only into this crate's test builds.
-/// NMCP-SPEC-002 places the binding evaluator's production path at I-036, so at I-033 there
-/// is no code anywhere that is entitled to mint one, and this crate does not invent a door
-/// for a caller that does not exist: a public constructor taking a caller-supplied rule would
-/// let anything holding the store authorize itself, which is the trust-boundary comment SB-A3
-/// exists to replace, reintroduced as an API. In-crate tests construct grants directly, which
-/// is what the test-scoped `pub(crate)` is for, and the crate documentation names the
-/// dependency question I-036 has to answer before a production constructor can exist
-/// (`nmcp-policy` cannot call into this crate without closing a cycle through
-/// `nmcp-schema`).
+/// The only constructor is `pub(crate)`, and its one production caller is
+/// [`SealedStore::evaluate`](crate::SealedStore::evaluate), the binding evaluator I-036
+/// landed under the v1.1 placement ruling: the evaluator lives in the crate that owns the
+/// store, so the constructor never crosses a crate boundary, and that is the whole of what
+/// keeps the grant unforgeable. At I-033 the constructor was additionally compiled only into
+/// test builds, because no production caller was yet entitled to one; the evaluator is that
+/// caller now, and the `cfg` came off with it. A public constructor taking a caller-supplied
+/// rule would let anything holding the store authorize itself, which is the trust-boundary
+/// comment SB-A3 exists to replace, reintroduced as an API; the door that exists instead is
+/// evaluation, which refuses or mints with the governing rule named (SB-8). In-crate tests
+/// still construct grants directly, so `resolve`'s own refusals stay gradable without a
+/// binding in the way.
 ///
 /// The exemplar is NMCP-SPEC-003's `GrantedAuthority`, sealed and **consumed** by
 /// `ToolProvider::call`, so the unauthorized call is not an expression that type-checks.
@@ -112,12 +124,12 @@ impl fmt::Display for BindingRuleId {
 /// };
 /// ```
 ///
-/// Asking for a constructor finds none, `E0599`: outside this crate's own test builds the
-/// constructor does not exist, so there is no door to be private.
+/// Asking for the constructor finds it private, `E0624`: it exists, for the evaluator in
+/// this crate, and no other crate can call it.
 ///
-/// ```compile_fail,E0599
+/// ```compile_fail,E0624
 /// let minted = nmcp_secrets::BindingGrant::issue(
-///     nmcp_secrets::SecretName::parse("github.token").unwrap(),
+///     nmcp_secrets::SecretName::parse("api.token").unwrap(),
 ///     nmcp_secrets::Version::first(),
 ///     nmcp_secrets::BindingRuleId::new("minted"),
 /// );
@@ -162,14 +174,15 @@ pub struct BindingGrant {
 }
 
 impl BindingGrant {
-    /// Issue a grant. Crate-private and compiled only into test builds: at I-033 no
-    /// production caller is entitled to one, so in a release binary **no constructor for
-    /// this type exists at all** and [`SealedStore::resolve`](crate::SealedStore::resolve)
-    /// is unreachable, which is precisely the sequencing NMCP-SPEC-002 wants until I-034
-    /// wires resolution and I-036 lands the evaluator. The crate documentation records the
-    /// dependency question I-036 has to answer before a production constructor can live
-    /// anywhere.
-    #[cfg(test)]
+    /// Issue a grant. Crate-private, and the one production caller is the binding
+    /// evaluator, [`SealedStore::evaluate`](crate::SealedStore::evaluate): the constructor
+    /// never crosses a crate boundary, which is NMCP-SPEC-002 v1.1's unforgeability
+    /// argument, and every path to a grant outside this crate runs through evaluation and
+    /// its deny-by-default gates. I-033 additionally compiled this out of release builds
+    /// while no production caller existed; I-036 is that caller, so the `cfg` is gone and
+    /// the visibility is the seal. In-crate tests also call it directly, deliberately, so
+    /// [`SealedStore::resolve`]'s own refusals (unknown version, sealed elsewhere, a key
+    /// quarantined after mint) are gradable without a binding standing in front of them.
     pub(crate) const fn issue(name: SecretName, version: Version, rule: BindingRuleId) -> Self {
         Self {
             _seal: (),

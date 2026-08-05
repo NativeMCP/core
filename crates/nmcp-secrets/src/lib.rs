@@ -5,21 +5,22 @@
 //!
 //! ## What this crate is
 //!
-//! NMCP-SPEC-002, RATIFIED v1.0, section 3 names this as a **new** crate, created under
+//! NMCP-SPEC-002, RATIFIED v1.1, section 3 names this as a **new** crate, created under
 //! NMCP-SPEC-001 R-4 placement: the sealed store, the [`Sealer`] abstraction, the core file
-//! sealer, [`Sealed<T>`](Sealed), the key lifecycle state machine and the binding grant. It is
-//! the half of the secret broker that owns material at rest and decides what a resolution is.
-//! I-033 lands it whole: every type here is real, wired and tested, and none of it is a mock
-//! (SB-A7, INV-6).
+//! sealer, [`Sealed<T>`](Sealed), the key lifecycle state machine, the binding grant, and,
+//! from I-036 under the v1.1 revision, the [`KeyBinding`] model and its evaluator. It is the
+//! half of the secret broker that owns material at rest and decides what a resolution is.
+//! Every type here is real, wired and tested, and none of it is a mock (SB-A7, INV-6).
 //!
-//! ## What this crate is not, which is I-033's boundary
+//! ## What this crate is not, which is the I-033/I-036 boundary
 //!
 //! Nothing here is reachable from a tool call, and that is the scope rather than a gap with no
 //! owner. Resolution wiring at ring stage 5b and the audit records for every store operation
-//! are I-034, which is the first code with both a dispatch path and an `AuditSink` in scope.
-//! The exfiltration tripwire is I-035. Evaluation of SB-6's bindings is I-036. The operator
-//! command surface, `nmcpctl`, is I-037 and I-038, and until it lands the write half below has
-//! no production caller, exactly as NMCP-SPEC-002 SB-13 sequences it.
+//! are I-034, which is the first code with both a dispatch path and an `AuditSink` in scope;
+//! it is where [`SealedStore::evaluate`] and [`SealedStore::resolve`] get their production
+//! caller. The exfiltration tripwire is I-035. The operator command surface, `nmcpctl`, is
+//! I-037 and I-038, and until it lands the write half below has no production caller, exactly
+//! as NMCP-SPEC-002 SB-13 sequences it.
 //!
 //! ## Dependency discipline
 //!
@@ -31,20 +32,23 @@
 //! RC-D1: `nmcp-secrets -> nmcp-schema -> nmcp-policy -> nmcp-identity`, and nothing depends
 //! on this crate today.
 //!
-//! ## Named gap: where the binding evaluator can construct a grant (owner: I-036)
+//! ## Where binding evaluation lives, ruled at v1.1 (I-036)
 //!
-//! NMCP-SPEC-002 section 3 places "`KeyBinding` evaluation (SB-6)" in `nmcp-policy`, and SB-15
-//! makes [`BindingGrant`] constructible only by the binding evaluator. Those two placements
-//! cannot both hold as written: a constructor callable from `nmcp-policy` means
+//! NMCP-SPEC-002 v1.0's section 3 placed "`KeyBinding` evaluation (SB-6)" in `nmcp-policy`,
+//! and SB-15 makes [`BindingGrant`] constructible only by the binding evaluator. I-033 proved
+//! those two placements cannot both hold: a constructor callable from `nmcp-policy` means
 //! `nmcp-policy -> nmcp-secrets`, and with this crate's `nmcp-secrets -> nmcp-schema` edge and
 //! RC-1's `nmcp-schema -> nmcp-policy` edge that is a dependency cycle, the exact shape RC-D1
-//! exists to prevent. This crate does not solve it, because any solution is a decision about
-//! where evaluation lives and that decision is I-036's. The surface here is neutral to the
-//! outcome: the grant's constructor is `pub(crate)` and compiled only into this crate's test
-//! builds, which lets the tests here exercise [`SealedStore::resolve`] while a release binary
-//! contains no way to mint a grant at all, and whichever arrangement I-036 ratifies
-//! (evaluation hosted here behind a policy-supplied decision, a spec revision moving the
-//! evaluator, or something else) can open exactly the door it needs.
+//! exists to prevent, confirmed with cargo tree. The v1.1 revision rules on it, following
+//! SB-13's own text: bindings are written only through the operator surface, per key, so they
+//! are per-key store metadata, and the crate that owns the store owns the evaluator.
+//! Unforgeability then costs nothing, because the grant constructor never crosses a crate
+//! boundary. [`SealedStore::evaluate`] is that evaluator and the only production path that
+//! mints a grant; `nmcp-policy` retains no binding role, and INV-4 stays as the evaluation
+//! model rather than a location. The host wires the two at ring stage 5b (I-034): it reads
+//! nothing secret, holds the store handle, and passes the request context in. The model, the
+//! evaluation order, the use budget's home (G-2) and the decrement-at-mint ruling are argued
+//! in the binding module's documentation, `src/binding.rs`.
 //!
 //! ## The platform position on at-rest protection
 //!
@@ -63,6 +67,7 @@
 //! digest. The store's tests drive material through every reachable failure path and assert
 //! that no rendered error contains any byte subsequence of it.
 
+mod binding;
 mod file_sealer;
 mod grant;
 mod lifecycle;
@@ -72,6 +77,7 @@ mod sealed;
 mod sealer;
 mod store;
 
+pub use binding::{BINDING_SCHEMA_VERSION, BindingDenial, BindingRequest, KeyBinding, UseBudget};
 pub use file_sealer::{
     FileSealer, KEY_DIR_MODE, KEY_FILE, KEY_FILE_MODE, KeyProtection, MemorySealer, default_key_dir,
 };
