@@ -96,6 +96,19 @@ reported as advice.
 Bumping the toolchain, adding a dependency, or adding a license exception is a
 reviewed change with the reason recorded in the pull request.
 
+## INV-8: Brand Integrity
+
+No artifact in this organization references the product's retired
+predecessor names: not in sources, comments, docs, workflows, package
+metadata, branch names, commit messages, or binary strings. The product has
+exactly one name.
+
+The enumeration of retired names lives in the CI brand gate, assembled from
+fragments so the gate does not trip on its own definition. The normative
+list resides in the private port specification (NMCP-SPEC-001, R-6), which
+is itself excluded from every public tree. A hit is a build failure, not a
+review comment.
+
 ---
 
 ## Enforcement
@@ -109,6 +122,7 @@ reviewed change with the reason recorded in the pull request.
 | INV-5 | Typed state transitions; exhaustive match, illegal transition tests |
 | INV-6 | Pull request template requires an ID; traceability matrix generated in CI |
 | INV-7 | `rust-toolchain.toml`, committed lockfile, `cargo deny check` gate |
+| INV-8 | CI brand gate step in the governance job; fragment-assembled pattern, required check |
 
 ## Amendment
 
