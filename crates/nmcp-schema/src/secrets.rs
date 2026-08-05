@@ -13,17 +13,24 @@
 /// by value on [`CallContext`](crate::CallContext), the field is private, and
 /// [`CallContext::secrets`](crate::CallContext::secrets) hands out a borrow rather than an
 /// owned copy, so material cannot be lifted out of the context and outlive the call it was
-/// resolved for. What is deliberately not decided here is what an entry is: the slot
-/// vocabulary, the resolution stage and the lifetime rules belong to NMCP-SPEC-002, which
-/// is still draft, and a guess at them made in this crate would be a second owner of the
-/// same field rather than a head start.
+/// resolved for. What is deliberately not decided here is what an entry is: the resolution
+/// stage and the lifetime rules belong to NMCP-SPEC-002, and a guess at them made on this
+/// crate's own authority would be a second owner of the same field rather than a head start.
+///
+/// NMCP-SPEC-002 is now RATIFIED v1.0 and I-032 has landed the half of it that is a
+/// vocabulary: [`SecretSlot`](crate::SecretSlot) and [`SecretRef`](crate::SecretRef) sit
+/// beside this type and say what a slot and a reference are. They do not say what an entry
+/// here is, and this type is unchanged, because an entry is resolved material and resolution
+/// is I-033. That is the boundary rather than an oversight: a tool can declare a slot today
+/// and the kernel can recognise one, and there is still nothing that opens a store.
 ///
 /// It is empty for every call, and empty by construction rather than by omission. A call
-/// whose tool declares no schema-declared secret slot has nothing to resolve; that is
-/// every call in this workspace, because the slot itself is NMCP-SPEC-002's to define.
-/// [`ResolvedSecrets::is_empty`] is therefore `true` for every value of this type that can
-/// exist, which is a fact about the type's cardinality rather than a body left unwritten,
-/// and the destructure in that method is what keeps the two from being confused.
+/// whose tool declares no schema-declared secret slot has nothing to resolve, and a call whose
+/// tool declares one has nothing to resolve it with until I-033 lands the store; that is every
+/// call in this workspace either way. [`ResolvedSecrets::is_empty`] is therefore `true` for
+/// every value of this type that can exist, which is a fact about the type's cardinality
+/// rather than a body left unwritten, and the destructure in that method is what keeps the two
+/// from being confused.
 ///
 /// It exists now rather than when NMCP-SPEC-002 lands because section 4.3 freezes
 /// `ToolProvider::call` at four parameters. The host does not spawn the child process,

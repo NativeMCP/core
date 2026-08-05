@@ -20,7 +20,7 @@ use nmcp_policy::{AbacAction, AbacRule, PolicyConfig};
 use nmcp_schema::{
     CONTRACT_SCHEMA_VERSION, CatalogView, HeldAuthority, RegistrationError, ToolAuthority,
     ToolContract, ToolProvider, ToolRegistry, accepts_contract_version, authorize,
-    contains_delete_intent, is_valid_public_tool_name, public_tool_name,
+    contains_delete_intent, is_valid_public_tool_name, public_tool_name, secret_slots,
 };
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -118,11 +118,14 @@ impl IndexedToolRegistry {
 /// which is how RC-D5's all-or-nothing rule is enforced rather than asserted.
 ///
 /// Refusal order, per tool and in declaration order: an unaddressable public name, then the
-/// INV-1 denylist, then a declared path argument the schema cannot receive, then a collision.
-/// INV-1 sits above declaration integrity because a tool that could never legally be called
-/// is a worse defect than one whose declaration is wrong, and a collision is checked last
-/// because reporting one against a name that was never valid tells an operator to fix the
-/// wrong provider.
+/// INV-1 denylist, then a declared path argument the schema cannot receive, then a declared
+/// secret slot the schema cannot carry, then a collision. INV-1 sits above declaration
+/// integrity because a tool that could never legally be called is a worse defect than one
+/// whose declaration is wrong, and a collision is checked last because reporting one against a
+/// name that was never valid tells an operator to fix the wrong provider. The two declaration
+/// checks sit together and in the order the two specifications ratified, which is the only
+/// thing separating them: they refuse the same class of defect, a declaration naming something
+/// the tool's own schema cannot deliver.
 fn build_slice(
     provider: &Arc<dyn ToolProvider>,
     retained: &HashMap<String, Arc<IndexEntry>>,
@@ -177,6 +180,19 @@ fn build_slice(
                 name: public_name,
                 arg: arg.clone(),
             });
+        }
+
+        // NMCP-SPEC-002 SB-3 and SB-4, the same argument RC-5 makes one field over. A slot
+        // annotation the kernel cannot bind to a top-level argument, or one whose modality is
+        // not one of the two SB-4 defines, is a declaration the tool's own schema cannot
+        // deliver on. It is refused here rather than at the call for a reason RC-5 does not
+        // have: this one fails open. A `path_args` entry the schema never receives resolves no
+        // root and the call is denied, whereas a secret slot the kernel never sees is a slot
+        // nothing injects into, so the tool runs with the credential missing rather than not
+        // running at all. Nothing is resolved by this call and no store is opened; the check
+        // reads the declaration and returns (I-032).
+        if let Err(refusal) = secret_slots(contract) {
+            return Err(refusal.at_tool(public_name));
         }
 
         // RC-21. A first-party tool's annotations are derived from its declared authority by
@@ -498,8 +514,8 @@ mod tests {
     use async_trait::async_trait;
     use nmcp_policy::{Permission, RootRule};
     use nmcp_schema::{
-        CONTRACT_SCHEMA_VERSION, CallContext, CapabilityGrant, GrantedAuthority, ToolCallResult,
-        ToolEffect, ToolReach,
+        CONTRACT_SCHEMA_VERSION, CallContext, CapabilityGrant, GrantedAuthority,
+        SECRET_SLOT_ANNOTATION, SecretSlotError, ToolCallResult, ToolEffect, ToolReach,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -789,6 +805,158 @@ mod tests {
             refused,
             RegistrationError::UndeclaredPathArgument { .. }
         ));
+    }
+
+    // - NMCP-SPEC-002 SB-3: declared secret slots the schema can carry -
+
+    /// A contract declaring one `secret_ref` slot on `credential`, plus `path` and an
+    /// undecorated free-text property, so a test can tell a slot from a string.
+    fn contract_with_secret_slot(name: &str, annotation: &Value) -> ToolContract {
+        let mut declared = contract(name, None);
+        declared.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "credential": {"type": "string", SECRET_SLOT_ANNOTATION: annotation},
+                "message": {"type": "string"},
+            },
+        });
+        declared
+    }
+
+    /// SB-3. A slot annotation the kernel has no top-level argument to bind is refused at
+    /// registration, naming where it found it.
+    ///
+    /// The nesting here is the reachable shape rather than a contrived one: an argument that
+    /// is itself an object, with the annotation on one of its own properties. A reader that
+    /// walked only the top-level `properties` map would find nothing, register the tool, and
+    /// leave a declared credential that nothing will ever inject, so the tool runs without it.
+    #[test]
+    fn a_secret_slot_that_is_not_a_property_is_refused_at_registration() {
+        let registry = registry();
+        let mut declared = contract("call_peer", None);
+        declared.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "credential": {
+                            "type": "string",
+                            SECRET_SLOT_ANNOTATION: {"inject": "env", "var": "SERVICE_TOKEN"},
+                        },
+                    },
+                },
+            },
+        });
+
+        let refused = registry
+            .register(TestProvider::new("", vec![declared]))
+            .expect_err("a secret slot no argument can carry is refused");
+        match &refused {
+            RegistrationError::UndeclaredSecretSlot { name, at } => {
+                assert_eq!(name, "call_peer");
+                assert_eq!(at, "/properties/config/properties/credential");
+            }
+            other => panic!("expected UndeclaredSecretSlot, got {other:?}"),
+        }
+        assert!(registry.is_empty(), "the provider registered nothing");
+    }
+
+    /// SB-4. The modality vocabulary is closed at two, and a declaration outside it is refused
+    /// here rather than discovered when there is finally something to inject.
+    ///
+    /// `argv` is the fixture on purpose: SB-A2 removes injection into a command line by
+    /// construction, and T5 is asserted by the absence of the modality rather than by a check.
+    /// This is where that absence becomes a refusal an operator can read.
+    #[test]
+    fn a_malformed_injection_modality_is_refused_at_registration() {
+        let registry = registry();
+        let refused = registry
+            .register(TestProvider::new(
+                "",
+                vec![contract_with_secret_slot(
+                    "call_peer",
+                    &json!({"inject": "argv", "var": "SERVICE_TOKEN"}),
+                )],
+            ))
+            .expect_err("a modality SB-4 does not define is refused");
+        match &refused {
+            RegistrationError::MalformedSecretSlot { name, source } => {
+                assert_eq!(name, "call_peer");
+                assert!(
+                    matches!(source, SecretSlotError::UnknownModality { arg, found }
+                        if arg == "credential" && found == "argv"),
+                    "got {source:?}"
+                );
+                assert!(
+                    format!("{refused}").contains("argv"),
+                    "the refusal an operator reads names what it refused"
+                );
+            }
+            other => panic!("expected MalformedSecretSlot, got {other:?}"),
+        }
+        assert!(registry.is_empty());
+    }
+
+    /// A modality declared without the name the contract owes it is the other half of SB-4,
+    /// and the message says whose name it is, because the answer is never the caller's.
+    #[test]
+    fn a_modality_missing_its_contract_supplied_name_is_refused_at_registration() {
+        let registry = registry();
+        let refused = registry
+            .register(TestProvider::new(
+                "",
+                vec![contract_with_secret_slot(
+                    "call_peer",
+                    &json!({"inject": "header"}),
+                )],
+            ))
+            .expect_err("a modality with no declared name is refused");
+        assert!(
+            matches!(&refused, RegistrationError::MalformedSecretSlot { source, .. }
+                if matches!(source, SecretSlotError::MissingModalityName { key, .. } if *key == "name")),
+            "got {refused:?}"
+        );
+        assert!(format!("{refused}").contains("by the contract rather than by the caller"));
+    }
+
+    /// The paired green case, so both refusals above are attributable to the declaration being
+    /// wrong rather than to secret slots being refused generally.
+    ///
+    /// It also pins the second half of inertness at the kernel boundary. The registry carries
+    /// `input_schema` to the catalogue verbatim, annotation and all: it neither strips the
+    /// annotation, which would leave a client unable to see the slot, nor promotes the
+    /// undecorated `message` property to one.
+    #[test]
+    fn a_well_formed_secret_slot_registers_and_reaches_the_catalogue_verbatim() {
+        let registry = registry();
+        let declared = contract_with_secret_slot(
+            "call_peer",
+            &json!({"inject": "header", "name": "Authorization"}),
+        );
+        let expected_schema = declared.input_schema.clone();
+        registry
+            .register(TestProvider::new("", vec![declared.clone()]))
+            .expect("a well-formed secret slot registers");
+        assert!(registry.resolve("call_peer").is_some());
+
+        let listed = registry.list_for(&CatalogView::default());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0]["inputSchema"], expected_schema,
+            "the schema reaches the catalogue byte for byte, annotation included"
+        );
+
+        let slots = secret_slots(&declared).expect("the declaration reads back");
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.arg.as_str())
+                .collect::<Vec<_>>(),
+            vec!["credential"],
+            "the undecorated properties are not slots"
+        );
     }
 
     /// NMCP-SPEC-003 v1.1: a call that supplies none of a tool's declared path arguments is
