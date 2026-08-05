@@ -1,20 +1,26 @@
 [package]
 name = "nmcp-audit"
-description = "Append-only, hash-chained audit trail with a platform-bound sink."
+description = "Append-only, hash-chained audit trail with a platform mirror trait: the chain is defined once, platforms bind the sink."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-authors.workspace = true
-repository.workspace = true
-homepage.workspace = true
-readme.workspace = true
-keywords.workspace = true
 categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-
-[dev-dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
