@@ -1782,6 +1782,29 @@ pub enum ResolveError {
     },
 }
 
+impl ResolveError {
+    /// The stable name of the refusal, for the `rule` field of
+    /// `Denial::SecretUnavailable` at ring stage 5b (SB-8) and for the record that carries
+    /// it (SB-R5).
+    ///
+    /// The sibling of [`BindingDenial::rule`](crate::BindingDenial::rule), and distinct
+    /// from the `rule: BindingRuleId` these variants carry: that field names the binding
+    /// that authorized the grant being spent, while this names the gate that refused the
+    /// resolution. `damaged-entry` and `unknown-secret` deliberately reuse the evaluator's
+    /// vocabulary, because they are the same refusal observed one stage later.
+    #[must_use]
+    pub const fn rule(&self) -> &'static str {
+        match self {
+            Self::UnknownSecret { .. } => "unknown-secret",
+            Self::UnknownVersion { .. } => "unknown-version",
+            Self::NotResolvable { .. } => "not-resolvable",
+            Self::DamagedEntry { .. } => "damaged-entry",
+            Self::SealedElsewhere { .. } => "sealed-elsewhere",
+            Self::Unsealable { .. } => "unsealable",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests assert on shapes, verdicts and JSON, where expect/indexing ARE the assertion:
@@ -2071,6 +2094,61 @@ mod tests {
         // Well after: still retired, and the metadata says so.
         time.fetch_add(3_600_000, Ordering::SeqCst);
         assert_eq!(store.names()[0].versions[0].state, KeyState::Retained);
+    }
+
+    /// I-034: every resolve refusal has a stable rule name for `Denial::SecretUnavailable`
+    /// (SB-8) and for the audit record (SB-R5), driven through real refusals rather than
+    /// constructed variants wherever a store can produce one, so the names on the wire are
+    /// the names this method returns.
+    #[test]
+    fn every_resolve_refusal_names_a_stable_rule() {
+        let dir = TempDir::new("store-resolve-rules");
+        let (store, time) = open_with_clock(&dir);
+
+        let unknown = store
+            .resolve(grant(&name("never.stored"), Version::first()))
+            .unwrap_err();
+        assert_eq!(unknown.rule(), "unknown-secret");
+
+        let key = name("api.key");
+        let first = store.set(&key, sealed(b"first-value-rl01")).unwrap();
+        let missing_version = store.resolve(grant(&key, first.next())).unwrap_err();
+        assert_eq!(missing_version.rule(), "unknown-version");
+
+        store.rotate(&key, sealed(b"second-value-rl02")).unwrap();
+        time.fetch_add(DEFAULT_OVERLAP_WINDOW_SECS * 1_000, Ordering::SeqCst);
+        let retired = store.resolve(grant(&key, first)).unwrap_err();
+        assert_eq!(retired.rule(), "not-resolvable");
+
+        // The remaining three shapes are reachable only through damage or a sealer swap,
+        // which their own tests drive; the names are pinned here so a rename shows up as a
+        // wire change rather than a surprise in a chain.
+        assert_eq!(
+            ResolveError::DamagedEntry {
+                name: "api.key".into(),
+                rule: BindingRuleId::new("binding.api.key"),
+            }
+            .rule(),
+            "damaged-entry"
+        );
+        let sealer_id =
+            |deployment: &str| SealerId::new("file", "NativeMCP.secrets.v2", deployment);
+        let elsewhere = ResolveError::SealedElsewhere {
+            name: "api.key".into(),
+            version: Version::first(),
+            sealed_by: sealer_id("other"),
+            sealer: sealer_id("this"),
+            rule: BindingRuleId::new("binding.api.key"),
+        };
+        assert_eq!(elsewhere.rule(), "sealed-elsewhere");
+        let unsealable = ResolveError::Unsealable {
+            name: "api.key".into(),
+            version: Version::first(),
+            sealed_by: sealer_id("this"),
+            rule: BindingRuleId::new("binding.api.key"),
+            source: Box::new(SealError::Unsealable),
+        };
+        assert_eq!(unsealable.rule(), "unsealable");
     }
 
     #[test]

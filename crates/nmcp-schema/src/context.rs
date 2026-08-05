@@ -84,8 +84,10 @@ pub struct CallContext {
     /// performs the injection (NMCP-SPEC-003 section 4.3).
     ///
     /// Private, read through [`CallContext::secrets`], which hands out a borrow rather than
-    /// an owned copy. Empty for every call today; see [`ResolvedSecrets`] for what that
-    /// means and for why the field is carried before NMCP-SPEC-002 defines its contents.
+    /// an owned copy, and set through [`CallContext::with_secrets`] by ring stage 5b. Empty
+    /// for every call whose tool declares no `secret_ref` slot, which section 4.3 states
+    /// and stage 5b preserves by construction: a slotless tool gives the stage nothing to
+    /// resolve.
     secrets: ResolvedSecrets,
 }
 
@@ -180,11 +182,27 @@ impl CallContext {
         self.matched_root.as_ref()
     }
 
+    /// Carry the secrets ring stage 5b resolved for this call (NMCP-SPEC-002 SB-5).
+    ///
+    /// Public for the same reason [`ResolvedSecrets::insert`] is: the ring lives in
+    /// `nmcp-router`, this crate cannot name it, and no visibility admits the ring and
+    /// nothing else. The unforgeability story for secret use is the binding grant and the
+    /// sealed store in `nmcp-secrets`, which are the only path to material; this builder
+    /// moves material that already exists onto the context that carries it, exactly as
+    /// [`CallContext::with_profile`] moves a profile. What the frozen text fixes is
+    /// preserved: the field stays private, the accessor hands out no owned copy, and a call
+    /// with no declared slot carries an empty channel because the stage resolves nothing
+    /// for it.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: ResolvedSecrets) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
     /// Secret material resolved for this call.
     ///
     /// A borrow, never an owned copy, per NMCP-SPEC-003 section 4.3. Empty for every call
-    /// with no schema-declared secret slot, which is every call until NMCP-SPEC-002 defines
-    /// the slot.
+    /// with no schema-declared secret slot.
     #[must_use]
     pub fn secrets(&self) -> &ResolvedSecrets {
         &self.secrets
@@ -329,8 +347,10 @@ mod tests {
     /// `secrets` is that line, and it clears the bar the doc above sets for a new field. It
     /// holds material the kernel resolved from a slot the tool's own input schema declared;
     /// a caller can neither name a slot nor put bytes in one, and the reader hands out a
-    /// borrow, so nothing here can be lifted out and forwarded. It is also empty for every
-    /// call that exists today (NMCP-SPEC-003 section 4.3).
+    /// borrow, so nothing here can be lifted out and forwarded. Since I-034 populated the
+    /// channel the bar holds for the same reasons: what travels in it came out of the
+    /// sealed store under a binding grant, never off the wire, and the caller's own bytes
+    /// in a slot argument are replaced by a marker before any provider sees them.
     #[test]
     fn a_call_context_has_no_field_a_caller_credential_could_travel_in() {
         let CallContext {
@@ -420,14 +440,36 @@ mod tests {
         assert_eq!(ctx.memory_scope.to_string(), "session:sess");
     }
 
-    /// Every call carries an empty `ResolvedSecrets`, and the accessor is a borrow. The
-    /// second half is asserted by the signature rather than by an assertion: a reader
-    /// returning an owned copy would let material outlive the call, which NMCP-SPEC-003
-    /// section 4.3 forbids, and this line would not compile against one.
+    /// Every freshly built call carries an empty `ResolvedSecrets`, and the accessor is a
+    /// borrow. The second half is asserted by the signature rather than by an assertion: a
+    /// reader returning an owned copy would let material outlive the call, which
+    /// NMCP-SPEC-003 section 4.3 forbids, and this line would not compile against one.
     #[test]
     fn every_call_carries_an_empty_secret_channel() {
         let ctx = CallContext::new(None);
         let borrowed: &crate::ResolvedSecrets = ctx.secrets();
         assert!(borrowed.is_empty());
+    }
+
+    /// The one setter carries what stage 5b resolved, and the reader reports it. The
+    /// material stays sealed on the way through: the only read is `with_exposed`, which is
+    /// the property the carrier exists for.
+    #[test]
+    fn the_secrets_the_ring_attaches_are_the_secrets_the_provider_reads() {
+        use crate::{InjectionModality, ResolvedSecrets, SealedSecret};
+
+        let mut resolved = ResolvedSecrets::default();
+        resolved.insert(
+            "credential",
+            InjectionModality::Env {
+                var: "DATABASE_URL".to_string(),
+            },
+            SealedSecret::new(b"qx7ve-2wkzn-8rjt4".to_vec()),
+        );
+        let ctx = CallContext::new(None).with_secrets(resolved);
+        assert!(!ctx.secrets().is_empty());
+        let (modality, value) = ctx.secrets().get("credential").expect("slot resolved");
+        assert_eq!(modality.declared_name(), "DATABASE_URL");
+        assert_eq!(value.with_exposed(<[u8]>::to_vec), b"qx7ve-2wkzn-8rjt4");
     }
 }

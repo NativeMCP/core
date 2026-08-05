@@ -16,7 +16,7 @@
 //!       4  authorize                (the declaration becomes a GrantedAuthority)
 //!                                                           Authorizing
 //!       5  approval gate, ABAC, HITL                        -> Rejected on deny
-//!       5b reserved: secret resolution (NMCP-SPEC-002, not implemented here)
+//!       5b secret resolution       (NMCP-SPEC-002 SB-5)     -> Rejected on refusal
 //!       6  audit intent record      (INV-3 gate, durable before any effect)
 //!                                                           Recorded
 //!       7  provider.call(.., granted)                       Executed
@@ -66,9 +66,12 @@
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::{Permission, PolicyConfig};
 use nmcp_schema::{
-    CapabilityGrant, CatalogView, Denial, HeldAuthority, RegistrationError, RequestReceived,
-    SettledRequest, ToolAuthority, ToolEffect, ToolRegistry, authorize,
+    CapabilityGrant, CatalogView, Denial, GrantedAuthority, HeldAuthority, InjectionModality,
+    RegistrationError, RequestReceived, ResolvedSecrets, SECRET_SLOT_MARKER, SealedSecret,
+    SecretRef, SecretSlotCatalog, SettledRequest, ToolAuthority, ToolEffect, ToolRegistry,
+    authorize,
 };
+use nmcp_secrets::{BindingRequest, SealedStore, SecretName};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
@@ -85,12 +88,12 @@ use tracing::{info, warn};
 /// what keeps that true once this workspace's own dependents stop going through it.
 ///
 /// `CallContext` took the two changes 4.3 requires and no others. `matched_root` is private
-/// with a `matched_root()` reader, and its one setter takes a
-/// [`GrantedAuthority`](nmcp_schema::GrantedAuthority) rather than a bare root, so nothing can
-/// decide what a call resolved to without having asked. And a private
-/// `secrets: ResolvedSecrets` appears with a reader, carried empty now because adding a
-/// fifth parameter to a frozen trait method after implementors exist is a breaking change
-/// to every one of them. `ToolCallResult` is unchanged.
+/// with a `matched_root()` reader, and its one setter takes a [`GrantedAuthority`] rather
+/// than a bare root, so nothing can decide what a call resolved to without having asked.
+/// And a private `secrets: ResolvedSecrets` appears with a reader, carried empty until
+/// I-034 wired stage 5b, because adding a fifth parameter to a frozen trait method after
+/// implementors exist is a breaking change to every one of them. `ToolCallResult` is
+/// unchanged.
 pub use nmcp_schema::{CallContext, ToolCallResult};
 
 /// The public tool name derivation and its validator, re-exported from `nmcp-schema`.
@@ -229,6 +232,11 @@ fn denial_result(declared: &ToolAuthority, denial: &Denial) -> ToolCallResult {
             "This tool declares no path authority, so it cannot be pointed at a path. Use a tool \
              that does."
         }
+        Denial::SecretUnavailable { .. } => {
+            "Store the referenced secret and bind it to this tool, program, root and caller \
+             through the operator surface, or correct the reference this call carries. No policy \
+             root change can grant it."
+        }
         _ => match declared.permission {
             Some(Permission::GitPublish) => {
                 "Grant the explicit git.publish permission on the repository root only after \
@@ -245,6 +253,213 @@ fn denial_result(declared: &ToolAuthority, denial: &Denial) -> ToolCallResult {
         "policy_denied",
         Some(remediation),
     )
+}
+
+// - Stage 5b: secret resolution (NMCP-SPEC-002 SB-5, I-034) -
+
+/// The stage 5b wiring: the sealed store and the slot catalog, injected together.
+///
+/// Injected as one value on purpose, so the ring cannot be wired to resolve without being
+/// able to read declarations or the other way around. The composer must pass the same
+/// object behind [`SecretSlotCatalog`] that it passed to [`Router::new`] as the
+/// [`ToolRegistry`]; `nmcp_host::IndexedToolRegistry` implements both, and two indexes is
+/// how the slots the stage reads and the tool that resolves come to disagree.
+///
+/// A router with no [`SecretResolution`] wired treats stage 5b as inert: references stay
+/// literal text in the arguments, which is what they are everywhere resolution does not
+/// exist (SB-2, T3: a reference is a name, not material, and with no store in the process
+/// there is no material anywhere to protect). SB-8's fail-closed rule governs a wired store
+/// that refuses, not a composition that never had one; the composition that registers
+/// slot-declaring tools and serves callers owes them this wiring, and I-031 is where that
+/// composition lives.
+#[derive(Clone)]
+pub struct SecretResolution {
+    store: Arc<SealedStore>,
+    slots: Arc<dyn SecretSlotCatalog>,
+}
+
+impl SecretResolution {
+    /// Wire a sealed store and the slot catalog the ring reads declarations from.
+    #[must_use]
+    pub fn new(store: Arc<SealedStore>, slots: Arc<dyn SecretSlotCatalog>) -> Self {
+        Self { store, slots }
+    }
+}
+
+/// What stage 5b hands the two post-resolution audit records (SB-7).
+///
+/// Names, versions and rules only, never material or a material-derived value (SB-1). On a
+/// call that resolved several slots each field is comma-joined in slot order, aligned index
+/// for index; the SB-2 grammar admits no comma, so the join is unambiguous. On a refusal
+/// the version is absent when the stage refused before a version was chosen.
+struct SecretUseStamp {
+    name: Option<String>,
+    version: Option<String>,
+    rule: Option<String>,
+}
+
+/// Everything one successful stage 5b run produces: the channel for the provider and the
+/// stamp for the audit pair.
+struct ResolvedForCall {
+    secrets: ResolvedSecrets,
+    stamp: SecretUseStamp,
+}
+
+/// A stage 5b refusal: the denial the caller sees and the stamp the denied record carries.
+struct SecretRefusal {
+    denial: Denial,
+    stamp: SecretUseStamp,
+}
+
+impl SecretRefusal {
+    /// A refusal with the governing rule named (SB-8), about `name` when one was parsed.
+    fn new(rule: impl Into<String>, name: Option<&SecretName>) -> Self {
+        let rule = rule.into();
+        Self {
+            denial: Denial::SecretUnavailable { rule: rule.clone() },
+            stamp: SecretUseStamp {
+                name: name.map(ToString::to_string),
+                version: None,
+                rule: Some(rule),
+            },
+        }
+    }
+}
+
+/// Resolve every declared `secret_ref` slot whose argument carries a reference, replacing
+/// each consumed reference with [`SECRET_SLOT_MARKER`] in the arguments the provider will
+/// see.
+///
+/// The mechanics of stage 5b, called from exactly one place in [`Router::walk_the_ring`],
+/// which keeps the stage's position, refusal path and state walk inline in the ring the way
+/// stage 0 does with `delete_guard_check`. Per slot, in the declaration's argument order:
+///
+/// - an absent argument fires nothing: a slot the schema marks optional and the caller did
+///   not use is no use, and nothing is evaluated or spent for it;
+/// - a present argument that does not parse as a reference is refused,
+///   `slot-requires-reference:<argument>`, because a declared slot receiving a non-reference
+///   is a caller error the tool should not see: passing it through would run the tool with a
+///   credential-shaped string where the tool was promised injected material, which fails
+///   open in exactly the direction `RegistrationError::UndeclaredSecretSlot` exists to
+///   refuse;
+/// - a reference is evaluated (`SealedStore::evaluate`, which mints the single-use
+///   `BindingGrant` and spends the budget at mint), resolved (consuming the grant),
+///   converted to the schema carrier through the scoped-exposure API, and recorded in the
+///   channel under its slot with its declared modality.
+///
+/// The binding request carries exactly what the call carries (I-036's vacuity rule): the
+/// tool dimension is always the **derived public name**, whichever alias the caller
+/// dispatched under, so an operator writes each binding against one stable name; the caller
+/// dimension is `ctx.agent_id`, or the literal `local` for the population that has none,
+/// matching the audit chain's own convention for the same callers; the program dimension is
+/// carried only for an `env` slot whose arguments carry a `program` string, as its basename,
+/// which is the name `nmcp-exec` allowlists; and the root dimension is carried only when
+/// authorization resolved one, read from the proof.
+///
+/// # Errors
+///
+/// A [`SecretRefusal`] whose denial is [`Denial::SecretUnavailable`] with the governing
+/// rule named (SB-8): the rule from `BindingDenial::rule()` or `ResolveError::rule()`, or
+/// one of the stage's own for a malformed slot argument or an unreadable declaration.
+fn resolve_secret_slots(
+    stage: &SecretResolution,
+    public_name: &str,
+    granted: &GrantedAuthority,
+    ctx: &CallContext,
+    args: &mut Value,
+) -> Result<Option<ResolvedForCall>, SecretRefusal> {
+    let Some(slots) = stage.slots.secret_slots_of(public_name) else {
+        // Resolved at stage 1 and gone from the catalog now: the declaration cannot be
+        // read, so nothing proves the reference-shaped argument below is not a declared
+        // slot. Fail closed on the evidence (SB-8) rather than letting a possible slot's
+        // reference travel to the provider; with no reference present there is nothing a
+        // slot could have asked for, and the call proceeds.
+        if let Some(object) = args.as_object()
+            && object
+                .values()
+                .filter_map(Value::as_str)
+                .any(|text| SecretRef::parse(text).is_ok())
+        {
+            return Err(SecretRefusal::new("slots-unreadable", None));
+        }
+        return Ok(None);
+    };
+
+    let mut secrets = ResolvedSecrets::default();
+    let mut names: Vec<String> = Vec::new();
+    let mut versions: Vec<String> = Vec::new();
+    let mut rules: Vec<String> = Vec::new();
+
+    for slot in slots {
+        let Some(supplied) = args.get(&slot.arg) else {
+            continue;
+        };
+        let reference = supplied
+            .as_str()
+            .and_then(|text| SecretRef::parse(text).ok());
+        let Some(reference) = reference else {
+            return Err(SecretRefusal::new(
+                format!("slot-requires-reference:{}", slot.arg),
+                None,
+            ));
+        };
+        let name = SecretName::from(&reference);
+
+        let mut request = BindingRequest::new(
+            public_name,
+            ctx.agent_id.clone().unwrap_or_else(|| "local".to_string()),
+        );
+        if matches!(slot.modality, InjectionModality::Env { .. })
+            && let Some(program) = args.get("program").and_then(Value::as_str)
+            && let Some(basename) = std::path::Path::new(program).file_name()
+        {
+            request = request.with_program(basename.to_string_lossy());
+        }
+        if let Some(root) = granted.matched_root() {
+            request = request.with_root(&root.id);
+        }
+
+        let grant = stage
+            .store
+            .evaluate(&name, &request)
+            .map_err(|denial| SecretRefusal::new(denial.rule(), Some(&name)))?;
+        // Read off the grant before `resolve` consumes it: the record must name the
+        // version that was authorized, not one looked up again afterwards (SB-R5).
+        names.push(grant.name().to_string());
+        versions.push(grant.version().to_string());
+        rules.push(grant.rule().to_string());
+
+        let sealed = stage
+            .store
+            .resolve(grant)
+            .map_err(|refused| SecretRefusal::new(refused.rule(), Some(&name)))?;
+        // The one conversion between the two sealed types, through the scoped API. The
+        // copy is the price of the dependency direction the carrier's documentation
+        // argues; both allocations zeroize on their own drop, and the store's drops here.
+        let carrier = sealed.with_exposed(|bytes| SealedSecret::new(bytes.clone()));
+        drop(sealed);
+        secrets.insert(slot.arg.clone(), slot.modality, carrier);
+
+        // The reference is removed from the arguments the provider sees: material travels
+        // through the context channel, and a reference reaching a child process's argv via
+        // a confused provider is the exposure SB-A2 exists to prevent. `as_object_mut`
+        // succeeds because `args.get` above just read this same object.
+        if let Some(object) = args.as_object_mut() {
+            object.insert(slot.arg, Value::String(SECRET_SLOT_MARKER.to_string()));
+        }
+    }
+
+    if secrets.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ResolvedForCall {
+        secrets,
+        stamp: SecretUseStamp {
+            name: Some(names.join(",")),
+            version: Some(versions.join(",")),
+            rule: Some(rules.join(",")),
+        },
+    }))
 }
 
 // - AuditRing -
@@ -266,16 +481,33 @@ fn audit_intent(
     tool_name: &str,
     ctx: &CallContext,
     permission: Option<Permission>,
+    secret_use: Option<&SecretUseStamp>,
 ) {
     let mut event = AuditEvent::new(tool_name, format!("intent tool={tool_name}"));
     event.decision = nmcp_audit::INTENT_DECISION.to_string();
     stamp_caller(&mut event, ctx);
     event.permission = permission.map(|p| p.as_str().to_string());
+    stamp_secret_use(&mut event, secret_use);
     if let Some(root) = ctx.matched_root() {
         event.normalized_path = Some(root.path.display().to_string());
     }
     if let Err(e) = sink.append(&event) {
         warn!(call_id = %ctx.call_id, "AuditRing: failed to write intent event: {e}");
+    }
+}
+
+/// Copy what stage 5b decided onto a record, the same way for every record that carries it.
+///
+/// SB-7: the intent record and the outcome record of a resolving call both name the key,
+/// version and binding rule, and the denied record of a refused one names the key when it
+/// was parsed and the rule that refused. One function so the pair cannot disagree, exactly
+/// as [`stamp_caller`] argues for the caller's identity. Names and rules only, never
+/// material (SB-1).
+fn stamp_secret_use(event: &mut AuditEvent, secret_use: Option<&SecretUseStamp>) {
+    if let Some(stamp) = secret_use {
+        event.secret_name.clone_from(&stamp.name);
+        event.secret_version.clone_from(&stamp.version);
+        event.secret_rule.clone_from(&stamp.rule);
     }
 }
 
@@ -324,6 +556,7 @@ fn audit_record(
     ctx: &CallContext,
     result: &ToolCallResult,
     permission: Option<Permission>,
+    secret_use: Option<&SecretUseStamp>,
     started: Instant,
 ) {
     let decision = if result.is_error {
@@ -339,6 +572,7 @@ fn audit_record(
     let mut event = AuditEvent::new(tool_name, &summary);
     event.decision = decision.to_string();
     stamp_caller(&mut event, ctx);
+    stamp_secret_use(&mut event, secret_use);
     // M4-1. The capability the ring required, taken from the tool's own declaration rather
     // than from anything the caller sent, so the Event Log mirror can give a read and an
     // execution different Event IDs and a SIEM rule can tell them apart without parsing a
@@ -395,6 +629,10 @@ pub struct Router {
     /// await makes the future `!Send` and does not compile. `dispatch_future_is_send` below is
     /// the compile-time assertion (RC-10).
     abac: parking_lot::RwLock<Option<Arc<dyn AbacCheck>>>,
+    /// The stage 5b wiring, behind the same lock discipline as `abac` and for the same
+    /// reasons: wired through `&self` after the router is shared (RC-D7), cloned out of the
+    /// guard before any `await`. `None` leaves stage 5b inert; see [`SecretResolution`].
+    secrets: parking_lot::RwLock<Option<SecretResolution>>,
 }
 
 impl Router {
@@ -409,6 +647,7 @@ impl Router {
             policy,
             audit,
             abac: parking_lot::RwLock::new(None),
+            secrets: parking_lot::RwLock::new(None),
         }
     }
 
@@ -452,6 +691,15 @@ impl Router {
     /// path.
     pub fn set_abac(&self, stage: Arc<dyn AbacCheck>) {
         *self.abac.write() = Some(stage);
+    }
+
+    /// Wire secret resolution into ring stage 5b (NMCP-SPEC-002 SB-5, I-034).
+    ///
+    /// `&self` per RC-D7, like every other wire-up method. Until this is called the stage
+    /// is inert and references stay literal text; see [`SecretResolution`] for what the
+    /// wiring carries and for the one-object rule its two halves must satisfy.
+    pub fn set_secrets(&self, resolution: SecretResolution) {
+        *self.secrets.write() = Some(resolution);
     }
 
     /// Merged, Claude-safe tool list for `tools/list` responses.
@@ -547,7 +795,7 @@ impl Router {
         // delete-denied name at registration, so an operator wiring the server learns it
         // rather than a caller being denied forever.
         if let Some(denied) = delete_guard_check(tool_name) {
-            audit_record(&self.audit, tool_name, &ctx, &denied, None, started);
+            audit_record(&self.audit, tool_name, &ctx, &denied, None, None, started);
             return state.rejected().settle(denied);
         }
 
@@ -568,7 +816,7 @@ impl Router {
                 "command_not_found",
                 Some("Call tools/list and retry with a registered tool name."),
             );
-            audit_record(&self.audit, tool_name, &ctx, &result, None, started);
+            audit_record(&self.audit, tool_name, &ctx, &result, None, None, started);
             return state.rejected().settle(result);
         };
         let permission = declared.permission;
@@ -598,7 +846,15 @@ impl Router {
                     "Call tools/list to see what this session can reach, or connect with a client bound to a profile that includes this server.",
                 ),
             );
-            audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+            audit_record(
+                &self.audit,
+                tool_name,
+                &ctx,
+                &denied,
+                permission,
+                None,
+                started,
+            );
             return state.rejected().settle(denied);
         }
 
@@ -654,7 +910,15 @@ impl Router {
                 }
             };
             if let Some(denied) = denied {
-                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                audit_record(
+                    &self.audit,
+                    tool_name,
+                    &ctx,
+                    &denied,
+                    permission,
+                    None,
+                    started,
+                );
                 return state.rejected().settle(denied);
             }
         }
@@ -686,7 +950,15 @@ impl Router {
             Err(denial) => {
                 warn!(tool = tool_name, "PolicyRing: denied - {denial}");
                 let denied = denial_result(&declared, &denial);
-                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                audit_record(
+                    &self.audit,
+                    tool_name,
+                    &ctx,
+                    &denied,
+                    permission,
+                    None,
+                    started,
+                );
                 return state.rejected().settle(denied);
             }
         };
@@ -725,7 +997,15 @@ impl Router {
                             "Review ABAC policy constraints or request approval through the configured workflow.",
                         ),
                     );
-                    audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                    audit_record(
+                        &self.audit,
+                        tool_name,
+                        &ctx,
+                        &denied,
+                        permission,
+                        None,
+                        started,
+                    );
                     return state.rejected().settle(denied);
                 }
                 AbacDecision::RequireApproval => {
@@ -743,7 +1023,15 @@ impl Router {
                     "policy_denied",
                     Some("Enable auto_approve or configure an ABAC approval workflow before invoking mutating tools."),
                 );
-                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                audit_record(
+                    &self.audit,
+                    tool_name,
+                    &ctx,
+                    &denied,
+                    permission,
+                    None,
+                    started,
+                );
                 return state.rejected().settle(denied);
             };
             // Block until human approves or timeout fires (fail closed).
@@ -754,28 +1042,87 @@ impl Router {
                     "approval_denied",
                     Some("Retry only after operator approval or adjust the HITL policy."),
                 );
-                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                audit_record(
+                    &self.audit,
+                    tool_name,
+                    &ctx,
+                    &denied,
+                    permission,
+                    None,
+                    started,
+                );
                 return state.rejected().settle(denied);
             }
         }
 
-        // - Stage 5b: reserved for secret resolution, owned by NMCP-SPEC-002 -
+        // - Stage 5b: secret resolution (NMCP-SPEC-002 SB-5, I-034) -
         //
-        // Named rather than omitted, per INV-6. Its position is fixed by NMCP-SPEC-003 section
-        // 4.6 and nothing else about it is that spec's to say: it sits after the approval gate,
-        // because resolving a credential for a call a human then refuses is a use that should
-        // never have happened, and before the intent record below, because that record names the
-        // key, version and binding decision and a record written ahead of the decision it
-        // describes asserts an outcome that could not have been known. Resolved material would
-        // reach the provider through `CallContext::secrets`, which is carried and empty on every
-        // call today. Owner: NMCP-SPEC-002, issues I-032 and I-033.
+        // Its position is NMCP-SPEC-003 section 4.6's two frozen constraints, honoured
+        // exactly: after the approval gate, because resolving a credential for a call a human
+        // then refuses is a use that should never have happened, and before the intent record
+        // below, because that record names the key, version and binding decision, and a record
+        // written ahead of the decision it describes asserts an outcome that could not have
+        // been known. SPEC-002's architecture block says "nmcp-host: stage 5b resolution"; the
+        // ring is one function and it lives here until I-031 moves composition, and 4.6, the
+        // governing frozen text, constrains position rather than crate.
+        //
+        // Fires only when the resolved tool's contract declares `secret_ref` slots AND the
+        // slot's argument parses as a reference; a reference in any other parameter is
+        // literal text (SB-2), which `a_tool_with_no_slots_passes_a_reference_through_inert`
+        // holds the ring to. A refusal is `Denial::SecretUnavailable` with the governing rule
+        // named (SB-8), taking the `rejected()` path exactly as a stage 5 deny does: the
+        // guard's `Authorizing -> Rejected` edge, no new edge needed, because 5b refusals
+        // happen before `recorded()`. Resolved material reaches the provider only through
+        // `CallContext::secrets`, and the consumed reference is replaced in the arguments by
+        // `SECRET_SLOT_MARKER` (SB-A2). The material's lifetime runs from here to the end of
+        // the call: the context is dropped when dispatch returns, and the tripwire scan that
+        // extends the stated window to the scrub is I-035's.
+        let stage5b = self.secrets.read().clone();
+        let mut args = args;
+        let resolved_use = match stage5b.as_ref() {
+            None => None,
+            Some(resolution) => {
+                // Bindings name tools by the derived public name, whichever alias the
+                // caller dispatched under, so one binding governs every name form.
+                let public_name = public_tool_name(provider.provider_id(), &local_name);
+                match resolve_secret_slots(resolution, &public_name, &granted, &ctx, &mut args) {
+                    Ok(resolved) => resolved,
+                    Err(refusal) => {
+                        warn!(tool = tool_name, "SecretRing: denied - {}", refusal.denial);
+                        let denied = denial_result(&declared, &refusal.denial);
+                        audit_record(
+                            &self.audit,
+                            tool_name,
+                            &ctx,
+                            &denied,
+                            permission,
+                            Some(&refusal.stamp),
+                            started,
+                        );
+                        return state.rejected().settle(denied);
+                    }
+                }
+            }
+        };
+        let (ctx, secret_use) = match resolved_use {
+            Some(resolved) => (ctx.with_secrets(resolved.secrets), Some(resolved.stamp)),
+            None => (ctx, None),
+        };
 
         // - Stage 6: audit intent record -
         //
         // INV-3's gate in the ring (RC-16). Durable before any effect, and written only once
         // every gate above has said yes, so an intent record is a statement that this call was
-        // about to run rather than that somebody asked for it.
-        audit_intent(&self.audit, tool_name, &ctx, permission);
+        // about to run rather than that somebody asked for it. For a call that resolved
+        // secrets it names the key, version and binding rule (SB-7), which stage 5b has
+        // decided by now; that ordering is the whole reason 5b sits above this line.
+        audit_intent(
+            &self.audit,
+            tool_name,
+            &ctx,
+            permission,
+            secret_use.as_ref(),
+        );
         let state = state.recorded();
 
         // - Stage 7: provider call -
@@ -790,7 +1137,18 @@ impl Router {
         let state = state.executed();
 
         // - Stage 8: audit outcome record -
-        audit_record(&self.audit, tool_name, &ctx, &result, permission, started);
+        //
+        // The other half of SB-7's pair: the outcome record of a call that resolved secrets
+        // carries the same key, version and rule as its intent record, on one call_id.
+        audit_record(
+            &self.audit,
+            tool_name,
+            &ctx,
+            &result,
+            permission,
+            secret_use.as_ref(),
+            started,
+        );
 
         state.completed().settle(result)
     }
@@ -3038,5 +3396,395 @@ mod tests {
             Some("repo"),
             "the resolved root is the one containing the argument the tool reads"
         );
+    }
+
+    // - NMCP-SPEC-002 stage 5b: secret resolution in the ring (I-034) -
+
+    use nmcp_schema::{SECRET_SLOT_ANNOTATION, SECRET_SLOT_MARKER};
+    use nmcp_secrets::{KeyBinding, Sealed, SealedStore, SecretName, UseBudget};
+
+    /// Distinctive material with no English substring, so the leak assertions below cannot
+    /// collide with legitimate prose such as the word "secret".
+    const SECRET_MATERIAL: &[u8] = b"xq4vw-7zr9t-8kn2m-hp5jd";
+
+    /// The reference the fixtures dispatch, naming the key the fixtures bind.
+    const DEPLOY_REF: &str = "nmcp://secret/deploy.db";
+
+    /// What the keyed provider saw when the ring reached it.
+    #[derive(Clone)]
+    struct SlotObservation {
+        args: Value,
+        channel_empty: bool,
+        /// The declared env variable and the exposed bytes, when the slot resolved. Exposed
+        /// through `with_exposed` because that is the only read path, which is itself half
+        /// of what the test asserts.
+        resolved: Option<(String, Vec<u8>)>,
+    }
+
+    /// A first-party tool declaring one `env` secret slot on `credential`, beside a free
+    /// `program` argument (the basename source for the binding's program dimension) and a
+    /// free `message` argument (the SB-2 inertness control inside the same call).
+    struct KeyedProvider {
+        observed: std::sync::Mutex<Option<SlotObservation>>,
+    }
+
+    impl KeyedProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                observed: std::sync::Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ToolProvider for KeyedProvider {
+        fn contract_version(&self) -> u32 {
+            1
+        }
+        fn provider_id(&self) -> &str {
+            ""
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            let mut contract = test_contract("keyed_run", ToolEffect::Observe);
+            contract.input_schema = json!({
+                "type": "object",
+                "properties": {
+                    "credential": {
+                        "type": "string",
+                        SECRET_SLOT_ANNOTATION: {"inject": "env", "var": "DATABASE_URL"},
+                    },
+                    "program": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            });
+            vec![contract]
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
+            let resolved = ctx.secrets().get("credential").map(|(modality, value)| {
+                (
+                    modality.declared_name().to_string(),
+                    value.with_exposed(<[u8]>::to_vec),
+                )
+            });
+            *self.observed.lock().unwrap() = Some(SlotObservation {
+                args: args.clone(),
+                channel_empty: ctx.secrets().is_empty(),
+                resolved,
+            });
+            ToolCallResult::ok(args)
+        }
+    }
+
+    /// A store holding `deploy.db` bound to the keyed tool: callers `local` (the audit
+    /// convention for the CLI and test population, which is what an anonymous `agent_id`
+    /// maps to), program `deployctl`, no roots because the tool resolves none and an
+    /// uncarried dimension is not consulted (I-036), and a budget of `uses` per hour.
+    fn bound_store(uses: u32) -> Arc<SealedStore> {
+        let store = Arc::new(SealedStore::ephemeral());
+        let key = SecretName::parse("deploy.db").unwrap();
+        store
+            .set(&key, Sealed::new(SECRET_MATERIAL.to_vec()))
+            .unwrap();
+        store
+            .bind(
+                &key,
+                KeyBinding {
+                    tools: vec!["keyed_run".to_string()],
+                    programs: vec!["deployctl".to_string()],
+                    roots: Vec::new(),
+                    callers: vec!["local".to_string()],
+                    expires_at_unix_ms: None,
+                    budget: Some(UseBudget {
+                        uses,
+                        window_secs: 3_600,
+                    }),
+                },
+            )
+            .unwrap();
+        store
+    }
+
+    /// A router whose stage 5b is wired: the registry serves as both the `ToolRegistry` and
+    /// the `SecretSlotCatalog`, which is the one-object rule `SecretResolution` documents.
+    fn keyed_router(store: &Arc<SealedStore>) -> (std::path::PathBuf, Router, Arc<KeyedProvider>) {
+        let (path, audit) = temp_audit("stage5b");
+        let policy = Arc::new(parking_lot::RwLock::new(PolicyConfig::default()));
+        let registry = Arc::new(IndexedToolRegistry::new(Arc::clone(&policy)));
+        let router = Router::new(
+            policy,
+            audit,
+            Arc::clone(&registry) as Arc<dyn ToolRegistry>,
+        );
+        router.set_secrets(SecretResolution::new(Arc::clone(store), registry));
+        let provider = KeyedProvider::new();
+        router
+            .register(Arc::clone(&provider) as Arc<dyn ToolProvider>)
+            .expect("the keyed tool registers");
+        (path, router, provider)
+    }
+
+    fn keyed_args() -> Value {
+        json!({
+            "credential": DEPLOY_REF,
+            "program": "deployctl",
+            "message": format!("see {DEPLOY_REF} for the key"),
+        })
+    }
+
+    /// The I-034 acceptance walk, end to end at the ring: a declared slot resolves through
+    /// evaluation and the store, the provider receives the marker and the channel rather
+    /// than the reference, the SB-7 pair names key, version and rule, and no serialized
+    /// record or result carries any byte window of the material (the SB-1 measurement
+    /// discipline). Then the budget arithmetic: two dispatches spend two uses, the third
+    /// names the budget, and after quarantine the refusal names key state, because state
+    /// precedes budget in the evaluator's gate order.
+    #[tokio::test]
+    async fn the_ring_resolves_a_declared_slot_end_to_end() {
+        let store = bound_store(2);
+        let (path, router, provider) = keyed_router(&store);
+
+        let result = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+
+        // What the provider saw: the marker where the reference was, the free-text
+        // reference untouched (SB-2 inertness inside the same call), and the material in
+        // the channel under the declared variable.
+        let observed = provider.observed.lock().unwrap().clone().expect("called");
+        assert_eq!(observed.args["credential"], SECRET_SLOT_MARKER);
+        assert_eq!(observed.args["program"], "deployctl");
+        assert_eq!(
+            observed.args["message"],
+            format!("see {DEPLOY_REF} for the key"),
+            "a reference in a free-text argument is literal text (SB-2)"
+        );
+        assert!(!observed.channel_empty);
+        let (variable, bytes) = observed.resolved.expect("the slot resolved");
+        assert_eq!(variable, "DATABASE_URL");
+        assert_eq!(bytes, SECRET_MATERIAL);
+
+        // The SB-7 pair: intent then outcome, one call_id, both naming key, version and
+        // rule.
+        let events = audit_lines(&path);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["decision"], nmcp_audit::INTENT_DECISION);
+        assert_eq!(events[1]["decision"], nmcp_audit::ALLOWED_DECISION);
+        assert_eq!(events[0]["call_id"], events[1]["call_id"]);
+        for event in &events {
+            assert_eq!(event["secret_name"], "deploy.db");
+            assert_eq!(event["secret_version"], "1");
+            assert_eq!(event["secret_rule"], "binding.deploy.db");
+        }
+
+        // SB-1, measured rather than asserted: no byte window of the material in any
+        // serialized audit record or in the result.
+        let material = String::from_utf8_lossy(SECRET_MATERIAL).to_string();
+        let chain = std::fs::read_to_string(&path).expect("chain");
+        assert!(!chain.contains(&material), "material reached the chain");
+        let rendered = serde_json::to_string(&result.content).expect("content");
+        assert!(!rendered.contains(&material), "material reached the result");
+        assert!(
+            rendered.contains(SECRET_SLOT_MARKER),
+            "the echoed arguments carry the marker, which proves the provider echoed what \
+             it was given rather than what the caller sent"
+        );
+
+        // The budget decremented exactly once per dispatch: the second use of a
+        // two-per-window budget succeeds, the third is refused naming the budget.
+        let second = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!second.is_error, "a double decrement would refuse here");
+        let third = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(third.is_error);
+        let third_text = third.content[0]["text"].as_str().unwrap_or_default();
+        assert!(third_text.contains("use-budget"), "{third_text}");
+
+        // Quarantine, then dispatch again: refused with key state named, which precedes
+        // the budget in the evaluator's gate order, and the denied record carries the rule.
+        store
+            .quarantine(&SecretName::parse("deploy.db").unwrap())
+            .unwrap();
+        let fourth = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(fourth.is_error);
+        let fourth_text = fourth.content[0]["text"].as_str().unwrap_or_default();
+        assert!(fourth_text.contains("key-state"), "{fourth_text}");
+        let events = audit_lines(&path);
+        let last = events.last().expect("denied record");
+        assert_eq!(last["decision"], nmcp_audit::DENIED_DECISION);
+        assert_eq!(last["secret_name"], "deploy.db");
+        assert_eq!(last["secret_rule"], "key-state");
+        assert_eq!(
+            last["secret_version"],
+            serde_json::Value::Null,
+            "no version was chosen for a refused resolution"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Deny by default at the ring: a key the operator stored and never bound refuses with
+    /// the rule named, before the intent record, so the chain shows one denied record and
+    /// no intent that never got an outcome.
+    #[tokio::test]
+    async fn an_unbound_key_refuses_with_the_rule_named() {
+        let store = bound_store(2);
+        store
+            .set(
+                &SecretName::parse("unbound.key").unwrap(),
+                Sealed::new(b"vv2qk-8mzt3-unbound".to_vec()),
+            )
+            .unwrap();
+        let (path, router, provider) = keyed_router(&store);
+
+        let result = router
+            .dispatch(
+                "keyed_run",
+                json!({"credential": "nmcp://secret/unbound.key", "program": "deployctl"}),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(result.is_error);
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("no-binding"), "{text}");
+        assert!(
+            provider.observed.lock().unwrap().is_none(),
+            "a stage 5b refusal never reaches the provider"
+        );
+
+        let events = audit_lines(&path);
+        assert_eq!(events.len(), 1, "a refused call writes no intent record");
+        assert_eq!(events[0]["decision"], nmcp_audit::DENIED_DECISION);
+        assert_eq!(events[0]["secret_name"], "unbound.key");
+        assert_eq!(events[0]["secret_rule"], "no-binding");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// SB-2 at dispatch, with resolution wired and armed: a tool with no declared slots
+    /// passes a well-formed reference through as literal text, untouched, and nothing is
+    /// evaluated or stamped for it. This is the I-032 inertness property held at the ring
+    /// rather than at the extractor.
+    #[tokio::test]
+    async fn a_tool_with_no_slots_passes_a_reference_through_inert() {
+        let store = bound_store(2);
+        let (path, router, _provider) = keyed_router(&store);
+        router.register(Arc::new(EchoProvider)).expect("register");
+
+        let result = router
+            .dispatch("echo", json!({"path": DEPLOY_REF}), CallContext::new(None))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let rendered = serde_json::to_string(&result.content).expect("content");
+        assert!(
+            rendered.contains(DEPLOY_REF),
+            "the reference reaches the tool as the literal text the caller sent: {rendered}"
+        );
+        let events = audit_lines(&path);
+        for event in &events {
+            assert_eq!(
+                event["secret_name"],
+                serde_json::Value::Null,
+                "nothing was resolved, so nothing is stamped"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The declared-slot-without-a-reference ruling, decided and held: a plain string in a
+    /// declared slot is a caller error the tool must not see, refused naming the slot,
+    /// because passing it through would run the tool with a credential-shaped string where
+    /// the contract promised injected material, which fails open in the direction
+    /// `UndeclaredSecretSlot` exists to refuse. An absent optional slot is the other half
+    /// of the ruling and is a separate test below.
+    #[tokio::test]
+    async fn a_declared_slot_with_a_plain_string_refuses_naming_the_slot() {
+        let store = bound_store(2);
+        let (path, router, provider) = keyed_router(&store);
+
+        let result = router
+            .dispatch(
+                "keyed_run",
+                json!({"credential": "hunter2-plain-text", "program": "deployctl"}),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(result.is_error);
+        let text = result.content[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("slot-requires-reference:credential"),
+            "{text}"
+        );
+        assert!(provider.observed.lock().unwrap().is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A declared slot whose argument is absent fires nothing: no evaluation, no spend, no
+    /// stamp, an empty channel, and the arguments reach the provider without the slot key
+    /// being invented. Proven with a one-use budget: the slotless dispatch spends nothing,
+    /// so the reference-carrying dispatch after it still finds its use available.
+    #[tokio::test]
+    async fn an_absent_optional_slot_fires_nothing_and_spends_nothing() {
+        let store = bound_store(1);
+        let (path, router, provider) = keyed_router(&store);
+
+        let without = router
+            .dispatch(
+                "keyed_run",
+                json!({"program": "deployctl"}),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(!without.is_error, "{without:?}");
+        let observed = provider.observed.lock().unwrap().clone().expect("called");
+        assert!(observed.channel_empty);
+        assert!(observed.resolved.is_none());
+        assert_eq!(
+            observed.args.get("credential"),
+            None,
+            "an absent slot argument is not invented"
+        );
+
+        let with = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(
+            !with.is_error,
+            "the one budgeted use is still available, so the absent slot spent nothing: {with:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The unwired composition, documented as a decision: a router with no
+    /// `SecretResolution` treats stage 5b as inert, so a reference stays literal text and
+    /// the channel stays empty. There is no store in the process, so there is no material
+    /// anywhere to protect, and a reference is a name (SB-2, T3); SB-8's fail-closed rule
+    /// governs a wired store that refuses, which the tests above hold.
+    #[tokio::test]
+    async fn an_unwired_ring_leaves_references_as_text() {
+        let (path, audit) = temp_audit("stage5b-unwired");
+        let router = router_over(PolicyConfig::default(), audit);
+        let provider = KeyedProvider::new();
+        router
+            .register(Arc::clone(&provider) as Arc<dyn ToolProvider>)
+            .expect("register");
+
+        let result = router
+            .dispatch("keyed_run", keyed_args(), CallContext::new(None))
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let observed = provider.observed.lock().unwrap().clone().expect("called");
+        assert!(observed.channel_empty);
+        assert_eq!(observed.args["credential"], DEPLOY_REF);
+        let _ = std::fs::remove_file(path);
     }
 }

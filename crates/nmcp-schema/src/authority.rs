@@ -232,6 +232,22 @@ pub enum Denial {
         /// meant to send.
         arg: String,
     },
+    /// A secret this call references could not be resolved for it (NMCP-SPEC-002 SB-5,
+    /// SB-8).
+    ///
+    /// Raised at ring stage 5b, the one stage this enum serves that is not [`authorize`]:
+    /// binding evaluation refused, the store refused the resolution, or the declared slot
+    /// carried something that is not a reference. The variant NMCP-SPEC-003 section 4.5
+    /// named when it marked this enum `non_exhaustive`, added here by I-034 exactly as that
+    /// headroom was reserved for.
+    #[error("a secret this call references is unavailable: {rule} is the governing rule")]
+    SecretUnavailable {
+        /// The stable name of the governing rule (SB-8): a `BindingDenial` rule, a
+        /// `ResolveError` rule, or one of the stage's own, such as
+        /// `slot-requires-reference:<argument>` for a declared slot whose argument is not
+        /// a reference.
+        rule: String,
+    },
 }
 
 /// The one place a declaration becomes a decision.
@@ -260,9 +276,11 @@ pub enum Denial {
 /// # Errors
 ///
 /// Returns the [`Denial`] naming what was refused. Every path out of this function that is
-/// not `Ok` is a refusal with a reason a caller can be shown, and the six variants do not
+/// not `Ok` is a refusal with a reason a caller can be shown, and the variants do not
 /// overlap: exactly one describes any given refusal, which is what lets the audit record
-/// carry the reason rather than a category.
+/// carry the reason rather than a category. [`Denial::SecretUnavailable`] is never returned
+/// here: it belongs to ring stage 5b, which runs after this function and raises it through
+/// the same refusal path (NMCP-SPEC-002 SB-5).
 pub fn authorize(
     declared: &ToolAuthority,
     held: &HeldAuthority,

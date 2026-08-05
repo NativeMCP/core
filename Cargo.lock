@@ -911,6 +911,7 @@ dependencies = [
  "anyhow",
  "nmcp-audit",
  "nmcp-policy",
+ "nmcp-schema",
  "serde",
  "serde_json",
  "tokio",
@@ -1014,6 +1015,7 @@ dependencies = [
  "nmcp-policy",
  "nmcp-proto",
  "nmcp-schema",
+ "nmcp-secrets",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1033,6 +1035,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
