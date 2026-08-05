@@ -139,3 +139,18 @@ jobs:
             exit 1
           fi
           echo "INV-1 gate passed."
+      - name: "INV-8: no legacy brand references"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # NMCP-SPEC-001 R-6. The pattern is assembled from fragments so
+          # that this file does not itself contain the names it rejects,
+          # the same technique as the INV-6 gate above.
+          A="$(printf '%s%s' 'Signal' 'Desk')"
+          B="$(printf '%s%s%s' 'windows' '-local-' 'repo')"
+          P="(${A}|${B})"
+          if git grep -n -i -E "$P"; then
+            echo "::error::INV-8 violation: legacy brand reference present."
+            exit 1
+          fi
+          echo "INV-8 gate passed."
