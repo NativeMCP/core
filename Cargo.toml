@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+"xtask",
+"crates/nmcp-inspector",
+"crates/nmcp-devtools",
+"crates/nmcp-abac",
+"crates/nmcp-router",
 "crates/nmcp-transport",
 "crates/nmcp-fs",
 "crates/nmcp-exec",
@@ -56,6 +61,9 @@ strip = "symbols"
 debug = "line-tables-only"
 
 [workspace.dependencies]
+clap = { version = "4.5.26", features = ["derive", "env"] }
+axum = { version = "0.7.9", features = ["ws"] }
+tracing = "0.1.41"
 walkdir = "2.5.0"
 nmcp-identity = { path = "crates/nmcp-identity", version = "0.1.0" }
 regex = "1.11.1"

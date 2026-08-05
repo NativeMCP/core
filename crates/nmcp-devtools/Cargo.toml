@@ -1,0 +1,27 @@
+[package]
+name = "nmcp-devtools"
+description = "Repository developer tools as a governed provider: git log, blame, diff, dependency graph and test runs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-router = { path = "../nmcp-router", version = "0.1.0" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
