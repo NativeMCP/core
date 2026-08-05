@@ -22,5 +22,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# NMCP-SPEC-002 SB-1, at I-034: the resolved-secret carrier on `CallContext` erases its
+# material on drop, and a `Zeroize` bound alone erases nothing. This is the one external
+# dependency the carrier costs; the workspace already reviewed it for `nmcp-secrets` (INV-7),
+# and RC-1's constraint on this crate is about workspace edges, which are unchanged.
+zeroize.workspace = true
 
 [dev-dependencies]

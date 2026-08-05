@@ -57,6 +57,18 @@
 //! I-033 and I-034 own the store, the sealer and the resolution, and [`ResolvedSecrets`] is
 //! still empty by construction until they land.
 //!
+//! I-034 populated the channel. [`ResolvedSecrets`] gained its interior: entries keyed by
+//! the declared slot argument, each carrying the contract's [`InjectionModality`] and the
+//! material sealed in [`SealedSecret`], a second sealed type whose existence is the price of
+//! the dependency direction (`nmcp-secrets` depends on this crate, so this crate cannot use
+//! its `Sealed<T>`; the carrier's module documentation argues it). [`CallContext::with_secrets`]
+//! is how ring stage 5b attaches what it resolved, [`SecretSlotCatalog`] is where the stage
+//! reads a resolved tool's declared slots without asking a provider to enumerate (RC-9), and
+//! [`SECRET_SLOT_MARKER`] is what the stage writes over a consumed reference so the provider
+//! receives material through the channel and never through the argument (SB-A2).
+//! [`Denial::SecretUnavailable`] is the refusal, added through the `non_exhaustive` headroom
+//! section 4.5 reserved for exactly it.
+//!
 //! I-049 added the request lifecycle: [`RequestState`] and the guard types that walk it. It
 //! arrived here at NMCP-SPEC-003 v1.4 from `nmcp-host`, which re-exports it, and it belongs
 //! here on the merits rather than for reach: the lifecycle is part of what every participant in
@@ -95,9 +107,10 @@ pub use registry::{CatalogView, RegistrationError, ToolRegistry};
 pub use scope::MemoryScope;
 pub use secret_ref::{
     InjectionModality, RESERVED_SECRET_NAMESPACES, SECRET_NAME_MAX_CHARS, SECRET_REF_PREFIX,
-    SECRET_SLOT_ANNOTATION, SecretRef, SecretRefError, SecretSlot, SecretSlotError, secret_slots,
+    SECRET_SLOT_ANNOTATION, SECRET_SLOT_MARKER, SecretRef, SecretRefError, SecretSlot,
+    SecretSlotCatalog, SecretSlotError, secret_slots,
 };
-pub use secrets::ResolvedSecrets;
+pub use secrets::{ResolvedSecrets, SealedSecret};
 
 /// Semantic version of this crate, taken from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

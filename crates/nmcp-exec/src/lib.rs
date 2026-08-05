@@ -9,8 +9,9 @@
 use anyhow::{Context, bail};
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::{Permission, PolicyConfig, absolute_path};
+use nmcp_schema::SealedSecret;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -615,6 +616,42 @@ impl CommandBroker {
     ///
     /// Returns the error this operation can fail with.
     pub async fn execute(&self, req: ExecuteRequest) -> anyhow::Result<ExecutionReport> {
+        self.execute_with_injected_env(req, &[]).await
+    }
+
+    /// [`CommandBroker::execute`] with broker-injected environment variables (NMCP-SPEC-002
+    /// SB-4, the `env` modality).
+    ///
+    /// `injected_env` carries `(variable name, sealed material)` pairs, resolved by ring
+    /// stage 5b and read off `CallContext::secrets` by whatever composes this broker into a
+    /// provider. The material crosses into the child's environment map at spawn, through
+    /// the carrier's scoped-exposure API, and never enters the request, the resolved
+    /// environment, any report, any audit line or the persisted job metadata: every
+    /// injected name shows `<redacted>` on those surfaces unconditionally, regardless of
+    /// the sensitive-name heuristic, which remains in force for variables the broker did
+    /// not inject. A caller-supplied `req.env` entry under an injected name is overridden
+    /// by the injection and redacted with it, so a colliding plaintext value neither wins
+    /// nor leaks.
+    ///
+    /// The sealed carriers are borrowed: the owner (the call context, or a test) drops them
+    /// when the request completes, which zeroizes the material. Two named limits, per
+    /// SB-1's own bound: the child's copy is the child's, past the process boundary the
+    /// program allowlist is the whole control; and the `Command` builder holds its own copy
+    /// of the environment between here and the spawn, which the standard library does not
+    /// zeroize, the same class of intermediate the platform sealers are required to zero
+    /// where they can and `std` cannot be asked to.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`CommandBroker::execute`] can fail with, plus a refusal naming the
+    /// variable when injected material is not valid UTF-8 (an environment value must cross
+    /// the platform environment boundary, and refusing is the fail-closed direction); the
+    /// refusal never echoes material.
+    pub async fn execute_with_injected_env(
+        &self,
+        req: ExecuteRequest,
+        injected_env: &[(String, SealedSecret)],
+    ) -> anyhow::Result<ExecutionReport> {
         self.policy.require(Permission::Execute, &req.cwd)?;
         reject_delete_intent(&req.program, &req.args)?;
         let _permit = self
@@ -629,6 +666,7 @@ impl CommandBroker {
             &req.env,
             req.inherit_service_env,
             req.profile.as_deref(),
+            &injected_names(injected_env),
         )
         .map_err(|err| anyhow::anyhow!(err.summary.clone()))?;
         let started = Instant::now();
@@ -640,6 +678,8 @@ impl CommandBroker {
             &resolved.environment.command_env,
             resolved.environment.inherit_service_env,
         );
+        // After the request environment, so an injected name wins a collision (SB-4).
+        apply_injected_env(&mut child, injected_env)?;
         let output = tokio::time::timeout(Duration::from_millis(req.timeout_ms), child.output())
             .await
             .context("command timed out")??;
@@ -653,20 +693,23 @@ impl CommandBroker {
             stderr_tail: tail_text(&String::from_utf8_lossy(&output.stderr), DEFAULT_TAIL_BYTES),
             summary: "command executed and report captured".into(),
         };
+        // The `env=` line is built from `redacted_env` and from nothing else, which is
+        // SB-4's second hardening: the audit summary never sees an injected value, because
+        // every injected name is already `<redacted>` in the map this consumes. It used to
+        // be built and then overwritten by the exit summary, so it never landed; it lands
+        // now, post-redaction, with the exit facts beside it.
         let mut event = self.effect(
             "execute",
             format!(
-                "{} {:?}; env={}",
+                "{} {:?}; exit={:?}; duration_ms={}; env={}",
                 report.program,
                 report.args,
+                report.exit_code,
+                report.duration_ms,
                 summarize_redacted_env_for_audit(&resolved.environment.redacted_env)
             ),
         );
         event.path = Some(report.cwd.clone());
-        event.summary = format!(
-            "exit={:?}; duration_ms={}",
-            report.exit_code, report.duration_ms
-        );
         self.audit.append(&event)?;
         Ok(report)
     }
@@ -696,6 +739,7 @@ impl CommandBroker {
             &req.env,
             req.inherit_service_env,
             req.profile.as_deref(),
+            &BTreeSet::new(),
         )
         .map_err(|err| anyhow::anyhow!(err))?;
         match resolve_program_with_environment(
@@ -725,8 +769,17 @@ impl CommandBroker {
         }
     }
 
+    /// Describe the execution environment a request would run under, redacted.
+    ///
+    /// A variable the broker injects (SB-4's `env` modality) is **omitted from this report
+    /// entirely, by construction, not shown redacted** (T1a: reporting `NAME=<redacted>`
+    /// tells an agent which credential a governed call carries, which is metadata the agent
+    /// has no use for and an attacker does). The omission is structural rather than a
+    /// filter somebody could forget: injection is a per-call parameter of
+    /// [`CommandBroker::execute_with_injected_env`] that reaches only that call's child
+    /// process, never the service environment or the profile this report describes, and
+    /// this method has no parameter through which an injected name could arrive.
     #[must_use]
-    /// `execute_env_report`.
     #[allow(clippy::needless_pass_by_value)]
     pub fn execute_env_report(&self, req: ExecuteEnvReportRequest) -> ExecuteEnvReport {
         let environment = build_execution_environment(
@@ -734,6 +787,7 @@ impl CommandBroker {
             &req.env,
             req.inherit_service_env,
             req.profile.as_deref(),
+            &BTreeSet::new(),
         )
         .unwrap_or_else(|_| ExecutionEnvironment {
             profile: req
@@ -790,13 +844,37 @@ impl CommandBroker {
     /// # Errors
     ///
     /// Returns the error this operation can fail with.
+    pub async fn execute_start(
+        &self,
+        req: ExecuteStartRequest,
+    ) -> anyhow::Result<ExecuteJobStartReport> {
+        self.execute_start_with_injected_env(req, &[]).await
+    }
+
+    /// [`CommandBroker::execute_start`] with broker-injected environment variables.
+    ///
+    /// The durable-job half of SB-4's `env` modality; see
+    /// [`CommandBroker::execute_with_injected_env`] for the injection contract, the
+    /// redaction rule and the named limits, all of which apply here unchanged. The one
+    /// addition is the persisted surface: the job's `job.json` carries `redacted_env`, and
+    /// every injected name is `<redacted>` there too, which is SB-4's third hardening. The
+    /// sealed carriers are borrowed and are done with before this returns: the child holds
+    /// its own copy from the spawn, so the borrow does not outlive the start call even
+    /// though the job does.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`CommandBroker::execute_start`] can fail with. Injected material that is
+    /// not valid UTF-8 takes the `failed_to_start` report path, naming the variable and
+    /// echoing nothing.
     // One job lifecycle start to finish: validate, spawn, register, report.
     // Splitting it would scatter a single ordered procedure across helpers
     // only meaningful in that order.
     #[allow(clippy::too_many_lines)]
-    pub async fn execute_start(
+    pub async fn execute_start_with_injected_env(
         &self,
         req: ExecuteStartRequest,
+        injected_env: &[(String, SealedSecret)],
     ) -> anyhow::Result<ExecuteJobStartReport> {
         self.policy.require(Permission::Execute, &req.cwd)?;
         reject_delete_intent(&req.program, &req.args)?;
@@ -844,6 +922,7 @@ impl CommandBroker {
             &req.env,
             req.inherit_service_env,
             req.profile.as_deref(),
+            &injected_names(injected_env),
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -876,6 +955,19 @@ impl CommandBroker {
             &resolved.environment.command_env,
             resolved.environment.inherit_service_env,
         );
+        // After the request environment, so an injected name wins a collision (SB-4). A
+        // refusal here takes the same failed-to-start path a spawn failure does, because
+        // the job directory already exists and a report that names it is more useful than
+        // an error that abandons it.
+        if let Err(err) = apply_injected_env(&mut command, injected_env) {
+            metadata.status = ExecuteJobStatus::FailedToStart;
+            metadata.finished_unix_ms = Some(now_unix_ms());
+            metadata.error = Some(err.to_string());
+            metadata.summary = format!("failed to start process: {err}");
+            write_job_metadata(&metadata_path, &mut metadata)?;
+            self.audit_job_event("execute_start_failed", &metadata)?;
+            return Ok(start_report(&metadata));
+        }
         command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -1055,18 +1147,22 @@ impl CommandBroker {
     }
 
     fn audit_job_event(&self, action: &str, metadata: &ExecuteJobMetadata) -> anyhow::Result<()> {
+        // One summary, built once, from `redacted_env` and nothing else (SB-4's second
+        // hardening: the `env=` line never sees a value the redaction did not pass). The
+        // old shape built this line and then overwrote it with the status summary, so the
+        // `env=` line never landed; now the status and the environment land together.
         let mut event = self.effect(
             action,
             format!(
-                "job_id={}; program={} {:?}; env={}",
+                "job_id={}; program={} {:?}; {}; env={}",
                 metadata.job_id,
                 metadata.program,
                 metadata.args,
+                metadata.summary,
                 summarize_redacted_env_for_audit(&metadata.redacted_env)
             ),
         );
         event.path = Some(metadata.cwd.clone());
-        event.summary.clone_from(&metadata.summary);
         self.audit.append(&event)
     }
 }
@@ -1287,9 +1383,11 @@ fn resolve_program(
     env: &BTreeMap<String, String>,
     inherit_service_env: Option<bool>,
     profile: Option<&str>,
+    injected_names: &BTreeSet<String>,
 ) -> Result<ResolvedProgram, Box<ProgramResolutionError>> {
-    let environment = build_execution_environment(policy, env, inherit_service_env, profile)
-        .map_err(|summary| Box::new(program_resolution_error(program, cwd, summary)))?;
+    let environment =
+        build_execution_environment(policy, env, inherit_service_env, profile, injected_names)
+            .map_err(|summary| Box::new(program_resolution_error(program, cwd, summary)))?;
     resolve_program_with_environment(policy, program, cwd, environment)
 }
 
@@ -1430,11 +1528,20 @@ fn program_not_found_error(
     }
 }
 
+/// Merge the profile and request environments and compute the redacted view.
+///
+/// `injected_names` are the variables the broker will inject at spawn (SB-4). Their values
+/// never enter `command_env`, which holds caller and profile data only; the names enter
+/// `redacted_env` as `<redacted>` unconditionally, so every surface derived from it (the
+/// audit `env=` line, `redacted_env` in job metadata and reports) redacts by injected name
+/// rather than by the heuristic. Threaded through here rather than patched on afterwards so
+/// no caller of this function can obtain an unredacted view to forget the patch on.
 fn build_execution_environment(
     policy: &PolicyConfig,
     request_env: &BTreeMap<String, String>,
     inherit_service_env: Option<bool>,
     requested_profile: Option<&str>,
+    injected_names: &BTreeSet<String>,
 ) -> Result<ExecutionEnvironment, String> {
     let profile_name = requested_profile
         .map(ToOwned::to_owned)
@@ -1502,7 +1609,7 @@ fn build_execution_environment(
     {
         command_env.insert("PATH".into(), effective_path.clone());
     }
-    let redacted_env = redact_env(&command_env);
+    let redacted_env = redact_env_with_injected(&command_env, injected_names);
     Ok(ExecutionEnvironment {
         profile: profile_name,
         inherit_service_env: inherit,
@@ -1815,16 +1922,76 @@ fn elapsed_ms(metadata: &ExecuteJobMetadata) -> u128 {
 }
 
 fn redact_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    env.iter()
+    redact_env_with_injected(env, &BTreeSet::new())
+}
+
+/// The redacted view of a child environment, with SB-4's first hardening applied.
+///
+/// Every name in `injected_names` is `<redacted>` unconditionally, whatever it is called:
+/// the eight-needle heuristic misses `DATABASE_URL`, `CONN_STR`, `LICENSE` and every other
+/// name outside its list, and for a variable the broker injected the heuristic is never the
+/// only filter. It remains the filter for variables the broker did not inject. An injected
+/// name absent from `env` is added as `<redacted>`, because the child's environment will
+/// carry it and this map describes that environment; an injected name present in `env` (a
+/// caller collision) is redacted rather than shown, because the caller's value loses the
+/// collision at spawn and printing it would leak caller data the redaction rule already
+/// covers the name for.
+fn redact_env_with_injected(
+    env: &BTreeMap<String, String>,
+    injected_names: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut redacted: BTreeMap<String, String> = env
+        .iter()
         .map(|(key, value)| {
-            let redacted = if is_sensitive_env_name(key) {
+            let shown = if injected_names.contains(key) || is_sensitive_env_name(key) {
                 "<redacted>".to_string()
             } else {
                 value.clone()
             };
-            (key.clone(), redacted)
+            (key.clone(), shown)
         })
-        .collect()
+        .collect();
+    for name in injected_names {
+        redacted
+            .entry(name.clone())
+            .or_insert_with(|| "<redacted>".to_string());
+    }
+    redacted
+}
+
+/// The names an injection will place in the child environment, for the redaction rule.
+fn injected_names(injected_env: &[(String, SealedSecret)]) -> BTreeSet<String> {
+    injected_env.iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// Move injected material into the child's environment map, at spawn (SB-4).
+///
+/// The values cross through the carrier's scoped-exposure API and land directly in the
+/// [`Command`]; they touch no request struct, no `ExecutionEnvironment` and nothing
+/// serializable. Material must be valid UTF-8, because an environment value has to cross
+/// the platform environment boundary on every platform this crate builds for, and refusing
+/// is the fail-closed direction; the refusal names the variable and never echoes material
+/// or a material-derived value (SB-1).
+fn apply_injected_env(
+    child: &mut Command,
+    injected_env: &[(String, SealedSecret)],
+) -> anyhow::Result<()> {
+    for (name, value) in injected_env {
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            bail!("injected environment variable name {name:?} is not a legal variable name");
+        }
+        value.with_exposed(|bytes| match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                child.env(name, text);
+                Ok(())
+            }
+            Err(_) => Err(anyhow::anyhow!(
+                "injected environment variable {name} carries material that is not valid \
+                 UTF-8 and cannot cross the environment boundary; the value is not echoed"
+            )),
+        })?;
+    }
+    Ok(())
 }
 
 fn summarize_redacted_env_for_audit(env: &BTreeMap<String, String>) -> String {
@@ -3084,5 +3251,254 @@ mod tests {
         // available_permits() is a live view - after a completed execute the permit is returned.
         // Just confirm the initial state and that with_cap sets the right count.
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // - NMCP-SPEC-002 SB-4: the env injection modality and its three hardenings (I-034) -
+
+    /// Distinctive material with no English substring, so absence assertions cannot collide
+    /// with legitimate prose, and long enough that no fragment of a path or a timestamp
+    /// mimics it.
+    const INJECTED_MATERIAL: &str = "zk8qw-4vnt7-2rjx9-pm3hd-injected";
+
+    fn injected(var: &str) -> Vec<(String, SealedSecret)> {
+        vec![(
+            var.to_string(),
+            SealedSecret::new(INJECTED_MATERIAL.as_bytes().to_vec()),
+        )]
+    }
+
+    #[cfg(windows)]
+    fn print_env_script(var: &str) -> String {
+        format!("echo %{var}%")
+    }
+    #[cfg(not(windows))]
+    fn print_env_script(var: &str) -> String {
+        format!("echo ${var}")
+    }
+
+    /// The modality works: the child process observes the injected variable. The child's
+    /// copy is the child's, which is SB-1's stated bound; past the process boundary the
+    /// program allowlist is the whole control, and that allowlist is the binding's,
+    /// enforced at stage 5b rather than here.
+    #[tokio::test]
+    async fn an_injected_variable_reaches_the_child_process() {
+        let root = temp_root("nmcp-exec-inject-reaches");
+        let report = broker(&root)
+            .execute_with_injected_env(
+                ExecuteRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args(&print_env_script("DATABASE_URL")),
+                    timeout_ms: 10_000,
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &injected("DATABASE_URL"),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(report.exit_code, Some(0));
+        assert!(
+            report.stdout_tail.contains(INJECTED_MATERIAL),
+            "the child observes the injected value: {}",
+            report.stdout_tail
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T1c, by name, with the spec's canonical fixture. `DATABASE_URL` is outside the
+    /// eight-needle heuristic, which the first assertion proves so the test means
+    /// something: under the heuristic alone the injected value would land in the immutable
+    /// chain, which is what got v0.1 refused. With redaction by injected name, the audit
+    /// `env=` line shows `DATABASE_URL=<redacted>`, and no byte window of the material
+    /// appears in any serialized audit record or in the report (the SB-1 measurement
+    /// discipline).
+    #[tokio::test]
+    async fn t1c_an_injected_value_never_reaches_the_audit_line() {
+        assert!(
+            !is_sensitive_env_name("DATABASE_URL"),
+            "the fixture must sit outside the heuristic or this test proves nothing"
+        );
+
+        let root = temp_root("nmcp-exec-inject-t1c");
+        let report = broker(&root)
+            .execute_with_injected_env(
+                ExecuteRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    // The child does not print the variable: this test measures the
+                    // broker's own surfaces, not the child's stdout, which is the child's.
+                    args: shell_args("echo done"),
+                    timeout_ms: 10_000,
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &injected("DATABASE_URL"),
+            )
+            .await
+            .expect("execute");
+
+        let chain = std::fs::read_to_string(root.join("audit.jsonl")).expect("chain");
+        assert!(
+            chain.contains("DATABASE_URL=<redacted>"),
+            "the env= line lands, post-redaction, naming the variable: {chain}"
+        );
+        assert!(
+            !chain.contains(INJECTED_MATERIAL),
+            "no audit record carries any byte window of the material"
+        );
+        let rendered = serde_json::to_string(&report).expect("report");
+        assert!(!rendered.contains(INJECTED_MATERIAL));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The durable-job half of T1c plus SB-4's third hardening: the persisted `job.json`
+    /// and every status surface show `<redacted>` for the injected name, a caller value
+    /// colliding with it neither wins nor leaks, and the child observes the injected value
+    /// rather than the caller's.
+    #[tokio::test]
+    async fn an_injected_name_is_redacted_in_job_metadata_and_wins_a_collision() {
+        let root = temp_root("nmcp-exec-inject-job");
+        let broker = broker(&root);
+        let start = broker
+            .execute_start_with_injected_env(
+                ExecuteStartRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args(&print_env_script("DATABASE_URL")),
+                    timeout_ms: Some(10_000),
+                    // The collision: a caller-supplied plaintext under the injected name.
+                    env: BTreeMap::from([("DATABASE_URL".into(), "caller-plain-qq17".into())]),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &injected("DATABASE_URL"),
+            )
+            .await
+            .expect("start");
+        let status = wait_for_terminal(&broker, &start.job_id)
+            .await
+            .expect("wait");
+        assert_eq!(status.exit_code, Some(0));
+        assert!(
+            status.stdout_tail.contains(INJECTED_MATERIAL),
+            "the injection wins the collision in the child: {}",
+            status.stdout_tail
+        );
+        assert!(!status.stdout_tail.contains("caller-plain-qq17"));
+
+        let metadata_path = root.join("exec-jobs").join(&start.job_id).join("job.json");
+        let metadata = read_job_metadata(&metadata_path).expect("metadata");
+        assert_eq!(metadata.redacted_env["DATABASE_URL"], "<redacted>");
+        let persisted = std::fs::read_to_string(&metadata_path).expect("job.json");
+        assert!(
+            !persisted.contains(INJECTED_MATERIAL),
+            "the persisted metadata never carries material"
+        );
+        assert!(
+            !persisted.contains("caller-plain-qq17"),
+            "the colliding caller value is redacted with the name, not printed"
+        );
+        let chain = std::fs::read_to_string(root.join("audit.jsonl")).expect("chain");
+        assert!(chain.contains("DATABASE_URL=<redacted>"));
+        assert!(!chain.contains(INJECTED_MATERIAL));
+        assert!(!chain.contains("caller-plain-qq17"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// T1a: the env report omits an injected variable entirely, never showing even
+    /// `NAME=<redacted>`, because reporting the name tells an agent which credential a
+    /// governed call carries. The omission is structural in this port: injection is a
+    /// per-call parameter that reaches only that call's child, and the report has no
+    /// parameter an injected name could arrive through; this drives an injected call first
+    /// and then measures the report to hold the property as behaviour rather than only as
+    /// architecture.
+    #[tokio::test]
+    async fn t1a_the_env_report_omits_injected_variables_entirely() {
+        let root = temp_root("nmcp-exec-inject-t1a");
+        let broker = broker(&root);
+        broker
+            .execute_with_injected_env(
+                ExecuteRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args("echo done"),
+                    timeout_ms: 10_000,
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &injected("DATABASE_URL"),
+            )
+            .await
+            .expect("execute");
+
+        let report = broker.execute_env_report(ExecuteEnvReportRequest {
+            profile: None,
+            env: BTreeMap::new(),
+            inherit_service_env: Some(false),
+        });
+        assert!(
+            !report.redacted_env.contains_key("DATABASE_URL"),
+            "an injected variable is omitted, not redacted (T1a)"
+        );
+        let rendered = serde_json::to_string(&report).expect("report");
+        assert!(
+            !rendered.contains(INJECTED_MATERIAL),
+            "no report surface carries material"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Material that cannot cross the environment boundary is refused before any process
+    /// exists, naming the variable and echoing nothing: an environment value must be valid
+    /// UTF-8 on every platform this crate builds for, and refusing is the fail-closed
+    /// direction (SB-8).
+    #[tokio::test]
+    async fn non_utf8_material_is_refused_naming_the_variable_only() {
+        let root = temp_root("nmcp-exec-inject-utf8");
+        let refused = broker(&root)
+            .execute_with_injected_env(
+                ExecuteRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args("echo done"),
+                    timeout_ms: 10_000,
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &[(
+                    "DATABASE_URL".to_string(),
+                    SealedSecret::new(vec![0xFF, 0xFE, 0x90, 0x00]),
+                )],
+            )
+            .await
+            .expect_err("non-UTF-8 material is refused");
+        let message = format!("{refused}");
+        assert!(message.contains("DATABASE_URL"), "{message}");
+        assert!(message.contains("not echoed"), "{message}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The heuristic is still the filter for variables the broker did not inject: SB-4
+    /// keeps it as an additional filter, never the only one for an injected name. Asserted
+    /// beside the injection tests so the two rules are visibly different rules.
+    #[test]
+    fn the_heuristic_remains_for_non_injected_variables() {
+        let env = BTreeMap::from([
+            ("API_TOKEN".to_string(), "caller-token".to_string()),
+            ("VISIBLE".to_string(), "value".to_string()),
+        ]);
+        let redacted = redact_env_with_injected(&env, &BTreeSet::new());
+        assert_eq!(redacted["API_TOKEN"], "<redacted>");
+        assert_eq!(redacted["VISIBLE"], "value");
+
+        // And the injected rule stacks on top rather than replacing it.
+        let redacted = redact_env_with_injected(&env, &BTreeSet::from(["VISIBLE".to_string()]));
+        assert_eq!(redacted["API_TOKEN"], "<redacted>");
+        assert_eq!(redacted["VISIBLE"], "<redacted>");
     }
 }

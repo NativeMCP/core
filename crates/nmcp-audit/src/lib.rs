@@ -229,6 +229,42 @@ pub struct AuditEvent {
     /// every record written before this field existed must keep verifying byte for byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<String>,
+    /// The secret name ring stage 5b resolved, or refused, for this call (NMCP-SPEC-002
+    /// SB-7, SB-R5).
+    ///
+    /// Set on the intent record and the outcome record of a call that resolved a
+    /// reference, and on the denial record of one that was refused at stage 5b, so an
+    /// auditor can answer "which key, used by whom, under which rule" from the chain. The
+    /// name only, never the value and never a value-derived digest (SB-1). A call that
+    /// resolved several slots carries every name, comma-joined in slot order and aligned
+    /// index for index with `secret_version` and `secret_rule`; the SB-2 grammar admits no
+    /// comma, so the join is unambiguous.
+    ///
+    /// Same optional, skipped-when-absent discipline as the fields above, and declared
+    /// before `event_hash` so `event_hash` stays the trailing member: the chain is
+    /// append-only and every record written before this field existed must keep verifying
+    /// byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    /// The version of the secret that resolution was authorized for (SB-7, SB-R5).
+    ///
+    /// The version the binding grant named, chosen at evaluation rather than looked up
+    /// again, so a rotation between the decision and the record cannot make the record
+    /// describe a value that was never used. Absent on a stage 5b denial that refused
+    /// before a version was chosen. Same comma-join rule and the same field discipline as
+    /// `secret_name`, declared before `event_hash` for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_version: Option<String>,
+    /// The binding rule that authorized the resolution, or the rule that refused it
+    /// (SB-7, SB-8).
+    ///
+    /// `binding.<name>` on a use; a stable refusal rule such as `no-binding` or
+    /// `use-budget` on a denial. Carried on the record rather than looked up later because
+    /// the terms can change between the decision and the reader. Same comma-join rule and
+    /// the same field discipline as `secret_name`, declared before `event_hash` for the
+    /// same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_rule: Option<String>,
     /// This record's own chain hash; always the trailing member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_hash: Option<String>,
@@ -261,6 +297,9 @@ impl AuditEvent {
             attempts: None,
             throttled: None,
             permission: None,
+            secret_name: None,
+            secret_version: None,
+            secret_rule: None,
             event_hash: None,
         }
     }
@@ -710,6 +749,17 @@ fn event_log_document(event: &AuditEvent, summary_budget: usize) -> serde_json::
     document.insert("event_id".into(), serde_json::json!(class.event_id()));
     if let Some(value) = &event.permission {
         document.insert("permission".into(), serde_json::json!(clip(value)));
+    }
+    // SB-7's additions ride into the mirror the same way they ride the chain: names,
+    // versions and rules, absent when absent, and never a value or a value-derived digest.
+    if let Some(value) = &event.secret_name {
+        document.insert("secret_name".into(), serde_json::json!(clip(value)));
+    }
+    if let Some(value) = &event.secret_version {
+        document.insert("secret_version".into(), serde_json::json!(clip(value)));
+    }
+    if let Some(value) = &event.secret_rule {
+        document.insert("secret_rule".into(), serde_json::json!(clip(value)));
     }
     if let Some(value) = &event.path {
         document.insert("path".into(), serde_json::json!(clip(value)));
@@ -1565,5 +1615,50 @@ mod tests {
             !json.contains("duration_ms"),
             "duration_ms must be omitted when None"
         );
+    }
+
+    /// NMCP-SPEC-002 SB-7, graded the way `client_info` was when it arrived: the three
+    /// secret fields follow the crate's own field discipline exactly. Absent, they change
+    /// no existing record's bytes; present, they sit ahead of `event_hash`, which stays the
+    /// trailing member so the payload-recovery rule in the canonical serialization holds.
+    #[test]
+    fn secret_fields_sit_ahead_of_event_hash_and_change_nothing_when_absent() {
+        let mut event = AuditEvent::new("keyed_run", "intent tool=keyed_run");
+        event.sequence = Some(1);
+        event.prev_event_hash = Some("0".repeat(64));
+
+        let without = serde_json::to_string(&event).expect("serialize");
+        for field in ["secret_name", "secret_version", "secret_rule"] {
+            assert!(
+                !without.contains(field),
+                "an absent {field} must not appear at all: {without}"
+            );
+        }
+        let tail = format!(r#""prev_event_hash":"{}"}}"#, "0".repeat(64));
+        assert!(
+            without.ends_with(&tail),
+            "prev_event_hash is last while event_hash is None: {without}"
+        );
+
+        event.secret_name = Some("deploy.db".into());
+        event.secret_version = Some("1".into());
+        event.secret_rule = Some("binding.deploy.db".into());
+        event.event_hash = Some("a".repeat(64));
+        let with = serde_json::to_string(&event).expect("serialize");
+        let hash_at = with.find(r#""event_hash""#).expect("event_hash present");
+        for field in ["secret_name", "secret_version", "secret_rule"] {
+            let field_at = with.find(field).expect("field present");
+            assert!(
+                field_at < hash_at,
+                "{field} goes ahead of event_hash: {with}"
+            );
+        }
+        // And the mirror projection carries them without inventing anything else.
+        let document = render_mirror_message(&event);
+        assert!(
+            document.contains(r#""secret_name":"deploy.db""#),
+            "{document}"
+        );
+        assert!(document.contains(r#""secret_rule":"binding.deploy.db""#));
     }
 }

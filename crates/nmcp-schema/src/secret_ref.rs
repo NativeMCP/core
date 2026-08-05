@@ -77,6 +77,42 @@ pub const RESERVED_SECRET_NAMESPACES: &[&str] = &["oauth"];
 /// The input-schema keyword that marks a property as a `secret_ref` slot (SB-3).
 pub const SECRET_SLOT_ANNOTATION: &str = "x-nmcp-secret-ref";
 
+/// What ring stage 5b writes over a slot argument whose reference it resolved (I-034).
+///
+/// The provider receives material through the context channel, never through the argument,
+/// so the reference is removed from the arguments the provider sees and this marker takes
+/// its place. Removal is SB-A2's point applied one step further: a reference is a name and
+/// not material, but a name that reaches a confused provider can reach a child process's
+/// argv, and telling an attacker which credential a call carries is metadata the provider
+/// has no use for. The marker is deliberately not in the SB-2 grammar and not a valid
+/// reference, so a provider that mistakenly forwards it forwards an obviously inert token.
+pub const SECRET_SLOT_MARKER: &str = "[nmcp:secret-slot]";
+
+/// Where ring stage 5b reads a resolved tool's declared `secret_ref` slots (I-034).
+///
+/// The registry index in `nmcp-host` implements this over the slots it already extracts and
+/// validates at registration, so the lookup is one hash probe and dispatch never asks a
+/// provider to enumerate its catalogue (NMCP-SPEC-003 RC-9). It is a separate trait rather
+/// than a method on [`crate::ToolRegistry`] because that trait's five methods are frozen by
+/// NMCP-SPEC-003 section 4.4, while stage 5b's interior is exactly what that spec's 4.6
+/// leaves to NMCP-SPEC-002; the surface the stage consumes is therefore this spec's to
+/// define, and it lives here so the implementation in `nmcp-host` and the consumer in
+/// `nmcp-router` can both see it without either depending on the other.
+///
+/// The composer must hand the ring the same object behind this trait and behind
+/// [`crate::ToolRegistry`]: two indexes is how the slots the stage reads and the tool that
+/// resolves come to disagree, which is the drift NMCP-SPEC-003 section 1 measures.
+pub trait SecretSlotCatalog: Send + Sync {
+    /// The declared `secret_ref` slots of the tool registered under `tool_name`, in
+    /// argument-name order, or `None` when no tool is registered under that name.
+    ///
+    /// `Some(vec![])` and `None` differ on purpose: a registered tool with no slots is a
+    /// tool stage 5b passes through untouched (SB-2 inertness), while an unregistered name
+    /// is a tool the stage cannot read a declaration for, and what it does about that is
+    /// the stage's fail-closed decision, not this trait's.
+    fn secret_slots_of(&self, tool_name: &str) -> Option<Vec<SecretSlot>>;
+}
+
 /// The annotation key naming the injection modality.
 const MODALITY_KEY: &str = "inject";
 

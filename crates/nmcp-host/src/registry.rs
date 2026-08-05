@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 use nmcp_policy::{AbacAction, AbacRule, PolicyConfig};
 use nmcp_schema::{
-    CONTRACT_SCHEMA_VERSION, CatalogView, HeldAuthority, RegistrationError, ToolAuthority,
-    ToolContract, ToolProvider, ToolRegistry, accepts_contract_version, authorize,
-    contains_delete_intent, is_valid_public_tool_name, public_tool_name, secret_slots,
+    CONTRACT_SCHEMA_VERSION, CatalogView, HeldAuthority, RegistrationError, SecretSlot,
+    SecretSlotCatalog, ToolAuthority, ToolContract, ToolProvider, ToolRegistry,
+    accepts_contract_version, authorize, contains_delete_intent, is_valid_public_tool_name,
+    public_tool_name, secret_slots,
 };
 use parking_lot::RwLock;
 use serde_json::{Value, json};
@@ -35,6 +36,12 @@ struct IndexEntry {
     public_name: String,
     authority: Arc<ToolAuthority>,
     list_entry: Value,
+    /// The tool's declared `secret_ref` slots, extracted and validated at registration
+    /// (NMCP-SPEC-002 SB-3) and kept so ring stage 5b reads them in one hash probe instead
+    /// of asking the provider to enumerate its catalogue per call (RC-9). Empty for the
+    /// overwhelming majority of tools, which costs nothing: an empty `Vec` does not
+    /// allocate.
+    secret_slots: Vec<SecretSlot>,
     /// Every index key this tool is reachable under, so removing a provider removes exactly
     /// what it added.
     keys: Vec<String>,
@@ -190,10 +197,14 @@ fn build_slice(
         // root and the call is denied, whereas a secret slot the kernel never sees is a slot
         // nothing injects into, so the tool runs with the credential missing rather than not
         // running at all. Nothing is resolved by this call and no store is opened; the check
-        // reads the declaration and returns (I-032).
-        if let Err(refusal) = secret_slots(contract) {
-            return Err(refusal.at_tool(public_name));
-        }
+        // reads the declaration and returns (I-032). Since I-034 the validated result is kept
+        // on the entry, because the same declaration is what ring stage 5b resolves against
+        // and re-extracting it per call would re-read the provider's catalogue on the
+        // dispatch path, which RC-9 forbids.
+        let declared_slots = match secret_slots(contract) {
+            Ok(slots) => slots,
+            Err(refusal) => return Err(refusal.at_tool(public_name)),
+        };
 
         // RC-21. A first-party tool's annotations are derived from its declared authority by
         // `to_list_entry`, so one that also published its own would be two sources that can
@@ -213,6 +224,7 @@ fn build_slice(
             list_entry: list_entry_for(&provider_id, contract, &public_name),
             public_name,
             authority: Arc::new(contract.authority.clone()),
+            secret_slots: declared_slots,
             keys,
         });
 
@@ -492,6 +504,21 @@ impl ToolRegistry for IndexedToolRegistry {
             })
             .map(|tool| tool.list_entry.clone())
             .collect()
+    }
+}
+
+impl SecretSlotCatalog for IndexedToolRegistry {
+    /// The declared slots of the tool registered under `tool_name`, from the same index
+    /// entry `resolve` and `authority_of` answer from, so the slots ring stage 5b reads and
+    /// the tool that resolves cannot disagree (I-034). One hash probe, no provider is
+    /// consulted (RC-9), and the clone is of a `Vec` that is empty for every slotless tool,
+    /// which does not allocate.
+    fn secret_slots_of(&self, tool_name: &str) -> Option<Vec<SecretSlot>> {
+        self.index
+            .read()
+            .by_name
+            .get(tool_name)
+            .map(|entry| entry.secret_slots.clone())
     }
 }
 
@@ -957,6 +984,55 @@ mod tests {
             vec!["credential"],
             "the undecorated properties are not slots"
         );
+    }
+
+    /// I-034: the slots the index validated at registration are the slots the catalog hands
+    /// ring stage 5b, keyed by every name form the tool answers to, with `Some(vec![])` for
+    /// a registered slotless tool and `None` for an unknown name. The three answers differ
+    /// on purpose: the stage passes a slotless tool through untouched (SB-2), resolves a
+    /// keyed one, and treats an unreadable declaration as its own fail-closed case.
+    #[test]
+    fn the_slot_catalog_answers_from_the_same_entry_resolution_does() {
+        use nmcp_schema::{InjectionModality, SecretSlotCatalog};
+
+        let registry = registry();
+        registry
+            .register(TestProvider::new(
+                "",
+                vec![
+                    contract_with_secret_slot(
+                        "keyed.run",
+                        &json!({"inject": "env", "var": "DATABASE_URL"}),
+                    ),
+                    contract("plain_tool", None),
+                ],
+            ))
+            .expect("both tools register");
+
+        for form in ["keyed_run", "keyed.run"] {
+            let slots = registry
+                .secret_slots_of(form)
+                .expect("a registered tool answers under every name form");
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slots[0].arg, "credential");
+            assert_eq!(
+                slots[0].modality,
+                InjectionModality::Env {
+                    var: "DATABASE_URL".to_string()
+                }
+            );
+        }
+        assert_eq!(
+            registry.secret_slots_of("plain_tool"),
+            Some(Vec::new()),
+            "a slotless tool is a known tool with no slots, not an unknown tool"
+        );
+        assert_eq!(registry.secret_slots_of("never_registered"), None);
+
+        // Unregistering removes the slots with the tool, so the catalog and `resolve`
+        // cannot disagree about whether the tool exists.
+        assert!(registry.unregister_provider(""));
+        assert_eq!(registry.secret_slots_of("keyed_run"), None);
     }
 
     /// NMCP-SPEC-003 v1.1: a call that supplies none of a tool's declared path arguments is
