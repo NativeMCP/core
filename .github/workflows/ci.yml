@@ -154,3 +154,12 @@ jobs:
             exit 1
           fi
           echo "INV-8 gate passed."
+      - name: "workspace membership: every crate is a member"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A crate directory that exists but is not a workspace member is
+          # committed, reviewed, and never built, linted or tested: CI is green
+          # because the workspace does not contain it. Same failure shape as a
+          # workflow GitHub accepts and never runs.
+          python3 scripts/workspace_members_check.py
