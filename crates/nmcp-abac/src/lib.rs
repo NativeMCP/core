@@ -635,8 +635,8 @@ mod tests {
             "execute",
             "execute_start",
             "win_registry_write",
-            "m365_mail_send",
-            "m365_teams_send_chat_message",
+            "mem_write",
+            "backup_file",
             "dev_git_publish",
             "write_text_file",
         ] {
@@ -979,7 +979,7 @@ mod tests {
             fn tool_names(&self) -> Vec<String> {
                 vec![
                     "mem_write".into(),
-                    "m365_mail_send".into(),
+                    "win_registry_write".into(),
                     "list_roots".into(),
                 ]
             }
@@ -1023,14 +1023,15 @@ mod tests {
             "the denial must come from the per-client allowlist, got: {msg}"
         );
 
-        // Defense in depth: the M365 send surface is refused too. The root ring answers first
-        // here, because the template grants no m365 capability, so the reason is the ring's.
-        let m365 = router
-            .dispatch("m365_mail_send", serde_json::json!({}), third_party())
+        // Defense in depth: a capability-gated write surface is refused too. The root ring
+        // answers first here, because the template grants no win.api capability, so the reason
+        // is the ring's rather than the allowlist's.
+        let capability_gated = router
+            .dispatch("win_registry_write", serde_json::json!({}), third_party())
             .await;
         assert!(
-            m365.is_error,
-            "the third-party client must not reach the M365 send surface"
+            capability_gated.is_error,
+            "the third-party client must not reach a capability-gated write surface"
         );
 
         // On the allowlist, so the client is restricted rather than broken.

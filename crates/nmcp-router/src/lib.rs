@@ -503,12 +503,6 @@ fn tool_is_mutating(tool_name: &str) -> bool {
     if n == "win_registry_write" {
         return true;
     }
-    if n.starts_with("m365_") {
-        return n.contains("send")
-            || n.contains("create")
-            || n.contains("update")
-            || n.contains("draft");
-    }
     match tool_policy_spec(tool_name) {
         Some(spec) => matches!(
             spec.permission,
@@ -530,29 +524,7 @@ fn tool_is_mutating(tool_name: &str) -> bool {
     }
 }
 
-fn has_m365_grant(policy: &PolicyConfig) -> bool {
-    policy
-        .roots
-        .iter()
-        .any(|root| root.permissions.contains(&Permission::M365))
-}
-
 fn policy_check(policy: &PolicyConfig, tool_name: &str, args: &Value) -> Option<ToolCallResult> {
-    // m365.* tools are capability-gated like win.api: fail closed unless a policy
-    // root grants the `m365` capability. They take no filesystem path.
-    if tool_name.replace('.', "_").starts_with("m365_") {
-        if !has_m365_grant(policy) {
-            warn!(tool = tool_name, "PolicyRing: denied missing m365 grant");
-            return Some(ToolCallResult::err_with_metadata(
-                "Policy denied: m365 capability is required for Microsoft 365 tools".to_string(),
-                "policy_denied",
-                Some(
-                    "Grant the m365 capability on a policy root approved for Microsoft 365 access.",
-                ),
-            ));
-        }
-        return None;
-    }
     // Registry writes require a dedicated capability beyond win.api, so a
     // read + win.api grant cannot escalate to arbitrary HKLM writes.
     if tool_name.replace('.', "_") == "win_registry_write" {
@@ -1085,7 +1057,6 @@ mod tests {
             (Permission::MemoryWrite, EventLogClass::Change),
             (Permission::WindowsApiWrite, EventLogClass::Change),
             (Permission::Execute, EventLogClass::Execute),
-            (Permission::M365, EventLogClass::Egress),
             (Permission::GitPublish, EventLogClass::Egress),
             (Permission::UpstreamCall, EventLogClass::Egress),
         ];
@@ -1122,7 +1093,6 @@ mod tests {
                 | Permission::MemoryWrite
                 | Permission::WindowsApiWrite
                 | Permission::Execute
-                | Permission::M365
                 | Permission::GitPublish
                 | Permission::UpstreamCall => {}
             }
@@ -1239,20 +1209,22 @@ mod tests {
 
     #[test]
     fn tool_is_mutating_classifies_correctly() {
+        // The dotted spellings are here on purpose: the classifier folds `.` to `_` before it
+        // consults the spec table, so a caller using either form gets the same verdict.
         for name in [
             "write_text_file",
             "backup",
             "execute",
             "win_registry_write",
-            "m365.mail_send",
-            "m365.calendar_create_event",
+            "fs.write_text_file",
+            "dev.git_publish",
         ] {
             assert!(tool_is_mutating(name), "{name} should be mutating");
         }
         for name in [
             "list_directory",
             "read_file_window_report",
-            "m365.mail_list",
+            "fs.list_directory",
         ] {
             assert!(!tool_is_mutating(name), "{name} should not be mutating");
         }

@@ -112,33 +112,18 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "dev_git_diff",
     "dev_dep_graph",
     "dev_git_stash_list",
-    // Microsoft 365 observation
-    "m365_auth_status",
-    "m365_mail_list",
-    "m365_mail_get",
-    "m365_mail_folders_list",
-    "m365_calendar_list_events",
-    "m365_calendar_view",
-    "m365_calendar_get_event",
-    "m365_calendar_get_schedule",
-    "m365_teams_list_joined",
-    "m365_teams_list_channels",
-    "m365_teams_list_channel_messages",
-    "m365_teams_list_chats",
-    "m365_teams_list_chat_messages",
-    "m365_files_search",
-    "m365_files_list_children",
-    "m365_files_get_item",
-    "m365_sites_get",
-    "m365_search_query",
 ];
 
-/// Non-`m365_` tools that can reach beyond this host.
+/// Tools that can reach beyond this host.
 ///
-/// Every `m365_` tool is open-world by definition and is matched by prefix rather than
-/// listed here. The execution tools are included because an approved program may itself
-/// reach the network: the tool's own reach is local, but its effect is not bounded by this
-/// host, and the conservative reading is the honest one to publish.
+/// A complete list rather than a list plus a prefix rule. The execution tools are included
+/// because an approved program may itself reach the network: the tool's own reach is local,
+/// but its effect is not bounded by this host, and the conservative reading is the honest one
+/// to publish.
+///
+/// A tool proxied from a gateway upstream is not here and cannot be: it is somebody else's
+/// tool, it arrives prefixed by its provider id, and this crate learns of it at runtime or
+/// not at all.
 pub const OPEN_WORLD_TOOLS: &[&str] = &[
     "execute",
     "execute_start",
@@ -162,7 +147,7 @@ pub const OPEN_WORLD_TOOLS: &[&str] = &[
 #[must_use]
 pub fn tool_annotations(name: &str) -> Value {
     let read_only = READ_ONLY_TOOLS.contains(&name);
-    let open_world = name.starts_with("m365_") || OPEN_WORLD_TOOLS.contains(&name);
+    let open_world = OPEN_WORLD_TOOLS.contains(&name);
     json!({
         "readOnlyHint": read_only,
         "destructiveHint": false,
@@ -486,7 +471,7 @@ mod tests {
             "list_directory",
             "dev_git_log",
             "execute_status",
-            "m365_mail_get",
+            "mem_read",
             "win_registry_read",
         ] {
             assert_eq!(
@@ -500,7 +485,7 @@ mod tests {
             "move_file",
             "dev_git_publish",
             "execute",
-            "m365_mail_send",
+            "mem_write",
             "win_registry_write",
         ] {
             assert_eq!(
@@ -513,12 +498,9 @@ mod tests {
 
     #[test]
     fn open_world_marks_exactly_the_tools_that_leave_this_host() {
-        for name in [
-            "m365_mail_send",
-            "m365_search_query",
-            "dev_git_publish",
-            "execute",
-        ] {
+        // Every entry of OPEN_WORLD_TOOLS, which is now the whole rule: the prefix arm that
+        // used to widen it named a vendor and had no first-party subject left (RC-19).
+        for name in OPEN_WORLD_TOOLS {
             assert_eq!(
                 tool_annotations(name)["openWorldHint"],
                 true,
@@ -560,13 +542,6 @@ mod tests {
             "win_registry_write",
             "dev_test_run",
             "dev_git_publish",
-            "m365_auth_begin_device_login",
-            "m365_mail_send",
-            "m365_mail_create_draft",
-            "m365_calendar_create_event",
-            "m365_calendar_update_event",
-            "m365_teams_send_channel_message",
-            "m365_teams_send_chat_message",
         ];
         for tool in tool_list() {
             let classified = READ_ONLY_TOOLS.contains(&tool.name.as_str())
