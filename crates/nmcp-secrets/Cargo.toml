@@ -1,0 +1,29 @@
+[package]
+name = "nmcp-secrets"
+description = "Sealed secret store, sealer abstraction and key lifecycle for NativeMCP servers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
