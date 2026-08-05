@@ -594,6 +594,8 @@ mod tests {
                     effect: nmcp_schema::ToolEffect::Observe,
                     reach: nmcp_schema::ToolReach::Local,
                 },
+                // First-party fixtures, which RC-21 requires to carry none.
+                published_annotations: None,
             })
             .collect()
     }
@@ -905,27 +907,25 @@ mod tests {
                 ""
             }
             fn contracts(&self) -> Vec<nmcp_schema::ToolContract> {
-                declare(&self.tool_names())
-            }
-            fn tool_names(&self) -> Vec<String> {
-                vec!["echo".into()]
-            }
-            fn tool_list(&self) -> Vec<serde_json::Value> {
-                vec![serde_json::json!({"name":"echo","description":"echo","inputSchema":{}})]
+                declare(&["echo".to_string()])
             }
             async fn call(
                 &self,
                 _: &str,
                 args: serde_json::Value,
                 _: &CallContext,
+                _: &nmcp_schema::GrantedAuthority,
             ) -> ToolCallResult {
                 ToolCallResult::ok(args)
             }
         }
 
-        let mut router = Router::new(policy_arc, audit);
+        let registry = Arc::new(nmcp_host::IndexedToolRegistry::new(policy_arc.clone()));
+        let router = Router::new(policy_arc, audit, registry);
         router.set_abac(into_abac_check(abac));
-        router.register(std::sync::Arc::new(Echo));
+        router
+            .register(std::sync::Arc::new(Echo))
+            .expect("register");
 
         let mut ctx = CallContext::new(Some("session-1".into()));
         ctx.agent_id = Some("untrusted-agent".into());
@@ -958,7 +958,8 @@ mod tests {
         let policy_arc = make_policy_arc();
         let audit = make_audit();
         let abac = AbacStage::new(audit.clone(), policy_arc.clone());
-        let mut router = Router::new(policy_arc, audit);
+        let registry = Arc::new(nmcp_host::IndexedToolRegistry::new(policy_arc.clone()));
+        let router = Router::new(policy_arc, audit, registry);
         router.set_abac(into_abac_check(abac));
 
         let ctx = CallContext::new(None);
@@ -978,11 +979,14 @@ mod tests {
     /// impl reading the live policy arc. Calling `AbacStage::evaluate` directly, as the unit
     /// tests above do, proves the rule logic but not that a real client is bound by it.
     ///
-    /// `mem_write` is the sharp case on purpose. It has no `tool_policy_spec`, so the root ring
-    /// never sees it, and it is not mutating by the ring's definition, so the auto-approve gate
-    /// never sees it either. Per-client ABAC is the only thing between an authenticated
-    /// third-party client and writing into the agent's persistent memory.
+    /// `mem_write` is the sharp case on purpose. It declares no root-scoped permission, so
+    /// authorization passes it, and it is first-party and declares `Observe`, so the
+    /// auto-approve gate passes it too. Per-client ABAC is the only thing between an
+    /// authenticated third-party client and writing into the agent's persistent memory. That
+    /// was true when the ring read a compiled-in table with no `mem_*` entry and it is true now
+    /// that it reads the declaration, which is what makes this test worth keeping unchanged.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn the_shipped_third_party_template_restricts_that_client_through_router_dispatch() {
         use async_trait::async_trait;
         use nmcp_router::{Router, ToolProvider};
@@ -1014,34 +1018,47 @@ mod tests {
                 ""
             }
             fn contracts(&self) -> Vec<nmcp_schema::ToolContract> {
-                declare(&self.tool_names())
-            }
-            fn tool_names(&self) -> Vec<String> {
-                vec![
-                    "mem_write".into(),
-                    "win_registry_write".into(),
-                    "list_roots".into(),
-                ]
-            }
-            fn tool_list(&self) -> Vec<serde_json::Value> {
-                self.tool_names()
-                    .into_iter()
-                    .map(|n| serde_json::json!({"name": n, "description": n, "inputSchema": {}}))
-                    .collect()
+                // `win_registry_write` declares the two Windows grants the deleted
+                // `policy_check` special case demanded, so this fixture keeps asking the
+                // question it was written to ask. The template grants neither, so the ring
+                // refuses it at stage 4 as `Denial::MissingGrant`, which is the same refusal
+                // at the same point in the ring the kernel's hardcoded branch produced.
+                let mut declared = declare(&[
+                    "mem_write".to_string(),
+                    "win_registry_write".to_string(),
+                    "list_roots".to_string(),
+                ]);
+                for contract in &mut declared {
+                    if contract.name == "win_registry_write" {
+                        contract.authority.grants = vec![
+                            nmcp_schema::CapabilityGrant::new(
+                                nmcp_policy::Permission::WindowsApi.as_str(),
+                            ),
+                            nmcp_schema::CapabilityGrant::new(
+                                nmcp_policy::Permission::WindowsApiWrite.as_str(),
+                            ),
+                        ];
+                    }
+                }
+                declared
             }
             async fn call(
                 &self,
                 _: &str,
                 args: serde_json::Value,
                 _: &CallContext,
+                _: &nmcp_schema::GrantedAuthority,
             ) -> ToolCallResult {
                 ToolCallResult::ok(args)
             }
         }
 
-        let mut router = Router::new(policy_arc, audit);
+        let registry = Arc::new(nmcp_host::IndexedToolRegistry::new(policy_arc.clone()));
+        let router = Router::new(policy_arc, audit, registry);
         router.set_abac(into_abac_check(abac));
-        router.register(std::sync::Arc::new(Surface));
+        router
+            .register(std::sync::Arc::new(Surface))
+            .expect("register");
 
         let third_party = || {
             let mut ctx = CallContext::new(Some("third-party-session".into()));

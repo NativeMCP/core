@@ -1,6 +1,6 @@
 //! The registry contract: the trait, its refusals, and the per-caller catalogue view.
 //!
-//! NMCP-SPEC-003 section 4.4, RATIFIED v1.1. The trait lives here and the index that
+//! NMCP-SPEC-003 section 4.4, RATIFIED v1.3. The trait lives here and the index that
 //! implements it lives in `nmcp-host`, which is the split section 4.4's own header states:
 //! the contract belongs where every provider can see it, and the implementation belongs in
 //! the kernel that owns the dispatch path.
@@ -19,6 +19,11 @@ use crate::provider::ToolProvider;
 /// enum is frozen before that spec ratifies. Adding a variant to an exhaustive public enum
 /// is a breaking change; adding one here is not. The cost is that matchers need a wildcard
 /// arm, which is correct anyway for an error type a caller cannot exhaustively handle.
+///
+/// [`RegistrationError::PublishedAnnotationsFromFirstParty`] is the first use of that headroom
+/// and it came from a caller NMCP-SPEC-002 had nothing to do with, exactly as
+/// `Denial::MissingPathArgument` did at v1.1. Two markings taken for one spec's benefit have
+/// now each paid for themselves against a different one.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RegistrationError {
@@ -76,6 +81,23 @@ pub enum RegistrationError {
     /// it rather than a caller being denied forever (RC-A3).
     #[error("tool {name:?} is on the INV-1 delete denylist and could never be called")]
     DeleteDeniedName {
+        /// The tool that was refused.
+        name: String,
+    },
+
+    /// A first-party provider supplied [`crate::ToolContract::published_annotations`], which
+    /// only a proxied upstream may carry (RC-21).
+    ///
+    /// The refusal is the point rather than tidiness. First-party annotations are derived from
+    /// the declared authority by `ToolContract::to_list_entry`, so a first-party tool that also
+    /// published its own would be two sources that can disagree about one tool, which is
+    /// precisely the defect RC-A4 exists to make unrepresentable. An optional field with no
+    /// refusal behind it would reintroduce it quietly, which is the whole reason section 4.4
+    /// gained a variant rather than section 4.2 gaining a field on its own.
+    #[error(
+        "first-party tool {name:?} supplies published annotations, which only a proxied upstream may carry"
+    )]
+    PublishedAnnotationsFromFirstParty {
         /// The tool that was refused.
         name: String,
     },

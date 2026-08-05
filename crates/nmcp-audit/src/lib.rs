@@ -55,6 +55,19 @@ pub const AUTH_REJECT_DECISION: &str = "auth_reject";
 /// The action an authentication-attempt record carries.
 pub const AUTH_REJECT_ACTION: &str = "auth.reject";
 
+/// The decision the ring's pre-effect record carries (NMCP-SPEC-003 RC-16).
+///
+/// Not a verdict, for the same reason [`EFFECT_DECISION`] is not one. The ring writes this
+/// record after authorization, approval and the human gate have all said yes and **before** the
+/// provider is called, so it states an intent to act rather than the outcome of acting. The
+/// outcome record follows on the same `call_id` and carries the verdict and the duration.
+///
+/// Kept out of [`is_authorization_decision`] deliberately: an operator asking "how many calls
+/// were allowed" is asking about outcomes, and counting the intent record as well would double
+/// every permitted call. The pairing is by `call_id`, which is what lets a reader ask the
+/// other question, namely which intents never reached an outcome.
+pub const INTENT_DECISION: &str = "intent";
+
 /// The verdict a call that the ring permitted carries.
 pub const ALLOWED_DECISION: &str = "allowed";
 
@@ -78,10 +91,11 @@ pub const UNSPECIFIED_DECISION: &str = "unspecified";
 
 /// Whether a decision string is a real authorization verdict rather than an effect marker.
 ///
-/// One function rather than a comparison at each reader. There are two strings that mean "not a
-/// verdict": `effect`, and `unspecified` from every record written before effect records were
-/// named. The chain is append-only, so both stay true forever, and a reader that knows only one
-/// of them miscounts without failing.
+/// One function rather than a comparison at each reader. Four strings mean "not a verdict":
+/// `effect`, `unspecified` from every record written before effect records were named,
+/// `auth_reject` from a credential that never reached the ring, and `intent` from the ring's
+/// own pre-effect record. The chain is append-only, so every one of them stays true forever,
+/// and a reader that knows only some of them miscounts without failing.
 #[must_use]
 pub fn is_authorization_decision(decision: &str) -> bool {
     let decision = decision.trim();
@@ -89,6 +103,7 @@ pub fn is_authorization_decision(decision: &str) -> bool {
         && decision != UNSPECIFIED_DECISION
         && decision != EFFECT_DECISION
         && decision != AUTH_REJECT_DECISION
+        && decision != INTENT_DECISION
 }
 
 /// One line in the audit chain.
@@ -538,6 +553,7 @@ pub fn event_log_severity(event: &AuditEvent) -> EventLogSeverity {
         ALLOWED_DECISION
         | HITL_PENDING_DECISION
         | EFFECT_DECISION
+        | INTENT_DECISION
         | UNSPECIFIED_DECISION => EventLogSeverity::Information,
         _ => EventLogSeverity::Warning,
     }
@@ -1315,6 +1331,12 @@ mod tests {
             EventLogSeverity::Information,
             "waiting on a human is not a failure"
         );
+        assert_eq!(
+            severity_of(INTENT_DECISION),
+            EventLogSeverity::Information,
+            "an intent record is written on the permitted path, so it is not a refusal; without \
+             this arm the unknown-decision fallback would page a SOC once per governed call"
+        );
 
         assert_eq!(severity_of(DENIED_DECISION), EventLogSeverity::Warning);
         assert_eq!(severity_of(ABAC_DENIED_DECISION), EventLogSeverity::Warning);
@@ -1463,7 +1485,17 @@ mod tests {
     fn both_markers_for_not_a_verdict_classify_the_same_way() {
         // The chain is append-only: every record written before effect records were named says
         // "unspecified" and will keep saying it, so both have to stay non-verdicts forever.
-        for marker in [UNSPECIFIED_DECISION, EFFECT_DECISION, "", "   "] {
+        //
+        // `intent` joins them at NMCP-SPEC-003 RC-16 for a different reason with the same
+        // consequence: the ring writes one before every provider call, so counting it as a
+        // verdict would report twice as many permitted calls as happened.
+        for marker in [
+            UNSPECIFIED_DECISION,
+            EFFECT_DECISION,
+            INTENT_DECISION,
+            "",
+            "   ",
+        ] {
             assert!(
                 !is_authorization_decision(marker),
                 "{marker:?} is not a verdict"

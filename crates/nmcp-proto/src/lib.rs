@@ -5,11 +5,20 @@
 //! and the tasks extension. The governance invariants in `docs/GOVERNANCE.md`
 //! are normative for every item in this crate.
 //!
-//! Carry-over, named: [`tool_list`], [`READ_ONLY_TOOLS`] and
-//! [`OPEN_WORLD_TOOLS`] describe the ported server's first-party catalog.
-//! They move behind the provider registry when `nmcp-host` lands (R-1), at
-//! which point a platform daemon contributes its own catalog instead of
-//! inheriting this one.
+//! Carry-over, named: [`tool_list`] describes the ported server's first-party
+//! catalog. It moves behind the provider registry when `nmcp-host` lands (R-1),
+//! at which point a platform daemon contributes its own catalog instead of
+//! inheriting this one, and NMCP-SPEC-003 G-5 records that it is deleted rather
+//! than deprecated when its 21 descriptors reach the crates that implement them.
+//!
+//! `READ_ONLY_TOOLS`, `OPEN_WORLD_TOOLS` and `tool_annotations` are gone as of
+//! I-047d. NMCP-SPEC-003 RC-D3 makes them derived rather than authoritative and
+//! RC-8 requires their deletion rather than their disuse: a tool's annotations
+//! are now read off the same `ToolAuthority` the kernel authorizes against, in
+//! `nmcp_schema::ToolContract::to_list_entry`, so the 29-of-63 mislabelling
+//! class those tables made possible is unrepresentable rather than fixed
+//! (RC-A4). `destructiveHint: false` is still emitted unconditionally and still
+//! restates the no-destructive-action guarantee rather than describing a tool.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,83 +85,6 @@ pub struct ToolSpec {
     /// JSON Schema for the tool's arguments.
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
-}
-
-/// Tools that only observe. They never create, modify, rename, move, or send anything.
-///
-/// `readOnlyHint` is the annotation a client uses to decide whether a call needs
-/// confirmation, so a wrong entry here is worse than no entry. When in doubt a tool is
-/// left out of this list and is therefore reported as not read-only.
-pub const READ_ONLY_TOOLS: &[&str] = &[
-    // filesystem observation
-    "list_roots",
-    "list_directory",
-    "search_repo",
-    "scan_repo",
-    "read_file_window_report",
-    "inspect_file_integrity",
-    // execution observation: these inspect jobs, they do not start or stop them
-    "execute_resolve_program",
-    "execute_env_report",
-    "execute_status",
-    "execute_tail",
-    "execute_wait",
-    "execute_result",
-    // scoped memory
-    "mem_read",
-    "mem_list",
-    // Windows observation
-    "win_registry_read",
-    "win_eventlog_query",
-    "win_services_query",
-    "win_wmi_query",
-    // repository observation
-    "dev_git_log",
-    "dev_git_blame",
-    "dev_git_diff",
-    "dev_dep_graph",
-    "dev_git_stash_list",
-];
-
-/// Tools that can reach beyond this host.
-///
-/// A complete list rather than a list plus a prefix rule. The execution tools are included
-/// because an approved program may itself reach the network: the tool's own reach is local,
-/// but its effect is not bounded by this host, and the conservative reading is the honest one
-/// to publish.
-///
-/// A tool proxied from a gateway upstream is not here and cannot be: it is somebody else's
-/// tool, it arrives prefixed by its provider id, and this crate learns of it at runtime or
-/// not at all.
-pub const OPEN_WORLD_TOOLS: &[&str] = &[
-    "execute",
-    "execute_start",
-    "dev_test_run",
-    "dev_git_publish",
-];
-
-/// MCP tool annotations for a first-party tool.
-///
-/// Absent annotations are not neutral. A client that receives none applies the protocol
-/// defaults, and those defaults are deliberately pessimistic: `destructiveHint` and
-/// `openWorldHint` both default to true. That is a sane default for an unknown server and
-/// exactly wrong for this one, which is why a read-only call like `dev_git_log` was being
-/// displayed to operators as DESTRUCTIVE.
-///
-/// `destructiveHint` is false for every tool here, and that is not a convenience: it is the
-/// No-Destructive-Action Guarantee (M3) restated in the manifest. There is no delete surface
-/// to annotate, backup is rename-only, and the broker refuses delete-intent commands before
-/// they spawn. If a tool is ever added for which false would be a lie, the guarantee is what
-/// broke, not this function.
-#[must_use]
-pub fn tool_annotations(name: &str) -> Value {
-    let read_only = READ_ONLY_TOOLS.contains(&name);
-    let open_world = OPEN_WORLD_TOOLS.contains(&name);
-    json!({
-        "readOnlyHint": read_only,
-        "destructiveHint": false,
-        "openWorldHint": open_world,
-    })
 }
 
 /// Build a success envelope for `id` carrying `result`.
@@ -444,116 +376,6 @@ mod tests {
         clippy::panic
     )]
     use super::*;
-
-    #[test]
-    fn no_tool_is_annotated_destructive() {
-        // G2-8. This is the No-Destructive-Action Guarantee expressed where a client can
-        // actually read it. If this ever fails, either a destructive tool was added, which
-        // breaks M3, or tool_annotations stopped telling the truth. Both are release
-        // blockers and neither should be fixed by editing this assertion.
-        for tool in tool_list() {
-            let annotations = tool_annotations(&tool.name);
-            assert_eq!(
-                annotations["destructiveHint"], false,
-                "{} is annotated destructive; the product guarantee says no tool is",
-                tool.name
-            );
-        }
-    }
-
-    #[test]
-    fn read_only_tools_are_annotated_read_only_and_mutating_tools_are_not() {
-        // Spot-check both directions rather than trusting the list's length. The pairs are
-        // chosen so a copy-paste error in READ_ONLY_TOOLS shows up: each mutating tool here
-        // shares a prefix with a read-only one.
-        for name in [
-            "read_file_window_report",
-            "list_directory",
-            "dev_git_log",
-            "execute_status",
-            "mem_read",
-            "win_registry_read",
-        ] {
-            assert_eq!(
-                tool_annotations(name)["readOnlyHint"],
-                true,
-                "{name} observes and should be annotated read-only"
-            );
-        }
-        for name in [
-            "write_text_file",
-            "move_file",
-            "dev_git_publish",
-            "execute",
-            "mem_write",
-            "win_registry_write",
-        ] {
-            assert_eq!(
-                tool_annotations(name)["readOnlyHint"],
-                false,
-                "{name} changes something and must not be annotated read-only"
-            );
-        }
-    }
-
-    #[test]
-    fn open_world_marks_exactly_the_tools_that_leave_this_host() {
-        // Every entry of OPEN_WORLD_TOOLS, which is now the whole rule: the prefix arm that
-        // used to widen it named a vendor and had no first-party subject left (RC-19).
-        for name in OPEN_WORLD_TOOLS {
-            assert_eq!(
-                tool_annotations(name)["openWorldHint"],
-                true,
-                "{name} can reach beyond this host"
-            );
-        }
-        for name in [
-            "list_directory",
-            "read_file_window_report",
-            "mem_read",
-            "win_services_query",
-        ] {
-            assert_eq!(
-                tool_annotations(name)["openWorldHint"],
-                false,
-                "{name} is local and should not claim an open world"
-            );
-        }
-    }
-
-    #[test]
-    fn every_advertised_tool_is_classified() {
-        // The read-only list is maintained by hand, so the failure mode is a new tool that
-        // nobody classified and that therefore silently reports as not read-only. This does
-        // not assert which side a tool lands on, only that somebody decided.
-        let known_mutating = [
-            "create_text_file",
-            "write_text_file",
-            "patch_text_file",
-            "rename_file",
-            "move_file",
-            "backup_file",
-            "execute",
-            "execute_start",
-            "execute_cancel",
-            "mem_write",
-            "mem_refresh",
-            "mem_expire_now",
-            "win_registry_write",
-            "dev_test_run",
-            "dev_git_publish",
-        ];
-        for tool in tool_list() {
-            let classified = READ_ONLY_TOOLS.contains(&tool.name.as_str())
-                || known_mutating.contains(&tool.name.as_str());
-            assert!(
-                classified,
-                "{} is advertised but classified in neither READ_ONLY_TOOLS nor the \
-                 mutating list; decide which it is before shipping it",
-                tool.name
-            );
-        }
-    }
 
     #[test]
     fn a_2026_07_28_result_carries_the_discriminator_that_revision_requires() {

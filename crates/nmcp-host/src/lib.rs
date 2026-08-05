@@ -9,12 +9,11 @@
 //! trait lives in `nmcp-schema` where every provider can see it, and [`IndexedToolRegistry`]
 //! implements it here because the kernel owns dispatch and owns INV-1.
 //!
-//! It is not wired into dispatch yet, which is a named gap and not an omission. `nmcp-router`
-//! still resolves through `ToolProvider::tool_names` and still authorizes from its own
-//! compiled-in table, so this crate's arrival changes no dispatch decision. Moving the ring
-//! onto this index and onto [`nmcp_schema::authorize`] is one atomic change, owner I-047d,
-//! because dispatch cannot hand a provider a `GrantedAuthority` until it produces one and
-//! cannot produce one until it reads the declaration this index holds.
+//! I-047c landed it unwired; I-047d put the ring on it. `nmcp_router::Router` holds an
+//! `Arc<dyn ToolRegistry>` and resolves, authorizes and lists through it, and the compiled-in
+//! policy table the ring used to consult is deleted. That had to be one change: dispatch cannot
+//! hand a provider a `GrantedAuthority` until it produces one, and it cannot produce one until
+//! it reads the declaration this index holds.
 
 mod registry;
 

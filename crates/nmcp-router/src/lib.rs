@@ -2,22 +2,52 @@
 //!
 //! ## Architecture
 //!
+//! [`Router::dispatch`] is the ring, and its stage order is frozen by NMCP-SPEC-003
+//! section 4.6. No stage may be reordered without a spec revision.
+//!
 //! ```text
 //! MCP client request
 //!   - Router::dispatch()
-//!       - PolicyRing::check()      (deny before provider is called)
-//!       - provider.call()
-//!       - AuditRing::record()      (record result + is_error)
-//!       - DeleteGuard::assert()    (unconditional, never bypassed)
+//!       0  DeleteGuard              (INV-1, before the registry is consulted)
+//!       1  resolve                  (one hash lookup in the ToolRegistry)
+//!       2  profile visibility       (after resolution: the public name is lossy)
+//!       3  upstream admission       (provider_id != "" only)
+//!       4  authorize                (the declaration becomes a GrantedAuthority)
+//!       5  approval gate, ABAC, HITL
+//!       5b reserved: secret resolution (NMCP-SPEC-002, not implemented here)
+//!       6  audit intent record      (INV-3 gate, durable before any effect)
+//!       7  provider.call(.., granted)
+//!       8  audit outcome record
 //!   - ToolCallResult - JSON-RPC response
 //! ```
 //!
-//! Providers implement [`ToolProvider`] and register with [`Router`].
-//! The ring applies identically to local and proxied (gateway) calls.
+//! Providers implement [`ToolProvider`] and are registered through [`Router::register`],
+//! which delegates to the injected [`ToolRegistry`]. The ring applies identically to local and
+//! proxied (gateway) calls.
+//!
+//! ## What the ring knows about a tool, and where it learns it
+//!
+//! From the tool's own declaration, except where trusting the declaration would let the
+//! declarer widen its own authority. Until I-047d this crate carried a compiled-in table of
+//! about forty first-party tool names deciding required permission, path arguments and the
+//! Windows API grant, plus a name-keyed mutation classifier. NMCP-SPEC-003 RC-D3 makes those
+//! derived rather than authoritative and RC-A1 requires their deletion; the ring now reads
+//! [`nmcp_schema::ToolAuthority`] out of the registry and hands it to
+//! [`nmcp_schema::authorize`].
+//!
+//! The exception is stage 5, and it is half the design rather than a caveat. A declaration
+//! from a non-empty `provider_id` is built from a remote server's `tools/list` response, which
+//! is attacker-controlled data, so the approval gate reads
+//! `!auto_approve && (third_party || effect == Mutate)` with `third_party` first and not
+//! conditional on anything declared (RC-D4, RC-13, M6).
 
 use nmcp_audit::{AuditEvent, AuditSink};
-use nmcp_policy::{Permission, PolicyConfig, RootRule};
-use serde_json::{Value, json};
+use nmcp_policy::{Permission, PolicyConfig};
+use nmcp_schema::{
+    CapabilityGrant, CatalogView, Denial, HeldAuthority, RegistrationError, ToolAuthority,
+    ToolEffect, ToolRegistry, authorize,
+};
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -33,8 +63,9 @@ use tracing::{info, warn};
 /// what keeps that true once this workspace's own dependents stop going through it.
 ///
 /// `CallContext` took the two changes 4.3 requires and no others. `matched_root` is private
-/// with a `matched_root()` reader, because a `pub` field lets anything holding a context set
-/// the resolved root and so fabricate the outcome of root resolution. And a private
+/// with a `matched_root()` reader, and its one setter takes a
+/// [`GrantedAuthority`](nmcp_schema::GrantedAuthority) rather than a bare root, so nothing can
+/// decide what a call resolved to without having asked. And a private
 /// `secrets: ResolvedSecrets` appears with a reader, carried empty now because adding a
 /// fifth parameter to a frozen trait method after implementors exist is a breaking change
 /// to every one of them. `ToolCallResult` is unchanged.
@@ -52,19 +83,16 @@ pub use nmcp_schema::{is_valid_public_tool_name, public_tool_name};
 
 /// The provider trait, re-exported from `nmcp-schema`.
 ///
-/// It moved there under NMCP-SPEC-003 section 4.3, RATIFIED v1.1, for RC-D1's reason: a
-/// provider crate depends on the contract and never on the kernel, which is what makes the
-/// open-core split hold at the dependency level rather than by convention. Re-exported here so
-/// every existing `use nmcp_router::ToolProvider` keeps compiling.
+/// It moved there under NMCP-SPEC-003 section 4.3 for RC-D1's reason: a provider crate depends
+/// on the contract and never on the kernel, which is what makes the open-core split hold at the
+/// dependency level rather than by convention. Re-exported here so every existing
+/// `use nmcp_router::ToolProvider` keeps compiling.
 ///
-/// It gained [`contract_version`](ToolProvider::contract_version) and
-/// [`contracts`](ToolProvider::contracts) in the move and kept `tool_names` and `tool_list`,
-/// which are now defaulted from `contracts` and which I-047d deletes. `call` keeps its four
-/// parameters: 4.3's frozen signature adds `granted: &GrantedAuthority`, and landing it is the
-/// same atomic change as rewiring dispatch through
-/// [`authorize`](nmcp_schema::authorize). Nothing about dispatch changed here.
+/// I-047d put it in 4.3's frozen shape. `call` takes `granted: &GrantedAuthority`, which is
+/// what makes RC-A2 a property of the type system rather than of this ring's good behaviour,
+/// and the transitional `tool_names` and `tool_list` are deleted in favour of
+/// [`contracts`](ToolProvider::contracts).
 pub use nmcp_schema::ToolProvider;
-
 // - AbacCheck trait -
 
 /// Decision returned by the ABAC stage.
@@ -78,14 +106,14 @@ pub enum AbacDecision {
     RequireApproval,
 }
 
-/// Synchronous pre-call check. Implement in `mcp-abac`; inject via `Router::set_abac`.
+/// Synchronous pre-call check. Implement in `nmcp-abac`; inject via `Router::set_abac`.
 ///
 /// `evaluate` is sync so it does not introduce async complexity at the ring boundary.
-/// The HITL async wait happens in `mcp-abac::AbacStage::register_hitl`, called by the
+/// The HITL async wait happens in `nmcp_abac::AbacStage::register_hitl`, called by the
 /// router after this method returns `RequireApproval`.
 pub trait AbacCheck: Send + Sync {
     /// Evaluate ABAC rules for a pending call.
-    /// Called after base policy check, before provider call.
+    /// Called after authorization, before the provider call.
     fn evaluate(&self, ctx: &CallContext, tool_name: &str, args: &Value) -> AbacDecision;
 
     /// Block until the call is approved or denied/timed-out.
@@ -110,8 +138,12 @@ pub trait AbacCheck: Send + Sync {
 /// against one table instead of two that can drift.
 use nmcp_schema::contains_delete_intent;
 
-/// Unconditional last stage of the ring. Panics in debug builds; returns a
-/// governed error in release. Applied to every call - local, proxied, OS, memory.
+/// Unconditional first stage of the ring. Applied to every call - local, proxied, OS, memory.
+///
+/// Stage 0, before the registry is consulted, so an unknown or misdeclared provider cannot
+/// reach it (RC-A3). INV-1 is not delegable: a provider that declares itself non-destructive is
+/// a provider grading its own homework, so this compares against a kernel-owned list of
+/// forbidden verbs and consults no declaration.
 fn delete_guard_check(tool_name: &str) -> Option<ToolCallResult> {
     if contains_delete_intent(tool_name) {
         warn!(tool = tool_name, "DeleteGuard: delete-named tool denied");
@@ -125,250 +157,143 @@ fn delete_guard_check(tool_name: &str) -> Option<ToolCallResult> {
     }
 }
 
-// - PolicyRing -
+// - Authorization -
 
-/// What the kernel's compiled-in table says a first-party tool requires.
+/// What the caller actually holds, assembled from effective policy and the call context.
 ///
-/// Public only so a provider migrating to a declared [`nmcp_schema::ToolAuthority`] can be
-/// graded against it: NMCP-SPEC-003 RC-D3 makes this table derived rather than authoritative,
-/// and a migration nobody checked is a migration nobody can trust.
-/// `nmcp-devtools`' `declared_authority_matches_the_kernel_tables_it_replaces` is the one
-/// consumer. It is still the table dispatch consults, and it is deleted together with that
-/// test at I-047d, once dispatch reads the declaration instead.
-#[derive(Debug, Clone, Copy)]
-pub struct ToolPolicySpec {
-    /// Root-scoped permission the ring requires for this tool.
-    pub permission: Permission,
-    /// Argument names the ring tries, in order, when resolving the matched root.
-    pub path_args: &'static [&'static str],
-    /// Whether the tool additionally requires the `win.api` grant.
-    pub require_windows_api: bool,
+/// The other half of every [`authorize`] call, and the half a provider never sees or supplies.
+/// `grants` is the union of the permissions granted on any root, which is exactly the rule the
+/// deleted `has_windows_api_grant` and `has_windows_api_write_grant` applied: a capability is
+/// held when some root grants it, independent of which root a path resolves to.
+fn held_authority(policy: &PolicyConfig, ctx: &CallContext) -> HeldAuthority {
+    HeldAuthority {
+        roots: policy.roots.clone(),
+        grants: policy
+            .roots
+            .iter()
+            .flat_map(|root| root.permissions.iter())
+            .map(|permission| CapabilityGrant::new(permission.as_str()))
+            .collect(),
+        agent_id: ctx.agent_id.clone(),
+    }
 }
 
-const PATH_ARG_PATH: &[&str] = &["path"];
-const PATH_ARG_FROM: &[&str] = &["from"];
-const PATH_ARG_CWD: &[&str] = &["cwd"];
-const PATH_ARG_REPO: &[&str] = &["repo", "repo_path", "repository", "repository_path", "path"];
-const PATH_ARG_PROGRAM: &[&str] = &["program"];
-const PATH_ARG_DEV: &[&str] = &["path", "repo", "repo_path", "cwd"];
-
-/// The kernel's compiled-in policy spec for `tool_name`, or `None` for a tool it has never
-/// heard of, which is every tool from every admitted upstream.
+/// Turn a refusal into the governed error a caller sees.
 ///
-/// Public for the reason on [`ToolPolicySpec`], and for no other. Deleted at I-047d.
-#[must_use]
-pub fn tool_policy_spec(tool_name: &str) -> Option<ToolPolicySpec> {
-    let n = tool_name.replace('.', "_");
-    let spec = match n.as_str() {
-        "execute" | "execute_start" => ToolPolicySpec {
-            permission: Permission::Execute,
-            path_args: PATH_ARG_CWD,
-            require_windows_api: false,
-        },
-        "execute_resolve_program" => ToolPolicySpec {
-            permission: Permission::Execute,
-            path_args: PATH_ARG_PROGRAM,
-            require_windows_api: false,
-        },
-        "read_text_file"
-        | "fs_read_text_file"
-        | "read_file_window_report"
-        | "inspect_file_integrity" => ToolPolicySpec {
-            permission: Permission::Read,
-            path_args: PATH_ARG_PATH,
-            require_windows_api: false,
-        },
-        "create_text_file" => ToolPolicySpec {
-            permission: Permission::Create,
-            path_args: PATH_ARG_PATH,
-            require_windows_api: false,
-        },
-        "write_text_file" | "patch_text_file" | "fs_write_text_file" | "fs_patch_text_file" => {
-            ToolPolicySpec {
-                permission: Permission::Write,
-                path_args: PATH_ARG_PATH,
-                require_windows_api: false,
-            }
+/// The message is the `Denial`'s own, which is why the six variants do not overlap: the audit
+/// record and the caller both get the reason rather than a category. The `Policy denied:` prefix
+/// and the `policy_denied` error kind are the ones the ring has always used, so nothing
+/// downstream has to learn a new shape.
+///
+/// The remediation is chosen from the declared permission first for
+/// [`Permission::GitPublish`], because that is the one capability whose remediation is a
+/// deliberate operator decision rather than a path correction, and telling somebody to widen a
+/// root when what they need is to approve outbound publishing sends them to the wrong place.
+/// That special case is the deleted policy ring's, kept verbatim.
+fn denial_result(declared: &ToolAuthority, denial: &Denial) -> ToolCallResult {
+    let remediation = match denial {
+        Denial::UnknownGrant(_) => {
+            "This tool requires a capability no permission in this build defines. It cannot be \
+             authorized by any policy; report it to whoever ships the provider."
         }
-        "list_directory" | "fs_list_directory" => ToolPolicySpec {
-            permission: Permission::List,
-            path_args: PATH_ARG_PATH,
-            require_windows_api: false,
-        },
-        "rename" | "fs_rename" | "rename_file" => ToolPolicySpec {
-            permission: Permission::Rename,
-            path_args: PATH_ARG_FROM,
-            require_windows_api: false,
-        },
-        "move" | "fs_move" | "move_file" => ToolPolicySpec {
-            permission: Permission::Move,
-            path_args: PATH_ARG_FROM,
-            require_windows_api: false,
-        },
-        "backup" | "fs_backup" | "backup_file" => ToolPolicySpec {
-            permission: Permission::Backup,
-            path_args: PATH_ARG_PATH,
-            require_windows_api: false,
-        },
-        "search_repo" | "scan_repo" | "dev_search_repo" | "dev_scan_repo" => ToolPolicySpec {
-            permission: Permission::Search,
-            path_args: PATH_ARG_DEV,
-            require_windows_api: false,
-        },
-        "git_status" | "git_diff" | "git_log" | "dev_git_status" | "dev_git_diff"
-        | "dev_git_log" | "git_blame" | "dev_git_blame" | "git_stash_list"
-        | "dev_git_stash_list" => ToolPolicySpec {
-            permission: Permission::Read,
-            path_args: PATH_ARG_REPO,
-            require_windows_api: false,
-        },
-        "git_publish" | "dev_git_publish" => ToolPolicySpec {
-            permission: Permission::GitPublish,
-            path_args: PATH_ARG_REPO,
-            require_windows_api: false,
-        },
-        "test_run" | "dev_test_run" | "dep_graph" | "dev_dep_graph" => ToolPolicySpec {
-            permission: Permission::Execute,
-            path_args: PATH_ARG_DEV,
-            require_windows_api: false,
-        },
-        "win_registry_read" | "win_registry_write" | "win_eventlog_query"
-        | "win_services_query" | "win_wmi_query" => ToolPolicySpec {
-            permission: Permission::Read,
-            path_args: &[],
-            require_windows_api: true,
-        },
-        _ => return None,
-    };
-    Some(spec)
-}
-
-fn path_arg<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
-    names
-        .iter()
-        .find_map(|name| args.get(*name).and_then(Value::as_str))
-}
-
-fn has_windows_api_grant(policy: &PolicyConfig) -> bool {
-    policy
-        .roots
-        .iter()
-        .any(|root| root.permissions.contains(&Permission::WindowsApi))
-}
-
-fn has_windows_api_write_grant(policy: &PolicyConfig) -> bool {
-    policy
-        .roots
-        .iter()
-        .any(|root| root.permissions.contains(&Permission::WindowsApiWrite))
-}
-
-/// Whether a tool mutates state (used by the `auto_approve` global gate).
-fn tool_is_mutating(tool_name: &str) -> bool {
-    let n = tool_name.replace('.', "_");
-    if n == "win_registry_write" {
-        return true;
-    }
-    match tool_policy_spec(tool_name) {
-        Some(spec) => matches!(
-            spec.permission,
-            Permission::Write
-                | Permission::Create
-                | Permission::Modify
-                | Permission::Move
-                | Permission::Rename
-                | Permission::Backup
-                | Permission::Execute
-                | Permission::GitPublish
-        ),
-        // A first-party tool with no spec, such as list_roots or scan_repo, reads or reports
-        // and does not mutate. A tool from an admitted upstream also has no spec and is a
-        // different question entirely, but this function only sees a name. The third-party
-        // rule lives in `dispatch`, which has resolved the provider and can tell them apart
-        // (M6).
-        None => false,
-    }
-}
-
-fn policy_check(policy: &PolicyConfig, tool_name: &str, args: &Value) -> Option<ToolCallResult> {
-    // Registry writes require a dedicated capability beyond win.api, so a
-    // read + win.api grant cannot escalate to arbitrary HKLM writes.
-    if tool_name.replace('.', "_") == "win_registry_write" {
-        if !has_windows_api_grant(policy) {
-            warn!(tool = tool_name, "PolicyRing: denied missing win.api grant");
-            return Some(ToolCallResult::err_with_metadata(
-                "Policy denied: win.api permission is required for Windows API tools".to_string(),
-                "policy_denied",
-                Some("Grant win.api only on a policy root approved for Windows API operations."),
-            ));
+        Denial::MissingGrant(_) => {
+            "Grant the required capability on a policy root chosen for it, or use a tool that \
+             does not need it."
         }
-        if !has_windows_api_write_grant(policy) {
-            warn!(
-                tool = tool_name,
-                "PolicyRing: denied missing win.api.write grant"
-            );
-            return Some(ToolCallResult::err_with_metadata(
-                "Policy denied: win.api.write permission is required to modify the Windows registry".to_string(),
-                "policy_denied",
-                Some("Grant win.api.write only on a policy root approved for registry writes."),
-            ));
+        Denial::MissingPathArgument { .. } => {
+            "Provide the required governed path argument for this tool."
         }
-        return None;
-    }
-    let spec = tool_policy_spec(tool_name)?;
-    if spec.require_windows_api && !has_windows_api_grant(policy) {
-        warn!(tool = tool_name, "PolicyRing: denied missing win.api grant");
-        return Some(ToolCallResult::err_with_metadata(
-            "Policy denied: win.api permission is required for Windows API tools".to_string(),
-            "policy_denied",
-            Some("Grant win.api only on a policy root approved for Windows API operations."),
-        ));
-    }
-    if spec.path_args.is_empty() {
-        return None;
-    }
-    let Some(path) = path_arg(args, spec.path_args) else {
-        return Some(ToolCallResult::err_with_metadata(
-            format!("Policy denied: missing required path argument for {tool_name}"),
-            "policy_denied",
-            Some("Provide the required governed path argument for this tool."),
-        ));
-    };
-    if let Err(e) = policy.require(spec.permission, path) {
-        warn!(tool = tool_name, path, "PolicyRing: denied - {e}");
-        let remediation = match spec.permission {
-            Permission::GitPublish => {
-                "Grant the explicit git.publish permission on the repository root only after outbound git publishing is approved."
+        Denial::UndeclaredPathUse { .. } => {
+            "This tool declares no path authority, so it cannot be pointed at a path. Use a tool \
+             that does."
+        }
+        _ => match declared.permission {
+            Some(Permission::GitPublish) => {
+                "Grant the explicit git.publish permission on the repository root only after \
+                 outbound git publishing is approved."
             }
             _ => {
-                "Adjust the NativeMCP policy root permissions or use a path inside an approved root."
+                "Adjust the NativeMCP policy root permissions or use a path inside an approved \
+                 root."
             }
-        };
-        return Some(ToolCallResult::err_with_metadata(
-            format!("Policy denied: {e}"),
-            "policy_denied",
-            Some(remediation),
-        ));
-    }
-    None
+        },
+    };
+    ToolCallResult::err_with_metadata(
+        format!("Policy denied: {denial}"),
+        "policy_denied",
+        Some(remediation),
+    )
 }
 
-fn matched_root_for_call(policy: &PolicyConfig, tool_name: &str, args: &Value) -> Option<RootRule> {
-    let spec = tool_policy_spec(tool_name)?;
-    let path = path_arg(args, spec.path_args)?;
-    let decision = policy.require(spec.permission, path).ok()?;
-    let root_id = decision.root_id?;
-    policy.roots.iter().find(|r| r.id == root_id).cloned()
+// - AuditRing -
+
+/// Write the ring's pre-effect record for a call that passed every gate (RC-16).
+///
+/// Stage 6, and the INV-3 gate expressed in the ring rather than only in the crate that
+/// performs the effect. It is written after authorization, ABAC and any human approval have all
+/// said yes and before [`ToolProvider::call`] is reached, so an effect that begins and never
+/// returns still left a durable record saying it was about to begin. `AuditSink::append` syncs,
+/// so "written" and "durable" are the same moment.
+///
+/// It carries no verdict and no duration: the verdict is the outcome record's to state and the
+/// clock has not stopped. `nmcp_audit::INTENT_DECISION` is deliberately not an authorization
+/// decision, so nothing that counts allowed calls counts this one twice. The two records share
+/// one `call_id`, which is how a reader pairs them and how it finds an intent with no outcome.
+fn audit_intent(
+    sink: &AuditSink,
+    tool_name: &str,
+    ctx: &CallContext,
+    permission: Option<Permission>,
+) {
+    let mut event = AuditEvent::new(tool_name, format!("intent tool={tool_name}"));
+    event.decision = nmcp_audit::INTENT_DECISION.to_string();
+    stamp_caller(&mut event, ctx);
+    event.permission = permission.map(|p| p.as_str().to_string());
+    if let Some(root) = ctx.matched_root() {
+        event.normalized_path = Some(root.path.display().to_string());
+    }
+    if let Err(e) = sink.append(&event) {
+        warn!(call_id = %ctx.call_id, "AuditRing: failed to write intent event: {e}");
+    }
 }
+
+/// Copy the caller's identity onto a record, the same way for both records a call writes.
+///
+/// One function rather than two copies, because the intent record and the outcome record have
+/// to agree about who called: a pair that disagreed would be worse than either record alone.
+fn stamp_caller(event: &mut AuditEvent, ctx: &CallContext) {
+    // G3-15 AF-7. `client` is overloaded: it is the session id when there is one, and a
+    // literal otherwise, and session replay filters on it. So the session id stays exactly
+    // where it was, and only the "local" FALLBACK changes. On the 2026-07-28 revision the
+    // session is deliberately None, which is why a call arriving through the tunnel used to
+    // claim to be local; it now names the network it came from. A caller with no transport at
+    // all, which is every CLI and test path, still reads "local".
+    event.client = ctx
+        .session_id
+        .clone()
+        .unwrap_or_else(|| ctx.peer.clone().unwrap_or_else(|| "local".to_string()));
+    event.peer.clone_from(&ctx.peer);
+    event.credential_path = ctx.credential_path.map(str::to_string);
+    event.agent_id.clone_from(&ctx.agent_id);
+    event.client_info.clone_from(&ctx.client_info);
+    // The half of G4-26 nobody had noticed was missing. `AuditEvent::call_id` and
+    // `CallContext::call_id` have both existed for a long time and were never connected, so
+    // every authorization record ever written carries none. Without this the effect side has
+    // nothing to join to, and after RC-16 it is also what pairs the intent record with its
+    // outcome.
+    event.call_id = Some(ctx.call_id);
+}
+
 /// Write the authorization record for a completed or denied call.
 ///
-/// One of the two records a governed call produces (ADR-0005). This is the one carrying the
-/// verdict, the duration and the caller. It does not carry the content hashes, because the ring
-/// never sees the bytes; the effect record written where the effect happened does.
+/// Stage 8, and one of the records a governed call produces (ADR-0005). This is the one
+/// carrying the verdict, the duration and the caller. It does not carry the content hashes,
+/// because the ring never sees the bytes; the effect record written where the effect happened
+/// does.
 ///
 /// `started` is the top of `dispatch`, not the provider call, so the recorded duration is
-/// what the client actually waited: delete guard, policy ring, ABAC, any human approval
-/// wait, and the provider. A policy denial that took three seconds is then as visible as a
+/// what the client actually waited: delete guard, resolution, authorization, ABAC, any human
+/// approval wait, and the provider. A denial that took three seconds is then as visible as a
 /// slow provider, and an operator sitting on approvals shows up in the latency history
 /// rather than hiding behind a fast provider.
 fn audit_record(
@@ -376,6 +301,7 @@ fn audit_record(
     tool_name: &str,
     ctx: &CallContext,
     result: &ToolCallResult,
+    permission: Option<Permission>,
     started: Instant,
 ) {
     let decision = if result.is_error {
@@ -390,35 +316,23 @@ fn audit_record(
 
     let mut event = AuditEvent::new(tool_name, &summary);
     event.decision = decision.to_string();
-    // G3-15 AF-7. `client` is overloaded: it is the session id when there is one, and a
-    // literal otherwise, and session replay filters on it. So the session id stays exactly
-    // where it was, and only the "local" FALLBACK changes. On the 2026-07-28 revision the
-    // session is deliberately None, which is why a call arriving through the tunnel used to
-    // claim to be local; it now names the network it came from. A caller with no transport at
-    // all, which is every CLI and test path, still reads "local".
-    event.client = ctx
-        .session_id
-        .clone()
-        .unwrap_or_else(|| ctx.peer.clone().unwrap_or_else(|| "local".to_string()));
-    event.peer.clone_from(&ctx.peer);
-    event.credential_path = ctx.credential_path.map(str::to_string);
-    // M4-1. The capability the ring required, taken from the tool's policy spec rather than
-    // from anything the caller sent, so the Event Log mirror can give a read and an execution
-    // different Event IDs and a SIEM rule can tell them apart without parsing a body. Absent
-    // for a tool with no spec, which is every upstream tool, because the permission an
-    // upstream call requires is declared on the upstream and not per tool.
-    event.permission = tool_policy_spec(tool_name).map(|spec| spec.permission.as_str().to_string());
+    stamp_caller(&mut event, ctx);
+    // M4-1. The capability the ring required, taken from the tool's own declaration rather
+    // than from anything the caller sent, so the Event Log mirror can give a read and an
+    // execution different Event IDs and a SIEM rule can tell them apart without parsing a
+    // body. Absent for a call refused before its declaration was read, which is the delete
+    // guard and an unknown tool, and for any tool that declares no root-scoped permission.
+    //
+    // It used to come from a compiled-in table keyed by tool name, which meant it was absent
+    // for every upstream tool. It now names whatever an upstream declared, which is accurate:
+    // RC-D4 makes a declaration an additional precondition, so a declared permission is one
+    // the ring genuinely required. The upstream's own admission capability is a separate
+    // question answered at stage 3.
+    event.permission = permission.map(|p| p.as_str().to_string());
 
     if let Some(root) = ctx.matched_root() {
         event.normalized_path = Some(root.path.display().to_string());
     }
-    event.agent_id.clone_from(&ctx.agent_id);
-    event.client_info.clone_from(&ctx.client_info);
-    // The half of G4-26 nobody had noticed was missing. `AuditEvent::call_id` and
-    // `CallContext::call_id` have both existed for a long time and were never connected, so
-    // every authorization record ever written carries none. Without this the effect side has
-    // nothing to join to.
-    event.call_id = Some(ctx.call_id);
     // Saturating rather than wrapping: a duration past u64 milliseconds is not real, and a
     // wrapped value would read as a suspiciously fast call rather than an obviously broken
     // one.
@@ -433,157 +347,191 @@ fn audit_record(
 
 /// The central dispatch point for all tool calls on the platform.
 ///
-/// Register providers with [`Router::register`]. The router merges their tool
-/// catalogs, resolves tool names (with upstream namespacing), and dispatches
-/// calls through the middleware ring.
+/// Register providers with [`Router::register`], which delegates to the [`ToolRegistry`] the
+/// router was built with. The registry owns the local-to-public name mapping, refuses a
+/// duplicate rather than shadowing it, and answers resolution in one hash lookup; the router
+/// owns the ring order and nothing else about a tool.
+///
+/// The registry arrives as a `dyn` handle rather than a concrete type because the index lives
+/// in `nmcp-host`, which depends on this crate (NMCP-SPEC-003 RC-D1). That direction is what
+/// keeps a provider crate off the kernel, and it means this crate names the contract and never
+/// the implementation.
 pub struct Router {
-    providers: Arc<parking_lot::RwLock<Vec<Arc<dyn ToolProvider>>>>,
+    registry: Arc<dyn ToolRegistry>,
     policy: Arc<parking_lot::RwLock<PolicyConfig>>,
     audit: AuditSink,
-    abac: Option<Arc<dyn AbacCheck>>,
+    /// The ABAC stage, behind a lock so RC-D7's one mutability rule holds for it too.
+    ///
+    /// `dispatch` clones the handle out and drops the guard **before** any `await`.
+    /// `parking_lot::RwLockReadGuard` is `!Send`, `wait_for_approval` is awaited inside
+    /// `dispatch`, and `dispatch` is served from an axum handler, so a guard held across that
+    /// await makes the future `!Send` and does not compile. `dispatch_future_is_send` below is
+    /// the compile-time assertion (RC-10).
+    abac: parking_lot::RwLock<Option<Arc<dyn AbacCheck>>>,
 }
 
 impl Router {
-    /// `new`.
-    pub fn new(policy: Arc<parking_lot::RwLock<PolicyConfig>>, audit: AuditSink) -> Self {
+    /// Build a router over a policy handle, an audit sink and a tool registry.
+    pub fn new(
+        policy: Arc<parking_lot::RwLock<PolicyConfig>>,
+        audit: AuditSink,
+        registry: Arc<dyn ToolRegistry>,
+    ) -> Self {
         Self {
-            providers: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            registry,
             policy,
             audit,
-            abac: None,
+            abac: parking_lot::RwLock::new(None),
         }
     }
 
-    /// Register a tool provider. Tool names must be unique across all providers
-    /// (upstream providers are namespaced automatically via `provider_id`).
-    /// Safe to call on a `SharedRouter` at runtime - takes a write lock.
-    #[must_use]
+    /// Remove a provider and all its tools. `true` if one was present.
+    ///
+    /// Delegates to the registry, which removes every name form the provider contributed rather
+    /// than the ones a caller can guess.
     pub fn unregister_provider(&self, provider_id: &str) -> bool {
-        let mut providers = self.providers.write();
-        let before = providers.len();
-        providers.retain(|provider| provider.provider_id() != provider_id);
-        providers.len() != before
-    }
-    /// `register`.
-    pub fn register(&self, provider: Arc<dyn ToolProvider>) {
-        info!(
-            provider = provider.provider_id(),
-            "Router: registered provider"
-        );
-        self.providers.write().push(provider);
+        self.registry.unregister_provider(provider_id)
     }
 
-    /// Inject an ABAC stage into the router. Must be called before the Arc is shared.
-    /// The stage runs after base policy check, before provider call - on the single dispatch path.
-    pub fn set_abac(&mut self, stage: Arc<dyn AbacCheck>) {
-        self.abac = Some(stage);
+    /// Register a tool provider, or refuse it with a reason.
+    ///
+    /// All-or-nothing (RC-D5): a provider whose third tool duplicates a public name registers
+    /// none of its tools. Safe to call on a `SharedRouter` at runtime, because every registry
+    /// method takes `&self` (RC-D7).
+    ///
+    /// Returning a `Result` is the point rather than a side effect. Registration used to return
+    /// `()` and push onto a `Vec`, so a duplicate public name shadowed by registration order and
+    /// an operator learned about it when a caller got the wrong tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`RegistrationError`] naming what was refused and what an operator has to
+    /// change.
+    pub fn register(&self, provider: Arc<dyn ToolProvider>) -> Result<(), RegistrationError> {
+        let provider_id = provider.provider_id().to_string();
+        self.registry.register(provider)?;
+        info!(provider = provider_id, "Router: registered provider");
+        Ok(())
+    }
+
+    /// Inject an ABAC stage into the router.
+    ///
+    /// `&self` per RC-D7: wire-up has one mutability rule, so a router already behind an `Arc`
+    /// is still a router an approval workflow can be attached to. The asymmetry this replaces,
+    /// where `register` took `&self` and `set_abac` took `&mut self`, was defensible as an
+    /// accident and not as a design.
+    ///
+    /// The stage runs after authorization and before the provider call, on the single dispatch
+    /// path.
+    pub fn set_abac(&self, stage: Arc<dyn AbacCheck>) {
+        *self.abac.write() = Some(stage);
     }
 
     /// Merged, Claude-safe tool list for `tools/list` responses.
     /// NOT FOR A REQUEST PATH (G6-11).
     ///
-    /// This is every tool of every registered provider, ignoring gateway profiles, and it
-    /// exists for the callers that legitimately have no session to scope to: readiness,
-    /// doctor, and the no-delete sweep, which are asking about this process rather than about
-    /// a caller. Answering a request with it hands a scoped session the full upstream and
-    /// tool inventory the profile exists to hide.
+    /// This is every tool of every registered provider, ignoring gateway profiles and caller
+    /// allowlists, and it exists for the callers that legitimately have no session to scope to:
+    /// readiness, doctor, and the no-delete sweep, which are asking about this process rather
+    /// than about a caller. Answering a request with it hands a scoped session the full upstream
+    /// and tool inventory the profile exists to hide.
     ///
     /// Every method that answers a caller must call [`Router::merged_tool_list_for`] with that
-    /// session's profile. `every_request_lane_scopes_its_tool_list_to_the_session_profile` in
-    /// `mcp-server` reads the request lanes out of the source and fails on any call to this
-    /// one, because the defect it was written for was a single method out of four.
+    /// session's profile and caller.
     #[must_use]
     pub fn merged_tool_list(&self) -> Vec<Value> {
-        self.merged_tool_list_for(None)
+        self.merged_tool_list_for(None, None)
     }
 
-    /// The same list, scoped to one session's gateway profile (G6-8).
+    /// The same list, scoped to one session's gateway profile and caller (G6-8, RC-D8).
     ///
-    /// The filter here and the check in `dispatch` both go through
-    /// `PolicyConfig::provider_visible_to_session`, which is the point: a session that can
-    /// see a tool it cannot call, or call one it cannot see, is worse than either restriction
-    /// on its own, and two copies of the rule is how that happens.
+    /// Delegates to [`ToolRegistry::list_for`], which is the point: the filter here and the
+    /// check in `dispatch` are one implementation rather than two copies of a rule. A session
+    /// that can see a tool it cannot call, or call one it cannot see, is worse than either
+    /// restriction on its own.
+    ///
+    /// `agent_id` is a parameter because `CallerToolAllowlist` filtering is unconditional at
+    /// list time (RC-D8) and inexpressible without knowing who is asking. It was already a
+    /// call-time deny, so applying it here is a pure narrowing that closes G6-8's gap: a
+    /// restricted caller used to see every tool and find out at the call.
+    ///
+    /// Permission-based filtering stays off (`filter_by: None`). RC-D8's second part is
+    /// available and opt-in: a tool that vanishes from the catalogue is indistinguishable from
+    /// a tool that does not exist, and the refusal path already gives a precise reason.
     #[must_use]
-    pub fn merged_tool_list_for(&self, profile: Option<&str>) -> Vec<Value> {
-        let policy = self.policy.read();
-        self.providers
-            .read()
-            .iter()
-            .filter(|p| policy.provider_visible_to_session(profile, p.provider_id()))
-            .flat_map(|p| {
-                let provider_id = p.provider_id().to_string();
-                p.tool_list().into_iter().map(move |mut tool| {
-                    if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                        let safe_name = public_tool_name(&provider_id, name);
-                        debug_assert!(is_valid_public_tool_name(&safe_name));
-                        // Insert rather than index, for the reason in
-                        // `into_dispatch_json`: a provider could hand back a
-                        // non-object and indexing would panic in the dispatch
-                        // path. A non-object simply carries no rewrite.
-                        if let Some(object) = tool.as_object_mut() {
-                            object.insert("name".into(), json!(safe_name));
-                        }
-                        // Annotate first-party tools only. A proxied upstream is somebody
-                        // else's software: this server can vouch for what its own tools do
-                        // and cannot vouch for theirs, so an upstream keeps whatever
-                        // annotations it published and gets none invented for it.
-                        if provider_id.is_empty() && tool.get("annotations").is_none() {
-                            // Classify on the PUBLIC name, not the provider's internal one.
-                            // public_tool_name sanitizes separators, so a provider tool such
-                            // as dev.git_log is advertised as dev_git_log. Keying on the
-                            // internal name silently missed every prefixed tool and let it
-                            // fall through to not-read-only and not-open-world.
-                            if let Some(object) = tool.as_object_mut() {
-                                object.insert(
-                                    "annotations".into(),
-                                    nmcp_proto::tool_annotations(&safe_name),
-                                );
-                            }
-                        }
-                    }
-                    tool
-                })
-            })
-            .collect()
+    pub fn merged_tool_list_for(
+        &self,
+        profile: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Vec<Value> {
+        self.registry.list_for(&CatalogView {
+            profile: profile.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
+            filter_by: None,
+        })
     }
 
     /// Dispatch a tool call through the full middleware ring.
-    // The governed call pipeline: resolve, policy, profile scope, ABAC,
-    // approval, provider, audit. Every stage is ordered with respect to the
-    // others and the ordering IS the governance; splitting it into helpers
-    // would scatter one decision procedure and invite a stage being skipped.
+    ///
+    /// The stage order is NMCP-SPEC-003 section 4.6, frozen at ratification. The ordering IS
+    /// the governance; splitting it into helpers would scatter one decision procedure and
+    /// invite a stage being skipped.
     #[allow(clippy::too_many_lines)]
     pub async fn dispatch(&self, tool_name: &str, args: Value, ctx: CallContext) -> ToolCallResult {
         // Every exit from this function audits, and every audit records how long the client
         // waited to reach it.
         let started = Instant::now();
 
-        // - Stage 0: DeleteGuard (pre-call, before provider is even found) -
+        // - Stage 0: DeleteGuard -
+        //
+        // Before resolution, so an unknown or misdeclared provider cannot reach it (RC-A3).
+        // INV-1 is enforced twice and this is the later of the two: the registry refuses a
+        // delete-denied name at registration, so an operator wiring the server learns it
+        // rather than a caller being denied forever.
         if let Some(denied) = delete_guard_check(tool_name) {
-            audit_record(&self.audit, tool_name, &ctx, &denied, started);
+            audit_record(&self.audit, tool_name, &ctx, &denied, None, started);
             return denied;
         }
 
-        // - Resolve provider and local name -
-        let Some((provider, local_name)) = self.resolve(tool_name) else {
+        // - Stage 1: resolve -
+        //
+        // One hash lookup. `authority_of` is a second lookup rather than a field of the first
+        // because authorization must be able to read the declaration without thereby obtaining
+        // the ability to call. Both are populated by one insertion, so the only way the pair
+        // disagrees is a provider unregistered between the two calls, which is an unknown tool
+        // by the time the second lookup runs and is answered as one.
+        let resolved = self
+            .registry
+            .resolve(tool_name)
+            .zip(self.registry.authority_of(tool_name));
+        let Some(((provider, local_name), declared)) = resolved else {
             let result = ToolCallResult::err_with_metadata(
                 format!("Unknown tool: {tool_name}"),
                 "command_not_found",
                 Some("Call tools/list and retry with a registered tool name."),
             );
-            audit_record(&self.audit, tool_name, &ctx, &result, started);
+            audit_record(&self.audit, tool_name, &ctx, &result, None, started);
             return result;
         };
+        let permission = declared.permission;
 
         let policy = self.policy.read().clone();
 
-        // - Stage 0.5: session profile scope (G6-8) -
+        // - Stage 2: profile and allowlist visibility (G6-8) -
         //
-        // Before PolicyRing because it is a visibility question rather than a permission one:
-        // if this session cannot reach the server at all, nothing about the tool's own policy
-        // matters. Here rather than at the transport edge because the public tool name is
-        // lossy and not invertible, so the only reliable way to know which upstream a call
-        // lands on is to have resolved the provider, which has just happened above.
+        // After resolution, because the public tool name is lossy and not invertible, so the
+        // only reliable way to know which upstream a call lands on is to have resolved the
+        // provider. Before authorization because it is a visibility question rather than a
+        // permission one: if this session cannot reach the server at all, nothing about the
+        // tool's own declaration matters.
+        //
+        // The allowlist half of this stage is `AbacRule::CallerToolAllowlist`, and it is
+        // evaluated once rather than twice. At list time `ToolRegistry::list_for` applies it
+        // unconditionally (RC-D8), which is what closed G6-8; at call time the ABAC stage below
+        // applies it, which is where the base put it and where its refusal names the rule that
+        // refused. A second evaluation here would reach the identical verdict by a different
+        // path and would replace that reason with a vaguer one, and two copies of a rule is how
+        // list and call come to disagree.
         if !policy.provider_visible_to_session(ctx.profile.as_deref(), provider.provider_id()) {
             let denied = ToolCallResult::err_with_metadata(
                 format!("Tool '{tool_name}' is not in this session's gateway profile"),
@@ -592,22 +540,19 @@ impl Router {
                     "Call tools/list to see what this session can reach, or connect with a client bound to a profile that includes this server.",
                 ),
             );
-            audit_record(&self.audit, tool_name, &ctx, &denied, started);
+            audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
             return denied;
         }
 
-        // - Stage 0.7: upstream admission (G4-28) -
+        // - Stage 3: upstream admission (G4-28) -
         //
         // The ring cannot govern what an admitted upstream does. A stdio or container upstream
         // is a child process of the daemon, an HTTP one is somebody else's server, and neither
-        // goes through mcp-fs, so no root permission constrains it. What the ring can govern is
+        // goes through nmcp-fs, so no root permission constrains it. What the ring can govern is
         // whether its tools are reachable, and that is what this asks.
         //
-        // Here rather than in PolicyRing because PolicyRing answers a path question from a
-        // compiled-in table of first-party tool names, which an upstream's tools are not in and
-        // cannot be: this server has never seen the name and does not know whether it takes a
-        // path. Before PolicyRing for the same reason the profile check is: if the caller may
-        // not reach this upstream at all, nothing about an individual tool matters.
+        // Before authorization for the same reason the profile check is: if the caller may not
+        // reach this upstream at all, nothing about an individual tool matters.
         if !provider.provider_id().is_empty() {
             let denied = match policy.upstream_admission(provider.provider_id()) {
                 nmcp_policy::UpstreamAdmission::Granted { .. } => None,
@@ -651,39 +596,62 @@ impl Router {
                 }
             };
             if let Some(denied) = denied {
-                audit_record(&self.audit, tool_name, &ctx, &denied, started);
+                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
                 return denied;
             }
         }
 
-        // - Stage 1: PolicyRing -
-        if let Some(denied) = policy_check(&policy, &local_name, &args) {
-            audit_record(&self.audit, tool_name, &ctx, &denied, started);
-            return denied;
-        }
-
-        // Enrich context with the same canonical policy decision used for authorization.
-        let ctx = ctx.with_root(matched_root_for_call(&policy, &local_name, &args));
-
-        // - Stage 1.5: ABAC -
-        // Runs after base policy, before provider. Cannot be bypassed.
-        // Global auto-approve gate: when auto_approve is disabled, mutating tools
-        // require HITL approval even without a matching ABAC rule. Default
-        // auto_approve=true leaves this inert (no behavior change).
-        // A tool from an admitted upstream has no compiled-in policy spec and cannot have
-        // one, so `tool_is_mutating` reads it as harmless for want of anything to consult.
-        // That put the tool this server knows least about on the trusting side of the gate.
-        // An operator who turned auto_approve off asked for mutating calls to be approved;
-        // for a third-party tool the honest answer to "does this mutate" is that nobody here
-        // knows, and unknown belongs on the gated side (M6).
+        // - Stage 4: authorize -
         //
-        // Keyed off the resolved provider rather than the tool name, because the name is the
-        // thing that carries no information here. Inert while auto_approve is true, which is
-        // the default and what the live policy runs.
+        // The only consumer of `ToolAuthority`, and the only producer of `GrantedAuthority`.
+        // The declaration is an additional precondition and never a grant (RC-D4): a tool
+        // declaring `Read` is still refused when the caller lacks Read, still refused when the
+        // path resolves outside every root, and a tool declaring no permission is restricted to
+        // operations needing none rather than exempted from the question.
+        //
+        // This is also where RC-20 lands. The kernel used to resolve a root from the first
+        // present of a compiled-in list of argument names that included `repo`, `repo_path`,
+        // `repository`, `repository_path` and `cwd`, while the dev tools read `path` and their
+        // schemas defined none of the others. The declaration is filtered to the tool's own
+        // schema by RC-D5, so the argument the ring authorizes and the argument the tool reads
+        // are the same argument by construction, which is what made deleting the provider-side
+        // re-check safe rather than merely tidy.
+        let held = held_authority(&policy, &ctx);
+        let granted = match authorize(&declared, &held, &args) {
+            Ok(granted) => granted,
+            Err(denial) => {
+                warn!(tool = tool_name, "PolicyRing: denied - {denial}");
+                let denied = denial_result(&declared, &denial);
+                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
+                return denied;
+            }
+        };
+        // The resolved root reaches the context only through the proof that it was resolved.
+        let ctx = ctx.with_granted(&granted);
+
+        // - Stage 5: approval gate, then ABAC, then HITL -
+        //
+        // RC-13, and the one line in this function where trusting a declaration would be a
+        // vulnerability rather than a bug. `third_party` is first and is not conditional on
+        // anything the provider declared: an upstream's `ToolContract` is built from a remote
+        // server's `tools/list` response, so `effect` is attacker-controlled, and an
+        // implementation that read `effect == Mutate` alone would hand a remote server the
+        // ability to switch off its own approval gate by declaring `Observe`.
+        //
+        // For a third-party tool the honest answer to "does this mutate" is that nobody here
+        // knows, and unknown belongs on the gated side (M6). Keyed off the resolved provider
+        // rather than the tool name, because the name carries no information here. Inert while
+        // auto_approve is true, which is the default and what the live policy runs.
         let third_party = !provider.provider_id().is_empty();
         let mut require_approval =
-            !policy.auto_approve && (tool_is_mutating(&local_name) || third_party);
-        if let Some(ref abac) = self.abac {
+            !policy.auto_approve && (third_party || declared.effect == ToolEffect::Mutate);
+
+        // Cloned out of the lock, and the guard dropped at the end of this statement, BEFORE
+        // the `await` below. `parking_lot::RwLockReadGuard` is `!Send` and `dispatch` is served
+        // from an axum handler, so a guard alive across the await makes this future `!Send`
+        // (RC-D7, RC-10).
+        let abac = self.abac.read().clone();
+        if let Some(ref abac) = abac {
             match abac.evaluate(&ctx, tool_name, &args) {
                 AbacDecision::Deny(reason) => {
                     let denied = ToolCallResult::err_with_metadata(
@@ -693,7 +661,7 @@ impl Router {
                             "Review ABAC policy constraints or request approval through the configured workflow.",
                         ),
                     );
-                    audit_record(&self.audit, tool_name, &ctx, &denied, started);
+                    audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
                     return denied;
                 }
                 AbacDecision::RequireApproval => {
@@ -705,13 +673,13 @@ impl Router {
         if require_approval {
             // No approval workflow configured is a refusal, not a pass: this is
             // the fail-closed half of the gate and it must stay first.
-            let Some(abac) = self.abac.as_ref() else {
+            let Some(abac) = abac.as_ref() else {
                 let denied = ToolCallResult::err_with_metadata(
                     "Approval required (auto_approve is disabled) but no approval workflow is configured".to_string(),
                     "policy_denied",
                     Some("Enable auto_approve or configure an ABAC approval workflow before invoking mutating tools."),
                 );
-                audit_record(&self.audit, tool_name, &ctx, &denied, started);
+                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
                 return denied;
             };
             // Block until human approves or timeout fires (fail closed).
@@ -722,56 +690,76 @@ impl Router {
                     "approval_denied",
                     Some("Retry only after operator approval or adjust the HITL policy."),
                 );
-                audit_record(&self.audit, tool_name, &ctx, &denied, started);
+                audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
                 return denied;
             }
         }
 
-        // - Stage 2: Provider call -
-        let result = provider.call(&local_name, args, &ctx).await;
+        // - Stage 5b: reserved for secret resolution, owned by NMCP-SPEC-002 -
+        //
+        // Named rather than omitted, per INV-6. Its position is fixed by NMCP-SPEC-003 section
+        // 4.6 and nothing else about it is that spec's to say: it sits after the approval gate,
+        // because resolving a credential for a call a human then refuses is a use that should
+        // never have happened, and before the intent record below, because that record names the
+        // key, version and binding decision and a record written ahead of the decision it
+        // describes asserts an outcome that could not have been known. Resolved material would
+        // reach the provider through `CallContext::secrets`, which is carried and empty on every
+        // call today. Owner: NMCP-SPEC-002, issues I-032 and I-033.
 
-        // - Stage 3: AuditRing -
-        audit_record(&self.audit, tool_name, &ctx, &result, started);
+        // - Stage 6: audit intent record -
+        //
+        // INV-3's gate in the ring (RC-16). Durable before any effect, and written only once
+        // every gate above has said yes, so an intent record is a statement that this call was
+        // about to run rather than that somebody asked for it.
+        audit_intent(&self.audit, tool_name, &ctx, permission);
+
+        // - Stage 7: provider call -
+        //
+        // The provider sees arguments, context and proof, and nothing else. `granted` is
+        // unforgeable outside `nmcp-schema`, so there is no expression that reaches this line
+        // without stage 4 having returned `Ok` (RC-A2).
+        let result = provider.call(&local_name, args, &ctx, &granted).await;
+
+        // - Stage 8: audit outcome record -
+        audit_record(&self.audit, tool_name, &ctx, &result, permission, started);
 
         result
     }
+}
 
-    fn resolve(&self, tool_name: &str) -> Option<(Arc<dyn ToolProvider>, String)> {
-        let providers = self.providers.read();
-        for provider in providers.iter() {
-            let provider_id = provider.provider_id();
-            for local in provider.tool_names() {
-                if provider_id.is_empty() && local == tool_name {
-                    return Some((provider.clone(), local));
-                }
-                if public_tool_name(provider_id, &local) == tool_name {
-                    return Some((provider.clone(), local));
-                }
-                if !provider_id.is_empty() {
-                    let legacy = format!("{provider_id}::{local}");
-                    if legacy == tool_name {
-                        return Some((provider.clone(), local));
-                    }
-                }
-            }
-        }
-        None
+/// RC-10, the compile-time half, and the reason the ABAC handle is cloned out of its lock.
+///
+/// Never called. It exists so the compiler refuses a `dispatch` whose future is `!Send`, which
+/// is what a `parking_lot` guard held across the `wait_for_approval` await produces. The failure
+/// this pins is not hypothetical: NMCP-SPEC-003 RC-D7 records it as one of the compile-level
+/// defects an adversarial review found in the v0.1 signatures, and an axum handler is where it
+/// would surface, one crate away from the code that caused it.
+///
+/// `assert_send::<T>()` is reached through a reference so the opaque future type can be
+/// inferred; there is no way to name it directly.
+#[allow(dead_code)]
+fn dispatch_future_is_send(router: &Router, args: Value, ctx: CallContext) {
+    fn assert_send<T: Send>() {}
+    fn over<T: Send>(_: &T) {
+        assert_send::<T>();
     }
+    over(&router.dispatch("tool", args, ctx));
 }
 
 // - Shared handle -
 
 /// Clone-cheap handle to the router.
-/// `register()` uses an internal `RwLock` so providers can be added at runtime
+/// `register()` goes through the registry's own lock so providers can be added at runtime
 /// without restarting the daemon.
 pub type SharedRouter = Arc<Router>;
 
-/// `make_router`.
+/// Build a shared router over a policy handle, an audit sink and a tool registry.
 pub fn make_router(
     policy: Arc<parking_lot::RwLock<PolicyConfig>>,
     audit: AuditSink,
+    registry: Arc<dyn ToolRegistry>,
 ) -> SharedRouter {
-    Arc::new(Router::new(policy, audit))
+    Arc::new(Router::new(policy, audit, registry))
 }
 
 // - Tests -
@@ -790,11 +778,19 @@ mod tests {
         clippy::indexing_slicing,
         clippy::panic
     )]
+    // Three tests here drive a whole ring or a whole grid and are long because the thing they
+    // measure is long: the frozen stage order is nine stages, and RC-6's oracle is the deleted
+    // table. Splitting either into helpers would put the ordering somewhere other than where it
+    // is read, which is the same argument `dispatch` itself carries.
+    #![allow(clippy::too_many_lines)]
     use super::*;
     // The trait moved to `nmcp-schema` and the ring no longer names the attribute, but the
     // test providers below still implement an async trait method and so still need it.
     use async_trait::async_trait;
-    use nmcp_schema::{ToolAuthority, ToolContract, ToolEffect, ToolReach};
+    use nmcp_host::IndexedToolRegistry;
+    use nmcp_policy::RootRule;
+    use nmcp_schema::{GrantedAuthority, ToolContract, ToolReach};
+    use serde_json::json;
     use std::sync::Arc;
 
     /// M4-1. The Event Log class comes from the permission the ring required, and the mapping
@@ -869,40 +865,42 @@ mod tests {
         }
     }
 
-    /// M4-1. The permission on the record is the one the policy spec declares for the tool,
-    /// taken from the spec rather than from anything the caller sent.
-    #[test]
-    fn the_authorization_record_names_the_capability_the_ring_required() {
-        let spec = tool_policy_spec("write_text_file").expect("write_text_file has a spec");
-        assert_eq!(spec.permission.as_str(), "write");
-        assert_eq!(
-            nmcp_policy::Permission::Execute.as_str(),
-            "execute",
-            "the name on the record is the name policy serializes, or a policy file and an \
-             audit record disagree about the same capability"
-        );
-        assert!(
-            tool_policy_spec("an_upstream_tool_nobody_declared").is_none(),
-            "a tool with no spec carries no permission rather than a guessed one"
-        );
-    }
-
-    fn make_test_router() -> Router {
-        let policy = Arc::new(parking_lot::RwLock::new(PolicyConfig::default()));
-        let audit = AuditSink::open(
-            std::env::temp_dir().join(format!("nmcp-router-test-{}.jsonl", uuid::Uuid::new_v4())),
-        )
-        .unwrap();
-        Router::new(policy, audit)
-    }
-
-    /// One declared tool for a test provider.
+    /// A router over a fresh audit file, the default policy and a real registry.
     ///
-    /// NMCP-SPEC-003 section 4.3 makes `contract_version` and `contracts` required, so every
-    /// provider in this module gains both. Nothing in the ring reads them: `resolve` and
-    /// `merged_tool_list_for` still go through `tool_names` and `tool_list`, which every
-    /// provider here still overrides byte for byte. That is why every assertion in this file
-    /// is the assertion it was before the trait moved.
+    /// The registry is `nmcp_host::IndexedToolRegistry`, the one the kernel ships, rather than
+    /// a stand-in. NMCP-SPEC-003 RC-D1 puts the index in `nmcp-host` and `nmcp-host` will
+    /// depend on this crate, so reaching it from here is a dev-dependency; a second index
+    /// written to make these tests compile would mean every ring assertion below was measured
+    /// against a fake, which is the one thing they must not be.
+    fn make_test_router() -> Router {
+        router_with(PolicyConfig::default(), None)
+    }
+
+    /// The registry and the router read one policy handle, not two copies.
+    ///
+    /// `list_for` answers profile scoping and caller allowlists from policy, and `dispatch`
+    /// answers the same questions from the same place. Two handles is how a session comes to
+    /// see a tool it cannot call.
+    fn router_over(policy: PolicyConfig, audit: AuditSink) -> Router {
+        let policy = Arc::new(parking_lot::RwLock::new(policy));
+        let registry = Arc::new(IndexedToolRegistry::new(Arc::clone(&policy)));
+        Router::new(policy, audit, registry)
+    }
+
+    fn temp_audit(label: &str) -> (std::path::PathBuf, AuditSink) {
+        let path = std::env::temp_dir().join(format!(
+            "nmcp-router-{label}-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let sink = AuditSink::open(&path).unwrap();
+        (path, sink)
+    }
+
+    /// One declared tool for a test provider, needing no root-scoped authority.
+    ///
+    /// The shape a first-party tool with no entry in the deleted policy table had: the ring
+    /// asked nothing of it then and asks nothing of it now, so `echo` and the namespaced
+    /// fixtures below still reach their provider on an empty policy exactly as they did.
     fn test_contract(name: &str, effect: ToolEffect) -> ToolContract {
         ToolContract {
             name: name.to_string(),
@@ -915,7 +913,25 @@ mod tests {
                 effect,
                 reach: ToolReach::Local,
             },
+            // Every fixture in this module is first-party or is an upstream that publishes
+            // nothing, and RC-21 refuses a first-party tool that carries this at all.
+            published_annotations: None,
         }
+    }
+
+    /// The same, declaring what the deleted `tool_policy_spec` said about this tool.
+    ///
+    /// The two fixtures that had a table entry, `write_text_file` and `dev.git_publish`, now
+    /// declare it. That is a change of setup and not of assertion: the ring required `write` on
+    /// the path argument before this commit and requires it after, and the tests that drive
+    /// them measure the same thing at the same policy. Without the declaration those tools
+    /// would ask for nothing, and the tests would keep passing while measuring less, which is
+    /// the failure mode this whole PR is written against.
+    fn specced_contract(name: &str, permission: Permission, effect: ToolEffect) -> ToolContract {
+        let mut contract = test_contract(name, effect);
+        contract.authority.permission = Some(permission);
+        contract.authority.path_args = vec!["path".to_string()];
+        contract
     }
 
     struct EchoProvider;
@@ -931,19 +947,19 @@ mod tests {
         fn contracts(&self) -> Vec<ToolContract> {
             vec![test_contract("echo", ToolEffect::Observe)]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["echo".into()]
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "echo", "description": "Echo args back", "inputSchema": {}})]
-        }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(args)
         }
     }
 
-    // Provider whose tool maps to a mutating permission (Write) in tool_policy_spec,
-    // used to exercise the auto_approve gate.
+    // Provider whose tool declares a mutating permission (Write) on `path`, which is what
+    // the deleted table said about `write_text_file`. Used to exercise the auto_approve gate.
     struct WriteProvider;
 
     #[async_trait]
@@ -955,15 +971,19 @@ mod tests {
             ""
         }
         fn contracts(&self) -> Vec<ToolContract> {
-            vec![test_contract("write_text_file", ToolEffect::Mutate)]
+            vec![specced_contract(
+                "write_text_file",
+                Permission::Write,
+                ToolEffect::Mutate,
+            )]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["write_text_file".into()]
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "write_text_file", "description": "write", "inputSchema": {}})]
-        }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(args)
         }
     }
@@ -1000,47 +1020,14 @@ mod tests {
     }
 
     fn router_with(policy: PolicyConfig, abac: Option<Arc<dyn AbacCheck>>) -> Router {
-        let audit = AuditSink::open(
-            std::env::temp_dir().join(format!("nmcp-router-abac-{}.jsonl", uuid::Uuid::new_v4())),
-        )
-        .unwrap();
-        let mut router = Router::new(Arc::new(parking_lot::RwLock::new(policy)), audit);
+        let (_, audit) = temp_audit("test");
+        let router = router_over(policy, audit);
         if let Some(stage) = abac {
+            // `&self`, per RC-D7. This used to need `let mut router` and had to happen before
+            // the handle was shared; the asymmetry was defensible as an accident, not a design.
             router.set_abac(stage);
         }
         router
-    }
-
-    #[test]
-    fn tool_is_mutating_classifies_correctly() {
-        // The dotted spellings are here on purpose: the classifier folds `.` to `_` before it
-        // consults the spec table, so a caller using either form gets the same verdict.
-        for name in [
-            "write_text_file",
-            "backup",
-            "execute",
-            "win_registry_write",
-            "fs.write_text_file",
-            "dev.git_publish",
-        ] {
-            assert!(tool_is_mutating(name), "{name} should be mutating");
-        }
-        for name in [
-            "list_directory",
-            "read_file_window_report",
-            "fs.list_directory",
-        ] {
-            assert!(!tool_is_mutating(name), "{name} should not be mutating");
-        }
-        // A specless name stays not-mutating here. That is right for the first-party tools
-        // that legitimately have no spec, and the third-party question is not answerable from
-        // a name at all, so `dispatch` answers it from the resolved provider instead (M6).
-        for name in ["echo", "vendor_do_something"] {
-            assert!(
-                !tool_is_mutating(name),
-                "{name} carries no information about mutation in its name alone"
-            );
-        }
     }
 
     #[tokio::test]
@@ -1052,7 +1039,7 @@ mod tests {
                 approve: true,
             })),
         );
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let ok = router
             .dispatch("echo", json!({}), CallContext::new(None))
             .await;
@@ -1065,7 +1052,7 @@ mod tests {
                 approve: false,
             })),
         );
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let denied = router
             .dispatch("echo", json!({}), CallContext::new(None))
             .await;
@@ -1085,7 +1072,7 @@ mod tests {
                 approve: true,
             })),
         );
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let denied = router
             .dispatch("echo", json!({}), CallContext::new(None))
             .await;
@@ -1111,13 +1098,41 @@ mod tests {
         fn contracts(&self) -> Vec<ToolContract> {
             vec![test_contract("do_something", ToolEffect::Observe)]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["do_something".into()]
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
+            ToolCallResult::ok(args)
         }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "do_something", "description": "unknown", "inputSchema": {}})]
+    }
+
+    struct UngovernableUpstream;
+    #[async_trait]
+    impl ToolProvider for UngovernableUpstream {
+        fn contract_version(&self) -> u32 {
+            1
         }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
+        fn provider_id(&self) -> &str {
+            "vendor"
+        }
+        fn contracts(&self) -> Vec<ToolContract> {
+            // Declares a permission no default root grants, so stage 4 would refuse it too.
+            vec![specced_contract(
+                "reach",
+                Permission::GitPublish,
+                ToolEffect::Mutate,
+            )]
+        }
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(args)
         }
     }
@@ -1215,42 +1230,27 @@ mod tests {
         assert_eq!(contract_provider(&provider), "");
     }
 
-    /// Adding `contracts` to the trait changed nothing about what this crate resolves against.
-    /// `resolve` and `merged_tool_list_for` still read `tool_names` and `tool_list`, which
-    /// every provider here still overrides, and the declaration is carried and unread until
-    /// I-047d wires the ring through the registry.
-    #[test]
-    fn the_declaration_is_carried_and_not_yet_consulted_by_the_ring() {
-        let provider = EchoProvider;
-        assert_eq!(provider.contract_version(), 1);
-        let declared = provider.contracts();
-        assert_eq!(declared.len(), 1);
-        assert_eq!(declared[0].name, "echo");
-        assert_eq!(provider.tool_names(), vec!["echo".to_string()]);
-        // The advertised entry is still the literal this provider publishes, not one derived
-        // from the declaration: the default body exists for implementors that dropped the
-        // override, and this one has not.
-        let listed = provider.tool_list();
-        assert_eq!(listed[0]["description"], "Echo args back");
-        assert!(
-            listed[0].get("annotations").is_none(),
-            "the ring's annotation step is what adds these today, and it still is"
-        );
-    }
-
     #[tokio::test]
     async fn an_unspecced_third_party_tool_is_treated_as_mutating_rather_than_trusted() {
-        // M6, first leg. tool_policy_spec is a compiled-in table of first-party tool names,
-        // so every tool from an admitted upstream falls through it. It used to fall through
-        // to "not mutating", which meant an operator who disabled auto_approve gated their
-        // own write_text_file and waved through a third party's do_something. The gate now
-        // reads the resolved provider, so unknown provenance means unknown effect.
+        // M6, first leg. The kernel's compiled-in table held first-party tool names only, so
+        // every tool from an admitted upstream fell through it to "not mutating", which meant
+        // an operator who disabled auto_approve gated their own write_text_file and waved
+        // through a third party's do_something. The gate reads the resolved provider, so
+        // unknown provenance means unknown effect. Nothing about that changed when the table
+        // was deleted: `third_party` never consulted it.
+        //
+        // This policy admits no upstream, so stage 3 refuses before the gate is reached and
+        // this test asserts the outcome rather than the mechanism. RC-13's own test,
+        // `a_third_party_tool_declaring_observe_still_requires_approval`, admits the upstream
+        // so the gate is the only thing left that can refuse.
         let policy = PolicyConfig {
             auto_approve: false,
             ..PolicyConfig::default()
         };
         let router = router_with(policy, None);
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let denied = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1271,7 +1271,7 @@ mod tests {
             ..PolicyConfig::default()
         };
         let router = router_with(policy, None);
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let ok = router
             .dispatch("echo", json!({"a": 1}), CallContext::new(None))
             .await;
@@ -1289,7 +1289,9 @@ mod tests {
             admitting(PolicyConfig::default(), &["vendor"], Permission::Execute),
             None,
         );
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let ok = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1347,7 +1349,9 @@ mod tests {
         // against a policy granting nothing. That was the gap, pinned so closing it would be
         // a visible change to a test rather than a silent one. This is that change.
         let router = router_with(policy_admitting(Some(Permission::Execute), &[]), None);
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let denied = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1365,7 +1369,9 @@ mod tests {
             policy_admitting(Some(Permission::Execute), &[Permission::Execute]),
             None,
         );
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let ok = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1383,7 +1389,9 @@ mod tests {
             ),
             None,
         );
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let denied = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1396,7 +1404,9 @@ mod tests {
         // dispatch in that state means a policy arrived by a route that did not validate.
         // Refuse rather than infer an intent nobody wrote down.
         let router = router_with(policy_admitting(None, &[Permission::Execute]), None);
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let undeclared = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1407,7 +1417,9 @@ mod tests {
 
         // And a provider whose id policy has never heard of is not a provider policy admitted.
         let router = router_with(PolicyConfig::default(), None);
-        router.register(Arc::new(ThirdPartyProvider));
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
         let unknown = router
             .dispatch("vendor_do_something", json!({}), CallContext::new(None))
             .await;
@@ -1419,7 +1431,7 @@ mod tests {
         // The local provider has an empty provider_id and is not an admitted upstream, so a
         // policy with no upstreams at all must leave it exactly as it was.
         let router = router_with(PolicyConfig::default(), None);
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let ok = router
             .dispatch("echo", json!({"a": 1}), CallContext::new(None))
             .await;
@@ -1434,7 +1446,7 @@ mod tests {
         };
         // No approval workflow configured: mutating call fails closed.
         let router = router_with(policy.clone(), None);
-        router.register(Arc::new(WriteProvider));
+        router.register(Arc::new(WriteProvider)).expect("register");
         let denied = router
             .dispatch(
                 "write_text_file",
@@ -1455,7 +1467,7 @@ mod tests {
                 approve: true,
             })),
         );
-        router.register(Arc::new(WriteProvider));
+        router.register(Arc::new(WriteProvider)).expect("register");
         let ok = router
             .dispatch(
                 "write_text_file",
@@ -1469,7 +1481,7 @@ mod tests {
     #[tokio::test]
     async fn auto_approve_on_does_not_gate_mutating_tools() {
         let router = router_with(PolicyConfig::default(), None);
-        router.register(Arc::new(WriteProvider));
+        router.register(Arc::new(WriteProvider)).expect("register");
         let ok = router
             .dispatch(
                 "write_text_file",
@@ -1491,15 +1503,19 @@ mod tests {
             ""
         }
         fn contracts(&self) -> Vec<ToolContract> {
-            vec![test_contract("dev.git_publish", ToolEffect::Mutate)]
+            vec![specced_contract(
+                "dev.git_publish",
+                Permission::GitPublish,
+                ToolEffect::Mutate,
+            )]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["dev.git_publish".into()]
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "dev.git_publish", "description": "Publish", "inputSchema": {}})]
-        }
-        async fn call(&self, _name: &str, args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(args)
         }
     }
@@ -1517,13 +1533,13 @@ mod tests {
         fn contracts(&self) -> Vec<ToolContract> {
             vec![test_contract("ping", ToolEffect::Observe)]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["ping".into()]
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "ping", "description": "Ping", "inputSchema": {}})]
-        }
-        async fn call(&self, _name: &str, _args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            _args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(json!("pong"))
         }
     }
@@ -1543,13 +1559,13 @@ mod tests {
         fn contracts(&self) -> Vec<ToolContract> {
             vec![test_contract("fetch", ToolEffect::Observe)]
         }
-        fn tool_names(&self) -> Vec<String> {
-            vec!["fetch".into()]
-        }
-        fn tool_list(&self) -> Vec<Value> {
-            vec![json!({"name": "fetch", "description": "Fetch", "inputSchema": {}})]
-        }
-        async fn call(&self, _name: &str, _args: Value, _ctx: &CallContext) -> ToolCallResult {
+        async fn call(
+            &self,
+            _name: &str,
+            _args: Value,
+            _ctx: &CallContext,
+            _granted: &GrantedAuthority,
+        ) -> ToolCallResult {
             ToolCallResult::ok(json!("fetched"))
         }
     }
@@ -1582,13 +1598,17 @@ mod tests {
             ),
             None,
         );
-        router.register(Arc::new(NamespacedProvider));
-        router.register(Arc::new(OtherUpstreamProvider));
-        router.register(Arc::new(EchoProvider));
+        router
+            .register(Arc::new(NamespacedProvider))
+            .expect("register");
+        router
+            .register(Arc::new(OtherUpstreamProvider))
+            .expect("register");
+        router.register(Arc::new(EchoProvider)).expect("register");
 
         let names = |profile: Option<&str>| -> Vec<String> {
             let mut names: Vec<String> = router
-                .merged_tool_list_for(profile)
+                .merged_tool_list_for(profile, None)
                 .iter()
                 .filter_map(|tool| tool["name"].as_str().map(String::from))
                 .collect();
@@ -1646,7 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn local_provider_dispatches() {
         let router = make_test_router();
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let ctx = CallContext::new(None);
         let result = router.dispatch("echo", json!({"msg": "hi"}), ctx).await;
         assert!(!result.is_error);
@@ -1658,7 +1678,9 @@ mod tests {
             admitting(PolicyConfig::default(), &["upstream"], Permission::Read),
             None,
         );
-        router.register(Arc::new(NamespacedProvider));
+        router
+            .register(Arc::new(NamespacedProvider))
+            .expect("register");
         let ctx = CallContext::new(None);
         let result = router.dispatch("upstream_ping", json!({}), ctx).await;
         assert!(!result.is_error);
@@ -1680,14 +1702,9 @@ mod tests {
         // AuditEvent::duration_ms. Before this, nothing on the real path ever set it: the
         // field was written only by tests, so every one of those surfaces reported on an
         // empty set while looking healthy. This test is on the producer side on purpose.
-        let path = std::env::temp_dir().join(format!(
-            "nmcp-router-duration-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let audit = AuditSink::open(&path).unwrap();
-        let policy = Arc::new(parking_lot::RwLock::new(PolicyConfig::default()));
-        let router = Router::new(policy, audit);
-        router.register(Arc::new(EchoProvider));
+        let (path, audit) = temp_audit("duration");
+        let router = router_over(PolicyConfig::default(), audit);
+        router.register(Arc::new(EchoProvider)).expect("register");
 
         // A successful provider call.
         let ok = router
@@ -1703,8 +1720,28 @@ mod tests {
         assert!(denied.is_error);
 
         let events = audit_lines(&path);
-        assert_eq!(events.len(), 2, "both calls must be audited");
-        for event in &events {
+        // Three records for two calls, and the count is the RC-16 behaviour change made
+        // visible rather than absorbed. The permitted call writes the ring's intent record at
+        // stage 6 and its outcome record at stage 8; the refused call never reaches stage 6 and
+        // writes one. This test used to assert two, which was the whole chain when the ring
+        // audited only on the way out.
+        assert_eq!(events.len(), 3, "both calls must be audited");
+        let outcomes: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| {
+                event["decision"]
+                    .as_str()
+                    .is_some_and(nmcp_audit::is_authorization_decision)
+            })
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one verdict per call, no more and no fewer"
+        );
+        // The assertion this test exists for, unchanged: every record that reached a verdict
+        // carries the duration the client actually waited.
+        for event in &outcomes {
             assert!(
                 event.get("duration_ms").is_some(),
                 "audit record is missing duration_ms: {event}"
@@ -1714,6 +1751,14 @@ mod tests {
                 "duration_ms must be a number: {event}"
             );
         }
+        // And the intent record deliberately carries neither a verdict nor a duration: the
+        // verdict is the outcome record's to state and the clock has not stopped.
+        let intents: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["decision"] == nmcp_audit::INTENT_DECISION)
+            .collect();
+        assert_eq!(intents.len(), 1, "only the permitted call reached stage 6");
+        assert!(intents[0]["duration_ms"].is_null());
         let _ = std::fs::remove_file(path);
     }
 
@@ -1742,20 +1787,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn devtools_policy_specs_cover_provider_tools() {
-        let blame = tool_policy_spec("dev_git_blame").expect("blame spec");
-        assert_eq!(blame.permission, Permission::Read);
-        let stash = tool_policy_spec("dev_git_stash_list").expect("stash spec");
-        assert_eq!(stash.permission, Permission::Read);
-        let dep = tool_policy_spec("dev_dep_graph").expect("dep graph spec");
-        assert_eq!(dep.permission, Permission::Execute);
-    }
-
     #[tokio::test]
     async fn git_publish_denial_has_specific_remediation() {
         let router = make_test_router();
-        router.register(Arc::new(PublishProvider));
+        router
+            .register(Arc::new(PublishProvider))
+            .expect("register");
         let ctx = CallContext::new(None);
         let result = router
             .dispatch("dev_git_publish", json!({"path":"."}), ctx)
@@ -1776,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn delete_guard_blocks_delete_named_tools() {
         let router = make_test_router();
-        router.register(Arc::new(EchoProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
         let ctx = CallContext::new(None);
         let result = router.dispatch("delete_file", json!({}), ctx).await;
         assert!(result.is_error);
@@ -1791,8 +1828,10 @@ mod tests {
     #[tokio::test]
     async fn merged_tool_list_namespaces_upstream() {
         let router = make_test_router();
-        router.register(Arc::new(EchoProvider));
-        router.register(Arc::new(NamespacedProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
+        router
+            .register(Arc::new(NamespacedProvider))
+            .expect("register");
         let list = router.merged_tool_list();
         let names: Vec<&str> = list.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"echo"));
@@ -1807,8 +1846,10 @@ mod tests {
         // server is in no position to make that claim on its behalf, so the boundary
         // matters as much as the annotation does.
         let router = make_test_router();
-        router.register(Arc::new(EchoProvider));
-        router.register(Arc::new(NamespacedProvider));
+        router.register(Arc::new(EchoProvider)).expect("register");
+        router
+            .register(Arc::new(NamespacedProvider))
+            .expect("register");
         let list = router.merged_tool_list();
 
         let local = list
@@ -1838,5 +1879,1095 @@ mod tests {
         assert!(!contains_delete_intent("list_roots"));
         assert!(!contains_delete_intent("write_text_file"));
         assert!(!contains_delete_intent("execute_start"));
+    }
+
+    // - RC-13: the approval gate, and the one line where trusting a declaration is a hole -
+
+    /// RC-13's specific requirement, and the M6 regression guard the spec calls not optional.
+    ///
+    /// A third-party provider declaring `ToolEffect::Observe` still requires approval when
+    /// `auto_approve` is false. This is the assertion that fails if somebody rewrites the gate
+    /// as `!auto_approve && effect == Mutate` and drops the `third_party` disjunct as
+    /// redundant, which is the obvious tidy-up and which would hand a remote MCP server the
+    /// ability to switch off its own approval gate by declaring itself harmless: an upstream's
+    /// `ToolContract` is built from that server's `tools/list` response, so `effect` is
+    /// attacker-controlled data (RC-D4).
+    ///
+    /// `an_unspecced_third_party_tool_is_treated_as_mutating_rather_than_trusted` is the older
+    /// test for the same rule and it stays, but it cannot carry this claim on its own: its
+    /// policy admits no upstream, so it is refused at stage 3 and never reaches the gate. This
+    /// one admits the upstream properly, so stage 5 is the only thing left that can refuse it.
+    #[tokio::test]
+    async fn a_third_party_tool_declaring_observe_still_requires_approval() {
+        let admitted = admitting(
+            PolicyConfig {
+                auto_approve: false,
+                ..PolicyConfig::default()
+            },
+            &["vendor"],
+            Permission::Execute,
+        );
+
+        // The declaration says Observe. Nothing else about this call is refusable: the
+        // upstream is admitted, the tool needs no root-scoped authority, and no ABAC rule
+        // matches. With no approval workflow configured the gate fails closed.
+        let router = router_with(admitted.clone(), None);
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
+        assert_eq!(
+            router
+                .registry
+                .authority_of("vendor_do_something")
+                .expect("the declaration is indexed")
+                .effect,
+            ToolEffect::Observe,
+            "the fixture must declare Observe or this test is measuring nothing"
+        );
+        let denied = router
+            .dispatch("vendor_do_something", json!({}), CallContext::new(None))
+            .await;
+        assert!(
+            denied.is_error,
+            "a third party declaring Observe must still be gated: {denied:?}"
+        );
+        assert_eq!(
+            denied.structured_content.clone().unwrap()["error_kind"],
+            "policy_denied",
+            "the refusal is the approval gate failing closed, not a policy denial elsewhere"
+        );
+        assert!(
+            denied.content[0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Approval required"),
+            "the refusal must name the gate that refused: {denied:?}"
+        );
+
+        // And with an approver attached, the same call is put to a human rather than run.
+        // Denying at the prompt refuses it, which is the other half of the gate having fired.
+        let router = router_with(
+            admitted,
+            Some(Arc::new(StubAbac {
+                mode: StubMode::Allow,
+                approve: false,
+            })),
+        );
+        router
+            .register(Arc::new(ThirdPartyProvider))
+            .expect("register");
+        let refused = router
+            .dispatch("vendor_do_something", json!({}), CallContext::new(None))
+            .await;
+        assert_eq!(
+            refused.structured_content.unwrap()["error_kind"],
+            "approval_denied",
+            "the call reached the human gate, which is what `third_party` being first buys"
+        );
+    }
+
+    /// The same rule read from the other side: a first-party tool declaring `Observe` is not
+    /// gated, so the disjunct above is doing work rather than gating everything.
+    ///
+    /// Without this, an implementation that gated every call when `auto_approve` is off would
+    /// pass the test above and be indistinguishable from a correct one.
+    #[tokio::test]
+    async fn a_first_party_tool_declaring_observe_is_not_gated() {
+        let router = router_with(
+            PolicyConfig {
+                auto_approve: false,
+                ..PolicyConfig::default()
+            },
+            None,
+        );
+        router.register(Arc::new(EchoProvider)).expect("register");
+        let ok = router
+            .dispatch("echo", json!({"a": 1}), CallContext::new(None))
+            .await;
+        assert!(!ok.is_error, "{ok:?}");
+    }
+
+    /// The gate reads the declaration for a first-party tool, which is what replaced the
+    /// name-keyed `tool_is_mutating`. Declared `Mutate` is gated; the same provider declaring
+    /// `Observe` is not. Both at one policy, so the declaration is the only variable.
+    #[tokio::test]
+    async fn the_first_party_half_of_the_gate_reads_the_declared_effect() {
+        struct Declaring(ToolEffect);
+        #[async_trait]
+        impl ToolProvider for Declaring {
+            fn contract_version(&self) -> u32 {
+                1
+            }
+            fn provider_id(&self) -> &str {
+                ""
+            }
+            fn contracts(&self) -> Vec<ToolContract> {
+                vec![test_contract("thing", self.0)]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                args: Value,
+                _ctx: &CallContext,
+                _granted: &GrantedAuthority,
+            ) -> ToolCallResult {
+                ToolCallResult::ok(args)
+            }
+        }
+
+        for (effect, gated) in [(ToolEffect::Observe, false), (ToolEffect::Mutate, true)] {
+            let router = router_with(
+                PolicyConfig {
+                    auto_approve: false,
+                    ..PolicyConfig::default()
+                },
+                None,
+            );
+            router
+                .register(Arc::new(Declaring(effect)))
+                .expect("register");
+            let result = router
+                .dispatch("thing", json!({}), CallContext::new(None))
+                .await;
+            assert_eq!(
+                result.is_error,
+                gated,
+                "{effect:?} must {} be gated when auto_approve is off",
+                if gated { "" } else { "not" }
+            );
+        }
+    }
+
+    // - RC-16 and the ring order -
+
+    /// NMCP-SPEC-003 section 4.6, observed rather than asserted from the source.
+    ///
+    /// Each stage is made to refuse in turn, and the stage that answers is identified by the
+    /// reason it gives. The order is frozen, so this is what fails if somebody moves the
+    /// upstream admission check above the profile check, or authorization above either.
+    ///
+    /// The delete guard is first and is checked against a name no provider registered, which is
+    /// the property RC-A3 states: it does not depend on the registry having resolved anything.
+    #[tokio::test]
+    async fn the_ring_refuses_in_the_frozen_stage_order() {
+        fn kind(result: &ToolCallResult) -> String {
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value["error_kind"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        }
+        fn text(result: &ToolCallResult) -> String {
+            result.content[0]["text"].as_str().unwrap_or("").to_string()
+        }
+
+        // Stage 0 beats stage 1: a delete-named tool nothing registered is refused by the
+        // guard, not reported as unknown.
+        let router = make_test_router();
+        let refused = router
+            .dispatch("delete_file", json!({}), CallContext::new(None))
+            .await;
+        assert!(text(&refused).contains("no-delete invariant"));
+
+        // Stage 1: an unknown name is refused before anything reads policy.
+        let unknown = router
+            .dispatch("nonexistent", json!({}), CallContext::new(None))
+            .await;
+        assert_eq!(kind(&unknown), "command_not_found");
+
+        // Stage 2 beats stage 3: an upstream outside the session profile is refused for the
+        // profile even though policy also admits no upstream by that name, which is the
+        // stage-3 refusal waiting behind it.
+        let router = router_with(policy_with_reading_profile(), None);
+        router
+            .register(Arc::new(OtherUpstreamProvider))
+            .expect("register");
+        let scoped = CallContext::new(None).with_profile(Some("reading".to_string()));
+        let profile_refusal = router.dispatch("partner_fetch", json!({}), scoped).await;
+        assert!(
+            text(&profile_refusal).contains("gateway profile"),
+            "stage 2 answers before stage 3: {}",
+            text(&profile_refusal)
+        );
+        let admission_refusal = router
+            .dispatch("partner_fetch", json!({}), CallContext::new(None))
+            .await;
+        assert!(
+            text(&admission_refusal).contains("no upstream named"),
+            "and with the profile satisfied, stage 3 is what refuses: {}",
+            text(&admission_refusal)
+        );
+
+        // Stage 3 beats stage 4: an unadmitted upstream is refused for admission even when its
+        // declaration would also fail authorization.
+        let router = router_with(PolicyConfig::default(), None);
+        router
+            .register(Arc::new(UngovernableUpstream))
+            .expect("register");
+        let admission = router
+            .dispatch("vendor_reach", json!({}), CallContext::new(None))
+            .await;
+        assert!(
+            text(&admission).contains("no upstream named"),
+            "stage 3 answers before stage 4: {}",
+            text(&admission)
+        );
+
+        // Stage 4 beats stage 5: a call that fails authorization is refused there rather than
+        // being put to a human, even with auto_approve off and an approver that would say yes.
+        let router = router_with(
+            PolicyConfig {
+                auto_approve: false,
+                ..PolicyConfig::default()
+            },
+            // An approver that refuses. If stage 5 ran before stage 4 the answer would be
+            // `approval_denied`; it is `policy_denied` naming the declared permission, so
+            // authorization answered first.
+            Some(Arc::new(StubAbac {
+                mode: StubMode::RequireApproval,
+                approve: false,
+            })),
+        );
+        router
+            .register(Arc::new(PublishProvider))
+            .expect("register");
+        let authorization = router
+            .dispatch(
+                "dev_git_publish",
+                json!({"path": "."}),
+                CallContext::new(None),
+            )
+            .await;
+        assert_eq!(
+            kind(&authorization),
+            "policy_denied",
+            "stage 4 answered, not stage 5, whose approver would have said no: {}",
+            text(&authorization)
+        );
+        assert!(
+            authorization
+                .structured_content
+                .as_ref()
+                .is_some_and(|value| {
+                    value["remediation"]
+                        .as_str()
+                        .is_some_and(|remediation| remediation.contains("git.publish"))
+                }),
+            "and it refused on the declared permission: {authorization:?}"
+        );
+    }
+
+    /// RC-16, and INV-3 expressed in the ring: the intent record is durable before the provider
+    /// is reached, and no effect is observable before it.
+    ///
+    /// Asserted from inside the provider, which is the only place that can see the ordering:
+    /// the provider reads the audit file it is about to be recorded in, and finds its own
+    /// intent record already there. A ring that wrote the record after the call, which is what
+    /// both trees did before this commit, fails here rather than passing on a comment.
+    #[tokio::test]
+    async fn the_intent_record_is_durable_before_the_provider_runs() {
+        struct Observing {
+            audit_path: std::path::PathBuf,
+            seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        }
+        #[async_trait]
+        impl ToolProvider for Observing {
+            fn contract_version(&self) -> u32 {
+                1
+            }
+            fn provider_id(&self) -> &str {
+                ""
+            }
+            fn contracts(&self) -> Vec<ToolContract> {
+                vec![test_contract("observe", ToolEffect::Observe)]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                args: Value,
+                _ctx: &CallContext,
+                _granted: &GrantedAuthority,
+            ) -> ToolCallResult {
+                // The effect, such as it is, has not happened yet. What is on disk at this
+                // instant is what INV-3 requires to be there before it does.
+                *self.seen.lock().unwrap() = audit_lines(&self.audit_path);
+                ToolCallResult::ok(args)
+            }
+        }
+
+        let (path, audit) = temp_audit("intent");
+        let router = router_over(PolicyConfig::default(), audit);
+        let provider = Arc::new(Observing {
+            audit_path: path.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        router
+            .register(Arc::clone(&provider) as Arc<dyn ToolProvider>)
+            .expect("register");
+
+        let ok = router
+            .dispatch("observe", json!({}), CallContext::new(None))
+            .await;
+        assert!(!ok.is_error);
+
+        let before_the_effect = provider.seen.lock().unwrap().clone();
+        assert_eq!(
+            before_the_effect.len(),
+            1,
+            "exactly the intent record is durable when the provider is entered"
+        );
+        assert_eq!(
+            before_the_effect[0]["decision"],
+            nmcp_audit::INTENT_DECISION
+        );
+
+        // And the pair shares one call_id, which is what lets a reader join an intent to its
+        // outcome and find an intent that never got one.
+        let all = audit_lines(&path);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["call_id"], all[1]["call_id"]);
+        assert_ne!(all[0]["call_id"], serde_json::Value::Null);
+        assert_eq!(all[1]["decision"], nmcp_audit::ALLOWED_DECISION);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A refused call writes no intent record, because it never intended to act.
+    ///
+    /// The other half of the gate ordering: stage 6 sits below every refusal, so an intent with
+    /// no outcome means a call that started and did not finish rather than a call that was
+    /// denied.
+    #[tokio::test]
+    async fn a_refused_call_writes_no_intent_record() {
+        let (path, audit) = temp_audit("refused-intent");
+        let router = router_over(PolicyConfig::default(), audit);
+        router
+            .register(Arc::new(PublishProvider))
+            .expect("register");
+
+        let denied = router
+            .dispatch(
+                "dev_git_publish",
+                json!({"path": "."}),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(denied.is_error);
+
+        let events = audit_lines(&path);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["decision"], nmcp_audit::DENIED_DECISION);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// M4-1, carried forward from `the_authorization_record_names_the_capability_the_ring_
+    /// required`, which read the deleted table directly.
+    ///
+    /// The claim is unchanged: the record names the capability the ring required, taken from
+    /// the tool rather than from anything the caller sent, so a SIEM rule can separate a read
+    /// from an execution without parsing a body. Only the source moved, from a compiled-in
+    /// table keyed by tool name to the declaration the ring actually authorized against, which
+    /// is the point of the whole commit.
+    #[tokio::test]
+    async fn the_authorization_record_names_the_capability_the_ring_required() {
+        let (path, audit) = temp_audit("permission");
+        let router = router_over(PolicyConfig::default(), audit);
+        router.register(Arc::new(WriteProvider)).expect("register");
+        router.register(Arc::new(EchoProvider)).expect("register");
+
+        let ok = router
+            .dispatch(
+                "write_text_file",
+                json!({"path": "."}),
+                CallContext::new(None),
+            )
+            .await;
+        assert!(!ok.is_error, "{ok:?}");
+
+        // A tool that declares no root-scoped permission carries none rather than a guessed
+        // one, which is what every specless tool did under the table too.
+        let ok = router
+            .dispatch("echo", json!({}), CallContext::new(None))
+            .await;
+        assert!(!ok.is_error);
+
+        // And a call refused before its declaration was read carries none either.
+        let unknown = router
+            .dispatch("nonexistent", json!({}), CallContext::new(None))
+            .await;
+        assert!(unknown.is_error);
+
+        let events = audit_lines(&path);
+        let permission_of = |action: &str| -> Option<String> {
+            events
+                .iter()
+                .find(|event| {
+                    event["action"] == action
+                        && event["decision"]
+                            .as_str()
+                            .is_some_and(nmcp_audit::is_authorization_decision)
+                })
+                .and_then(|event| event["permission"].as_str().map(String::from))
+        };
+        assert_eq!(
+            permission_of("write_text_file").as_deref(),
+            Some("write"),
+            "the name on the record is the name policy serializes, or a policy file and an \
+             audit record disagree about the same capability"
+        );
+        assert_eq!(Permission::Write.as_str(), "write");
+        assert_eq!(permission_of("echo"), None);
+        assert_eq!(permission_of("nonexistent"), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // - RC-10: the mutability rule and the Send property -
+
+    /// RC-10. Every wire-up method takes `&self`, so a router already behind an `Arc` is still
+    /// a router an upstream and an approval workflow can be attached to. Asserted by doing it:
+    /// none of these compile against a `&mut self` receiver.
+    #[tokio::test]
+    async fn every_wire_up_method_is_callable_through_a_shared_handle() {
+        let shared: SharedRouter = Arc::new(router_with(
+            admitting(PolicyConfig::default(), &["upstream"], Permission::Read),
+            None,
+        ));
+        let handle = Arc::clone(&shared);
+        handle
+            .register(Arc::new(NamespacedProvider))
+            .expect("register through an Arc");
+        handle.set_abac(Arc::new(StubAbac {
+            mode: StubMode::Allow,
+            approve: true,
+        }));
+        let ok = handle
+            .dispatch("upstream_ping", json!({}), CallContext::new(None))
+            .await;
+        assert!(!ok.is_error, "{ok:?}");
+        assert!(handle.unregister_provider("upstream"));
+        let gone = handle
+            .dispatch("upstream_ping", json!({}), CallContext::new(None))
+            .await;
+        assert!(gone.is_error, "an unregistered provider resolves nothing");
+    }
+
+    /// RC-10's other half, at run time rather than compile time.
+    ///
+    /// `dispatch_future_is_send` in this crate's production code is the compile-time assertion
+    /// and is the one that matters; this drives the future across a `tokio::spawn`, which is
+    /// where an axum handler would put it, so the property is exercised as well as asserted.
+    #[tokio::test]
+    async fn the_dispatch_future_crosses_a_spawn() {
+        let router: SharedRouter = Arc::new(router_with(
+            PolicyConfig::default(),
+            Some(Arc::new(StubAbac {
+                mode: StubMode::RequireApproval,
+                approve: true,
+            })),
+        ));
+        router.register(Arc::new(EchoProvider)).expect("register");
+        // RequireApproval forces the `wait_for_approval` await, which is the await a guard held
+        // across would make this future `!Send`.
+        let handle = tokio::spawn(async move {
+            router
+                .dispatch("echo", json!({}), CallContext::new(None))
+                .await
+        });
+        let ok = handle.await.expect("the spawned dispatch completes");
+        assert!(!ok.is_error);
+    }
+
+    /// RC-9 through the ring rather than through the registry alone: dispatch resolves without
+    /// asking any provider to enumerate anything.
+    #[tokio::test]
+    async fn dispatch_never_asks_a_provider_to_enumerate() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl ToolProvider for Counting {
+            fn contract_version(&self) -> u32 {
+                1
+            }
+            fn provider_id(&self) -> &str {
+                ""
+            }
+            fn contracts(&self) -> Vec<ToolContract> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![test_contract("counted", ToolEffect::Observe)]
+            }
+            async fn call(
+                &self,
+                _name: &str,
+                args: Value,
+                _ctx: &CallContext,
+                _granted: &GrantedAuthority,
+            ) -> ToolCallResult {
+                ToolCallResult::ok(args)
+            }
+        }
+
+        let router = make_test_router();
+        let provider = Arc::new(Counting(std::sync::atomic::AtomicUsize::new(0)));
+        router
+            .register(Arc::clone(&provider) as Arc<dyn ToolProvider>)
+            .expect("register");
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..500 {
+            let ok = router
+                .dispatch("counted", json!({}), CallContext::new(None))
+                .await;
+            assert!(!ok.is_error);
+        }
+        assert_eq!(
+            provider.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "five hundred dispatches asked the provider to enumerate again"
+        );
+    }
+
+    // - RC-6: the full oracle -
+
+    /// One entry of the deleted `tool_policy_spec` table, captured as test data.
+    ///
+    /// Copied out of `nmcp-router` at the commit before this one, verbatim: the names after the
+    /// `.` to `_` fold that function applied, the permission it required, the path arguments it
+    /// tried in order, and whether it demanded the Windows API grant. RC-6 grades the new
+    /// authorization path against these semantics in both directions, so the table has to
+    /// survive its own deletion as data or there is nothing to grade against.
+    struct OldSpec {
+        names: &'static [&'static str],
+        permission: Permission,
+        path_args: &'static [&'static str],
+        require_windows_api: bool,
+        /// The subset of `path_args` the tool's own input schema defines, which is what RC-D5
+        /// forces a declaration to carry and what RC-20 makes load-bearing.
+        ///
+        /// Grounded rather than asserted: `the_oracle_schema_subsets_match_the_shipped_catalogue`
+        /// below recomputes it from `nmcp_proto::tool_list` for every name that catalogue
+        /// carries. The dev tools are graded against their real schemas in `nmcp-devtools`'
+        /// `the_ring_authorizes_the_argument_the_provider_reads`, and the Windows entry declares
+        /// no path argument at all, so the filter is a no-op there.
+        declared_path_args: &'static [&'static str],
+    }
+
+    const PATH_ARG_REPO: &[&str] = &["repo", "repo_path", "repository", "repository_path", "path"];
+    const PATH_ARG_DEV: &[&str] = &["path", "repo", "repo_path", "cwd"];
+
+    /// The whole of the deleted table. Fourteen entries, about forty names.
+    const OLD_TOOL_POLICY_SPEC: &[OldSpec] = &[
+        OldSpec {
+            names: &["execute", "execute_start"],
+            permission: Permission::Execute,
+            path_args: &["cwd"],
+            require_windows_api: false,
+            declared_path_args: &["cwd"],
+        },
+        OldSpec {
+            names: &["execute_resolve_program"],
+            permission: Permission::Execute,
+            path_args: &["program"],
+            require_windows_api: false,
+            declared_path_args: &["program"],
+        },
+        OldSpec {
+            names: &[
+                "read_text_file",
+                "fs_read_text_file",
+                "read_file_window_report",
+                "inspect_file_integrity",
+            ],
+            permission: Permission::Read,
+            path_args: &["path"],
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &["create_text_file"],
+            permission: Permission::Create,
+            path_args: &["path"],
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &[
+                "write_text_file",
+                "patch_text_file",
+                "fs_write_text_file",
+                "fs_patch_text_file",
+            ],
+            permission: Permission::Write,
+            path_args: &["path"],
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &["list_directory", "fs_list_directory"],
+            permission: Permission::List,
+            path_args: &["path"],
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &["rename", "fs_rename", "rename_file"],
+            permission: Permission::Rename,
+            path_args: &["from"],
+            require_windows_api: false,
+            declared_path_args: &["from"],
+        },
+        OldSpec {
+            names: &["move", "fs_move", "move_file"],
+            permission: Permission::Move,
+            path_args: &["from"],
+            require_windows_api: false,
+            declared_path_args: &["from"],
+        },
+        OldSpec {
+            names: &["backup", "fs_backup", "backup_file"],
+            permission: Permission::Backup,
+            path_args: &["path"],
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &[
+                "search_repo",
+                "scan_repo",
+                "dev_search_repo",
+                "dev_scan_repo",
+            ],
+            permission: Permission::Search,
+            path_args: PATH_ARG_DEV,
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &[
+                "git_status",
+                "git_diff",
+                "git_log",
+                "dev_git_status",
+                "dev_git_diff",
+                "dev_git_log",
+                "git_blame",
+                "dev_git_blame",
+                "git_stash_list",
+                "dev_git_stash_list",
+            ],
+            permission: Permission::Read,
+            path_args: PATH_ARG_REPO,
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &["git_publish", "dev_git_publish"],
+            permission: Permission::GitPublish,
+            path_args: PATH_ARG_REPO,
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &["test_run", "dev_test_run", "dep_graph", "dev_dep_graph"],
+            permission: Permission::Execute,
+            path_args: PATH_ARG_DEV,
+            require_windows_api: false,
+            declared_path_args: &["path"],
+        },
+        OldSpec {
+            names: &[
+                "win_registry_read",
+                "win_registry_write",
+                "win_eventlog_query",
+                "win_services_query",
+                "win_wmi_query",
+            ],
+            permission: Permission::Read,
+            path_args: &[],
+            require_windows_api: true,
+            declared_path_args: &[],
+        },
+    ];
+
+    /// The deleted `policy_check`, reproduced as the RC-6 oracle.
+    ///
+    /// Every branch of it, in its order: the `win_registry_write` special case that demanded
+    /// two grants and then returned without checking anything else, the `require_windows_api`
+    /// flag, the early return on an empty `path_args`, the first-present path argument lookup,
+    /// and `PolicyConfig::require`. Copied from the source it replaces rather than paraphrased,
+    /// because a paraphrased oracle grades the paraphrase.
+    fn old_policy_allows(spec: &OldSpec, name: &str, policy: &PolicyConfig, args: &Value) -> bool {
+        fn holds(policy: &PolicyConfig, permission: Permission) -> bool {
+            policy
+                .roots
+                .iter()
+                .any(|root| root.permissions.contains(&permission))
+        }
+        if name == "win_registry_write" {
+            return holds(policy, Permission::WindowsApi)
+                && holds(policy, Permission::WindowsApiWrite);
+        }
+        if spec.require_windows_api && !holds(policy, Permission::WindowsApi) {
+            return false;
+        }
+        if spec.path_args.is_empty() {
+            return true;
+        }
+        let Some(path) = first_present(args, spec.path_args) else {
+            return false;
+        };
+        policy.require(spec.permission, path).is_ok()
+    }
+
+    fn first_present<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
+        names
+            .iter()
+            .find_map(|name| args.get(*name).and_then(Value::as_str))
+    }
+
+    /// The declaration a provider migrating off `spec` makes, derived by the documented rule.
+    ///
+    /// `permission` unchanged, `path_args` filtered to the tool's own schema (RC-D5, RC-20),
+    /// and the `require_windows_api` flag becoming declared capability grants. `effect` and
+    /// `reach` are excluded from RC-6 because `authorize` does not consume them; RC-8 and RC-13
+    /// cover those.
+    fn declaration_for(spec: &OldSpec, name: &str) -> ToolAuthority {
+        let grants = if name == "win_registry_write" {
+            vec![
+                nmcp_schema::CapabilityGrant::new(Permission::WindowsApi.as_str()),
+                nmcp_schema::CapabilityGrant::new(Permission::WindowsApiWrite.as_str()),
+            ]
+        } else if spec.require_windows_api {
+            vec![nmcp_schema::CapabilityGrant::new(
+                Permission::WindowsApi.as_str(),
+            )]
+        } else {
+            Vec::new()
+        };
+        ToolAuthority {
+            permission: Some(spec.permission),
+            path_args: spec
+                .declared_path_args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect(),
+            grants,
+            effect: ToolEffect::Observe,
+            reach: ToolReach::Local,
+        }
+    }
+
+    /// The oracle's schema subsets are the shipped catalogue's, not somebody's recollection.
+    ///
+    /// For every table name `nmcp_proto::tool_list` carries, `declared_path_args` must equal
+    /// `path_args` filtered to that tool's real input schema properties, in the table's order.
+    /// Twenty-one of the forty names are graded here; the seven dev tools are graded against
+    /// their own schemas by `nmcp-devtools`, and the five Windows names declare no path
+    /// argument, so there is nothing left to filter.
+    #[test]
+    fn the_oracle_schema_subsets_match_the_shipped_catalogue() {
+        let catalogue = nmcp_proto::tool_list();
+        let mut checked = 0usize;
+        for spec in OLD_TOOL_POLICY_SPEC {
+            for name in spec.names {
+                let Some(tool) = catalogue.iter().find(|tool| tool.name == *name) else {
+                    continue;
+                };
+                let expected: Vec<&str> = spec
+                    .path_args
+                    .iter()
+                    .copied()
+                    .filter(|arg| {
+                        tool.input_schema
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| properties.contains_key(*arg))
+                    })
+                    .collect();
+                assert_eq!(
+                    spec.declared_path_args,
+                    expected.as_slice(),
+                    "{name}: the oracle's schema subset disagrees with the shipped input schema"
+                );
+                checked += 1;
+            }
+        }
+        // Fourteen: execute, execute_start, execute_resolve_program, read_file_window_report,
+        // inspect_file_integrity, create_text_file, write_text_file, patch_text_file,
+        // list_directory, rename_file, move_file, backup_file, search_repo, scan_repo. The rest
+        // of the table's names are provider-internal aliases, the seven dev tools and the five
+        // Windows tools, none of which the shipped first-party catalogue carries. Pinned
+        // exactly, so a table entry renamed out from under this check fails rather than
+        // silently grounding fewer.
+        assert_eq!(
+            checked, 14,
+            "the catalogue grounded {checked} of the oracle's names, not the 14 it carries"
+        );
+    }
+
+    /// A divergence RC-6 declares deliberate. Anything else is a behaviour change hiding in a
+    /// refactor and fails the test.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Divergence {
+        /// NMCP-SPEC-003 section 4.1: `permission: Some(p)` with `path_args: []` means the
+        /// caller must hold `p` on some root and no root is resolved. The deleted
+        /// `policy_check` returned early on an empty `path_args` and never enforced the
+        /// declared permission at all, so the contract narrows here on purpose. Five Windows
+        /// tools are exactly this shape.
+        EmptyPathArgsNowEnforcesThePermission,
+        /// RC-20: the table's path-argument lists named arguments the tools' own schemas do not
+        /// define, so the kernel resolved a root from one argument while the tool operated on
+        /// another. The declaration is filtered to the schema, so the argument authorized and
+        /// the argument used are the same argument. Disagreements are exactly the calls where
+        /// the two lists picked different arguments.
+        SchemaFilteredToTheArgumentTheToolReads,
+    }
+
+    /// RC-6, the full oracle, in both directions.
+    ///
+    /// Every entry of the deleted table, crossed with every `Permission` as the held set plus
+    /// the empty and the universal holder, crossed with every shape a call's path arguments can
+    /// take: absent, present and inside the governed root, present and outside it, and the two
+    /// two-argument shapes where the table's first choice and the schema's disagree. Roughly
+    /// nine thousand cases.
+    ///
+    /// Both directions are graded. No input may produce an allow the old path refused, and no
+    /// input may produce a deny the old path allowed, **except** where one of the two
+    /// [`Divergence`] variants applies, and each disagreement is attributed to one of them by a
+    /// predicate rather than by being tolerated. A disagreement matching neither fails with the
+    /// case printed.
+    #[test]
+    fn authorize_agrees_with_the_deleted_table_except_where_the_contract_says_otherwise() {
+        let governed = std::env::temp_dir().join("nmcp-rc6-governed");
+        let elsewhere = std::env::temp_dir().join("nmcp-rc6-elsewhere");
+        let inside = governed.join("file.txt").display().to_string();
+        let outside = elsewhere.join("file.txt").display().to_string();
+
+        // Every holder shape: nothing, exactly one permission, and everything. "Exactly one"
+        // is what makes the grid grade a permission rather than a policy: a tool requiring
+        // Write is refused under a root granting only Read, and the oracle has to agree.
+        let mut holders: Vec<PolicyConfig> = vec![PolicyConfig {
+            roots: Vec::new(),
+            ..PolicyConfig::default()
+        }];
+        for permission in Permission::ALL {
+            holders.push(PolicyConfig {
+                roots: vec![RootRule {
+                    id: format!("grants-{permission}"),
+                    path: governed.clone(),
+                    permissions: [permission].into_iter().collect(),
+                }],
+                ..PolicyConfig::default()
+            });
+        }
+        holders.push(PolicyConfig {
+            roots: vec![RootRule {
+                id: "grants-everything".into(),
+                path: governed.clone(),
+                permissions: Permission::ALL.into_iter().collect(),
+            }],
+            ..PolicyConfig::default()
+        });
+        // The Windows pair, which is the only holder shape that satisfies the registry-write
+        // special case, plus the same grant without the write half so the escalation the base
+        // guarded against stays guarded.
+        for permissions in [
+            vec![Permission::WindowsApi],
+            vec![Permission::WindowsApi, Permission::WindowsApiWrite],
+            vec![Permission::WindowsApi, Permission::Read],
+            vec![
+                Permission::WindowsApi,
+                Permission::WindowsApiWrite,
+                Permission::Read,
+            ],
+        ] {
+            holders.push(PolicyConfig {
+                roots: vec![RootRule {
+                    id: "grants-windows".into(),
+                    path: governed.clone(),
+                    permissions: permissions.into_iter().collect(),
+                }],
+                ..PolicyConfig::default()
+            });
+        }
+
+        let mut cases = 0usize;
+        let mut divergences: std::collections::BTreeSet<(String, &'static str)> =
+            std::collections::BTreeSet::new();
+
+        for spec in OLD_TOOL_POLICY_SPEC {
+            // Argument shapes, built from this entry's own path-argument list so a tool that
+            // names `from` or `cwd` is exercised on `from` and `cwd` rather than on `path`.
+            let mut shapes: Vec<Value> = vec![json!({}), json!({"unrelated": "value"})];
+            for arg in spec.path_args {
+                shapes.push(json!({ *arg: inside.clone() }));
+                shapes.push(json!({ *arg: outside.clone() }));
+            }
+            // The confused-deputy shapes: the table's first choice and the schema's choice
+            // present together, pointing at different places. These are the calls RC-20 exists
+            // for, and the ones where the two paths must disagree.
+            if let (Some(first), Some(declared)) =
+                (spec.path_args.first(), spec.declared_path_args.first())
+                && first != declared
+            {
+                shapes.push(json!({ *first: inside.clone(), *declared: outside.clone() }));
+                shapes.push(json!({ *first: outside.clone(), *declared: inside.clone() }));
+            }
+
+            for name in spec.names {
+                let declared = declaration_for(spec, name);
+                for policy in &holders {
+                    let held = held_authority(policy, &CallContext::new(None));
+                    for args in &shapes {
+                        cases += 1;
+                        let old = old_policy_allows(spec, name, policy, args);
+                        let new = authorize(&declared, &held, args).is_ok();
+                        if old == new {
+                            continue;
+                        }
+
+                        let divergence = if spec.path_args.is_empty() {
+                            assert!(
+                                old && !new,
+                                "{name}: an empty path_args entry may only narrow, and this \
+                                 widened. args={args} roots={:?}",
+                                policy.roots
+                            );
+                            Divergence::EmptyPathArgsNowEnforcesThePermission
+                        } else {
+                            assert_ne!(
+                                spec.path_args, spec.declared_path_args,
+                                "{name}: the two paths disagreed on a tool whose declaration is \
+                                 the table's list unchanged, which is an unexplained behaviour \
+                                 change. old={old} new={new} args={args} roots={:?}",
+                                policy.roots
+                            );
+                            // Attribution, not tolerance: the disagreement has to be the two
+                            // lists choosing different arguments out of this call.
+                            let old_arg = spec
+                                .path_args
+                                .iter()
+                                .find(|arg| args.get(**arg).and_then(Value::as_str).is_some());
+                            let new_arg = spec
+                                .declared_path_args
+                                .iter()
+                                .find(|arg| args.get(**arg).and_then(Value::as_str).is_some());
+                            assert_ne!(
+                                old_arg, new_arg,
+                                "{name}: the two paths disagreed while resolving the same \
+                                 argument, which the schema filter cannot explain. old={old} \
+                                 new={new} args={args} roots={:?}",
+                                policy.roots
+                            );
+                            Divergence::SchemaFilteredToTheArgumentTheToolReads
+                        };
+                        divergences.insert((
+                            (*name).to_string(),
+                            match divergence {
+                                Divergence::EmptyPathArgsNowEnforcesThePermission => {
+                                    "path_args: [] now enforces the declared permission (4.1)"
+                                }
+                                Divergence::SchemaFilteredToTheArgumentTheToolReads => {
+                                    "path_args filtered to the schema (RC-20)"
+                                }
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            cases > 8_000,
+            "the grid collapsed to {cases} cases; RC-6 is not being graded"
+        );
+        // Both divergences must actually occur, or the test is passing because the grid never
+        // reached them.
+        assert!(
+            divergences.iter().any(|(name, _)| name.starts_with("win_")),
+            "the empty path_args narrowing was never exercised"
+        );
+        assert!(
+            divergences
+                .iter()
+                .any(|(_, reason)| reason.contains("RC-20")),
+            "the schema filtering divergence was never exercised"
+        );
+        // Every tool that diverges at all is one of the two families the contract names. This
+        // is the assertion that fails if a third divergence appears.
+        for (name, reason) in &divergences {
+            let expected_empty = name.starts_with("win_");
+            assert_eq!(
+                expected_empty,
+                reason.contains("4.1"),
+                "{name} diverged for {reason}, which is not the family it belongs to"
+            );
+        }
+    }
+
+    /// RC-20, stated as the property rather than as an example, at the ring rather than at one
+    /// provider.
+    ///
+    /// The confused deputy the deleted table made possible: a call carrying a repository
+    /// argument pointing somewhere the caller may read and a `path` pointing somewhere it may
+    /// not. The old ring resolved the root from `repo` and authorized it; the tool then read
+    /// `path`. The new ring authorizes `path`, which is the argument the tool reads, so the
+    /// call is refused.
+    #[test]
+    fn the_ring_authorizes_the_argument_the_tool_reads_not_the_first_one_offered() {
+        let governed = std::env::temp_dir().join("nmcp-rc20-governed");
+        let ungoverned = std::env::temp_dir().join("nmcp-rc20-ungoverned");
+        let policy = PolicyConfig {
+            roots: vec![RootRule {
+                id: "repo".into(),
+                path: governed.clone(),
+                permissions: [Permission::Read].into_iter().collect(),
+            }],
+            ..PolicyConfig::default()
+        };
+        let held = held_authority(&policy, &CallContext::new(None));
+
+        let git_log = OLD_TOOL_POLICY_SPEC
+            .iter()
+            .find(|spec| spec.names.contains(&"dev_git_log"))
+            .expect("the oracle carries the git family");
+        let declared = declaration_for(git_log, "dev_git_log");
+        assert_eq!(declared.path_args, vec!["path".to_string()]);
+
+        let confused = json!({
+            "repo": governed.join("readable").display().to_string(),
+            "path": ungoverned.join("secret").display().to_string(),
+        });
+
+        // The old table resolved the root from `repo` and allowed it.
+        assert!(
+            old_policy_allows(git_log, "dev_git_log", &policy, &confused),
+            "this is the call the old table allowed, or the test is not measuring the defect"
+        );
+        // The ring refuses it, naming the argument the tool actually reads.
+        let denial = authorize(&declared, &held, &confused)
+            .expect_err("the argument the tool reads is outside every root");
+        assert!(
+            matches!(&denial, Denial::OutsideRoots { arg } if arg == "path"),
+            "the refusal must name `path`, which is what git_log reads: {denial:?}"
+        );
+
+        // And the mirror image, which is the direction that looks like a widening and is not:
+        // the old table refused because `repo` was ungoverned while the effect was always going
+        // to run on `path`, which is inside a root the caller holds Read on.
+        let mirrored = json!({
+            "repo": ungoverned.join("elsewhere").display().to_string(),
+            "path": governed.join("readable").display().to_string(),
+        });
+        assert!(!old_policy_allows(
+            git_log,
+            "dev_git_log",
+            &policy,
+            &mirrored
+        ));
+        let granted = authorize(&declared, &held, &mirrored)
+            .expect("the argument the tool reads is inside a root granting Read");
+        assert_eq!(
+            granted.matched_root().map(|root| root.id.as_str()),
+            Some("repo"),
+            "the resolved root is the one containing the argument the tool reads"
+        );
     }
 }

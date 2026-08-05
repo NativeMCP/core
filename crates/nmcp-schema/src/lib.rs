@@ -16,27 +16,36 @@
 //! This crate's only direct workspace dependency is `nmcp-policy` (RC-1), which depends on
 //! `nmcp-identity` and nothing else in the workspace, so the edge closes no cycle.
 //!
-//! ## What is here, and what is not here yet
+//! ## What is here
 //!
 //! I-047a landed the value types: [`ToolAuthority`] and its parts, [`ToolContract`],
 //! [`GrantedAuthority`], [`Denial`], [`authorize`], [`RegistrationError`], [`CatalogView`],
 //! [`MemoryScope`], and the public tool name derivation. I-047b added the two types
 //! section 4.3 moves alongside the trait: [`CallContext`], with `matched_root` private
 //! behind a reader and a private [`ResolvedSecrets`] channel, and [`ToolCallResult`]
-//! unchanged. I-047c adds [`ToolProvider`] itself and the [`ToolRegistry`] trait section 4.4
+//! unchanged. I-047c added [`ToolProvider`] itself and the [`ToolRegistry`] trait section 4.4
 //! freezes, whose index lives in `nmcp-host`. `nmcp-router` re-exports every moved item, so
 //! no `use` path breaks.
 //!
-//! Named gaps, per INV-6, with owners rather than as silent absences. [`ToolProvider::call`]
-//! still takes four parameters and [`ToolProvider`] still carries
-//! [`tool_names`](ToolProvider::tool_names) and [`tool_list`](ToolProvider::tool_list).
-//! Section 4.3 adds `granted: &GrantedAuthority` to `call` and deletes both methods, and that
-//! is one atomic change rather than three: a provider cannot be handed a
-//! [`GrantedAuthority`] until dispatch produces one, dispatch cannot produce one until it
-//! calls [`authorize`], and [`authorize`] needs the declaration only
-//! [`contracts`](ToolProvider::contracts) supplies. Owner I-047d, which also lands RC-6's
-//! property test, because that test's oracle is the base's per-tool policy table and the
-//! table only stops being authoritative once dispatch reads the declaration instead.
+//! I-047d closed the two gaps those three left. [`ToolProvider::call`] takes
+//! `granted: &GrantedAuthority`, and the transitional `tool_names` and `tool_list` are gone,
+//! so section 4.3's signature is the one this crate compiles. That had to be one change rather
+//! than three: a provider cannot be handed a [`GrantedAuthority`] until dispatch produces one,
+//! dispatch cannot produce one until it calls [`authorize`], and [`authorize`] needs the
+//! declaration only [`contracts`](ToolProvider::contracts) supplies. [`CallContext`]'s one
+//! setter for the resolved root takes the same proof, so nothing can decide what a call
+//! resolved to without having asked.
+//!
+//! Deleting `tool_list` left an upstream's own annotations with nowhere to travel, since
+//! section 4.2 froze [`ToolContract`] at four fields and none of them could hold an annotation
+//! somebody else wrote. That was escalated rather than decided in code, because a change to a
+//! ratified contract is a spec revision, and it produced NMCP-SPEC-003 v1.3 rather than a
+//! deferral. [`ToolContract::published_annotations`] is the channel and
+//! [`RegistrationError::PublishedAnnotationsFromFirstParty`] is what keeps it from becoming a
+//! second source of truth: an upstream's annotations pass through verbatim, a first-party
+//! provider supplying any is refused at registration, and first-party annotations stay derived
+//! from the declared authority by [`ToolContract::to_list_entry`] so they cannot disagree with
+//! what the kernel authorizes against (RC-21, RC-A4).
 
 mod authority;
 mod context;
@@ -162,9 +171,11 @@ mod tests {
     /// because a check that fires for the wrong reason is a check that will keep passing
     /// after the reason it was testing has gone.
     ///
-    /// The full RC-6 property test is graded against a per-tool oracle built from the
-    /// base's `tool_policy_spec` table. That oracle needs the kernel internals I-047b
-    /// moves, so it lands with I-047c and this is not it.
+    /// This is the self-contained half of RC-6. The full oracle, graded against the kernel's
+    /// own per-tool policy table in both directions, landed with I-047d in `nmcp-router`'s
+    /// `authorize_agrees_with_the_deleted_table_except_where_the_contract_says_otherwise`,
+    /// because that table stopped being authoritative only when dispatch began reading the
+    /// declaration instead, and the table had to be captured as test data on its way out.
     #[test]
     fn authorize_grades_every_permission_against_every_path_state() {
         for permission in Permission::ALL {
@@ -648,6 +659,8 @@ mod tests {
                 effect,
                 reach,
             },
+            // `to_list_entry` is first-party only, so the fixture it grades carries none.
+            published_annotations: None,
         }
     }
 
