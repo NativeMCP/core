@@ -6,24 +6,46 @@
 //! section 4.6. No stage may be reordered without a spec revision.
 //!
 //! ```text
-//! MCP client request
-//!   - Router::dispatch()
+//! MCP client request                                        RequestState
+//!   - Router::dispatch()                                    Received
 //!       0  DeleteGuard              (INV-1, before the registry is consulted)
 //!       1  resolve                  (one hash lookup in the ToolRegistry)
 //!       2  profile visibility       (after resolution: the public name is lossy)
 //!       3  upstream admission       (provider_id != "" only)
+//!                                   any of 0..3 refusing:   -> Rejected
 //!       4  authorize                (the declaration becomes a GrantedAuthority)
-//!       5  approval gate, ABAC, HITL
+//!                                                           Authorizing
+//!       5  approval gate, ABAC, HITL                        -> Rejected on deny
 //!       5b reserved: secret resolution (NMCP-SPEC-002, not implemented here)
 //!       6  audit intent record      (INV-3 gate, durable before any effect)
-//!       7  provider.call(.., granted)
-//!       8  audit outcome record
+//!                                                           Recorded
+//!       7  provider.call(.., granted)                       Executed
+//!       8  audit outcome record                             Completed
 //!   - ToolCallResult - JSON-RPC response
 //! ```
 //!
 //! Providers implement [`ToolProvider`] and are registered through [`Router::register`],
 //! which delegates to the injected [`ToolRegistry`]. The ring applies identically to local and
 //! proxied (gateway) calls.
+//!
+//! ## How the stage order is held
+//!
+//! By the compiler, for the transitions, and by a test for the rest. The right-hand column
+//! above is [`nmcp_schema::RequestState`], and the ring walks it through the linear typestate
+//! guard beside it: one type per state, each advance consuming the previous guard, and an
+//! advance method present only where section 4.6 has an edge. The ring's body returns a
+//! [`nmcp_schema::SettledRequest`], which no crate outside `nmcp-schema` can construct and
+//! which only a terminal guard produces, so an exit that skipped or reordered a transition does
+//! not compile at the `return` rather than failing a test somebody has to have written (RC-22).
+//!
+//! Two limits, stated here because a guard that oversells itself is worse than none. Stages 0
+//! through 3 all sit in `Received` and are indistinguishable to a guard keyed on state, so
+//! their relative order is `the_ring_refuses_in_the_frozen_stage_order`'s job and the guard does
+//! not claim it. And the guard constrains the order of transitions, not that the side effect
+//! each stage names succeeded: `audit_intent` warns and continues if the sink refuses, so
+//! `Recorded` means stage 6 ran, not that the record is on disk. Binding those would change
+//! what the server does, which RC-22 forbids, and `the_intent_record_is_durable_before_the_provider_runs`
+//! is what grades the durability.
 //!
 //! ## What the ring knows about a tool, and where it learns it
 //!
@@ -44,8 +66,8 @@
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::{Permission, PolicyConfig};
 use nmcp_schema::{
-    CapabilityGrant, CatalogView, Denial, HeldAuthority, RegistrationError, ToolAuthority,
-    ToolEffect, ToolRegistry, authorize,
+    CapabilityGrant, CatalogView, Denial, HeldAuthority, RegistrationError, RequestReceived,
+    SettledRequest, ToolAuthority, ToolEffect, ToolRegistry, authorize,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -353,9 +375,14 @@ fn audit_record(
 /// owns the ring order and nothing else about a tool.
 ///
 /// The registry arrives as a `dyn` handle rather than a concrete type because the index lives
-/// in `nmcp-host`, which depends on this crate (NMCP-SPEC-003 RC-D1). That direction is what
-/// keeps a provider crate off the kernel, and it means this crate names the contract and never
-/// the implementation.
+/// in `nmcp-host`, and NMCP-SPEC-003 RC-D1 fixes the edge between these two crates as
+/// `nmcp-host -> nmcp-router`. That edge does not exist yet: `nmcp-host` currently depends on
+/// `nmcp-schema` and `nmcp-policy` only, and it takes the router edge at I-031, when the server
+/// runtime is extracted into it. Naming the direction rather than asserting the edge matters
+/// here, because it is the direction and not the presence that does the work: it keeps a
+/// provider crate off the kernel, and it means this crate names the contract and never the
+/// implementation. I-049 is what made the distinction load-bearing, since the reverse edge
+/// would have been the cheap way to reach `RequestState` and would have made I-031 a cycle.
 pub struct Router {
     registry: Arc<dyn ToolRegistry>,
     policy: Arc<parking_lot::RwLock<PolicyConfig>>,
@@ -476,11 +503,42 @@ impl Router {
     /// The stage order is NMCP-SPEC-003 section 4.6, frozen at ratification. The ordering IS
     /// the governance; splitting it into helpers would scatter one decision procedure and
     /// invite a stage being skipped.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// This body unwraps the seal and nothing else. The decision procedure stays in one
+    /// function, [`Router::walk_the_ring`], whose return type is a [`SettledRequest`] that only
+    /// a terminal lifecycle guard can produce (RC-22). Splitting the *seal* off is what makes
+    /// the ring's exits provable; splitting the *stages* off is what the paragraph above
+    /// refuses, and this does not do that.
     pub async fn dispatch(&self, tool_name: &str, args: Value, ctx: CallContext) -> ToolCallResult {
+        self.walk_the_ring(tool_name, args, ctx).await.into_inner()
+    }
+
+    /// The ring, from stage 0 to stage 8, with the lifecycle guard walked alongside it.
+    ///
+    /// Returning a [`SettledRequest`] rather than a [`ToolCallResult`] is the enforcement.
+    /// `SettledRequest` has a private field in `nmcp-schema` and two constructors,
+    /// `RequestRejected::settle` and `RequestCompleted::settle`, so every `return` below has to
+    /// name a terminal guard, and a terminal guard is reachable only by advance methods that
+    /// exist where section 4.6 has an edge. A stage that skipped a transition, took one out of
+    /// order, or added an exit that walked nothing is a compile error at that `return`.
+    ///
+    /// Nothing here reads the guard. It is walked and never consulted, which is deliberate: the
+    /// guard observes and constrains the sequence, and a state machine that changed a refusal
+    /// reason, a decision or an audit record would not be observing the server.
+    #[allow(clippy::too_many_lines)]
+    async fn walk_the_ring(
+        &self,
+        tool_name: &str,
+        args: Value,
+        ctx: CallContext,
+    ) -> SettledRequest {
         // Every exit from this function audits, and every audit records how long the client
         // waited to reach it.
         let started = Instant::now();
+
+        // Off the transport, nothing evaluated. Stages 0 through 3 can only refuse from here,
+        // which is the `Received -> Rejected` edge RC-15 added and the reason it had to exist.
+        let state = RequestReceived::new();
 
         // - Stage 0: DeleteGuard -
         //
@@ -490,7 +548,7 @@ impl Router {
         // rather than a caller being denied forever.
         if let Some(denied) = delete_guard_check(tool_name) {
             audit_record(&self.audit, tool_name, &ctx, &denied, None, started);
-            return denied;
+            return state.rejected().settle(denied);
         }
 
         // - Stage 1: resolve -
@@ -511,7 +569,7 @@ impl Router {
                 Some("Call tools/list and retry with a registered tool name."),
             );
             audit_record(&self.audit, tool_name, &ctx, &result, None, started);
-            return result;
+            return state.rejected().settle(result);
         };
         let permission = declared.permission;
 
@@ -541,7 +599,7 @@ impl Router {
                 ),
             );
             audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-            return denied;
+            return state.rejected().settle(denied);
         }
 
         // - Stage 3: upstream admission (G4-28) -
@@ -597,7 +655,7 @@ impl Router {
             };
             if let Some(denied) = denied {
                 audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-                return denied;
+                return state.rejected().settle(denied);
             }
         }
 
@@ -616,6 +674,12 @@ impl Router {
         // schema by RC-D5, so the argument the ring authorizes and the argument the tool reads
         // are the same argument by construction, which is what made deleting the provider-side
         // re-check safe rather than merely tidy.
+        //
+        // The state advances here rather than after `authorize` returns, because the table's
+        // third column reads "`Authorizing`, then `Rejected` on `Denial`": a call that was
+        // refused by authorization did enter authorization, and that is the difference this
+        // state carries against stages 0 through 3.
+        let state = state.authorizing();
         let held = held_authority(&policy, &ctx);
         let granted = match authorize(&declared, &held, &args) {
             Ok(granted) => granted,
@@ -623,7 +687,7 @@ impl Router {
                 warn!(tool = tool_name, "PolicyRing: denied - {denial}");
                 let denied = denial_result(&declared, &denial);
                 audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-                return denied;
+                return state.rejected().settle(denied);
             }
         };
         // The resolved root reaches the context only through the proof that it was resolved.
@@ -662,7 +726,7 @@ impl Router {
                         ),
                     );
                     audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-                    return denied;
+                    return state.rejected().settle(denied);
                 }
                 AbacDecision::RequireApproval => {
                     require_approval = true;
@@ -680,7 +744,7 @@ impl Router {
                     Some("Enable auto_approve or configure an ABAC approval workflow before invoking mutating tools."),
                 );
                 audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-                return denied;
+                return state.rejected().settle(denied);
             };
             // Block until human approves or timeout fires (fail closed).
             let approved = abac.wait_for_approval(&ctx, tool_name, &args).await;
@@ -691,7 +755,7 @@ impl Router {
                     Some("Retry only after operator approval or adjust the HITL policy."),
                 );
                 audit_record(&self.audit, tool_name, &ctx, &denied, permission, started);
-                return denied;
+                return state.rejected().settle(denied);
             }
         }
 
@@ -712,6 +776,7 @@ impl Router {
         // every gate above has said yes, so an intent record is a statement that this call was
         // about to run rather than that somebody asked for it.
         audit_intent(&self.audit, tool_name, &ctx, permission);
+        let state = state.recorded();
 
         // - Stage 7: provider call -
         //
@@ -719,11 +784,15 @@ impl Router {
         // unforgeable outside `nmcp-schema`, so there is no expression that reaches this line
         // without stage 4 having returned `Ok` (RC-A2).
         let result = provider.call(&local_name, args, &ctx, &granted).await;
+        // Whatever the provider answered, including an error of its own, the ring executed the
+        // call. A provider-level failure is not a refusal, which is why there is no
+        // `Executed -> Rejected` edge to take here.
+        let state = state.executed();
 
         // - Stage 8: audit outcome record -
         audit_record(&self.audit, tool_name, &ctx, &result, permission, started);
 
-        result
+        state.completed().settle(result)
     }
 }
 

@@ -35,9 +35,14 @@ uuid.workspace = true
 # async trait method, so the edge is real and is classified where it is used.
 async-trait.workspace = true
 # The registry the ring dispatches through. NMCP-SPEC-003 RC-D1 puts the index in
-# `nmcp-host` and the trait in `nmcp-schema`, and `nmcp-host` depends on this crate, so the
-# production edge runs the other way and this one is test-only. Writing a second index here
-# to avoid it would mean every ring assertion in this crate was measured against a fake.
+# `nmcp-host` and the trait in `nmcp-schema`, and fixes the edge between those two crates as
+# `nmcp-host -> nmcp-router`. That edge is not present yet and arrives at I-031 with the
+# server runtime; what matters now is that it is the declared direction, so this edge stays
+# test-only and never becomes a production one. I-049 tested that: wiring `RequestState` into
+# dispatch would have been trivial with a production edge here, and taking it would have made
+# I-031 a dependency cycle, so `RequestState` moved to `nmcp-schema` at spec v1.4 instead.
+# Writing a second index here to avoid this dev edge would mean every ring assertion in this
+# crate was measured against a fake.
 nmcp-host = { path = "../nmcp-host", version = "0.1.0" }
 # Test-only, and only for RC-6's oracle: the deleted `tool_policy_spec` table's path-argument
 # lists are graded against the shipped first-party input schemas, which live here. It was a
