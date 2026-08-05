@@ -70,7 +70,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::binding::{
-    BINDING_SCHEMA_VERSION, BindingDenial, BindingRecord, BindingRequest, KeyBinding,
+    BINDING_SCHEMA_VERSION, BindingDenial, BindingRecord, BindingRequest, KeyBinding, OnTripAction,
 };
 use crate::file_sealer::MemorySealer;
 use crate::grant::{BindingGrant, BindingRuleId};
@@ -110,6 +110,25 @@ pub const STORE_SCHEMA_VERSION: u32 = 1;
 /// Zero is permitted and gives the hard cutover.
 pub const DEFAULT_OVERLAP_WINDOW_SECS: u64 = 300;
 
+/// The default exfiltration-tripwire arming floor, in bytes (NMCP-SPEC-002 section 8 item 2).
+///
+/// The floor's home is this store's configuration, beside the overlap window, because a value's
+/// arming is a per-deployment policy an operator sets once. A value shorter than the floor still
+/// resolves and injects; it is detection that is off for it, so a short or common value does not
+/// trip on unrelated output and auto-suspend the operator's own credential (T14). Sixteen sits
+/// above accidental collisions and below every real credential format; the mechanism that reads
+/// the floor is [`nmcp_schema::SecretTripwire`], which is handed this number rather than owning
+/// it. This equals `nmcp_schema::DEFAULT_TRIPWIRE_FLOOR`, and
+/// `the_two_default_floors_agree` pins them together so the store and the scanner cannot drift.
+pub const DEFAULT_TRIPWIRE_FLOOR: u64 = 16;
+
+/// The lowest floor [`SealedStore::set_tripwire_floor`] accepts (NMCP-SPEC-002 section 8 item 2).
+///
+/// Below eight bytes the tripwire is a guessing oracle (T13) more than a detector, so the
+/// operator ruling refuses a floor under it at the surface that sets it. A deployment may raise
+/// the floor freely; it may not lower it past here.
+pub const TRIPWIRE_FLOOR_MINIMUM: u64 = 8;
+
 /// The suffix a document is written under before being renamed into place.
 const WRITE_EXTENSION: &str = "json.writing";
 
@@ -129,6 +148,10 @@ pub struct VersionMeta {
     /// When it was superseded by a rotation, if it has been; what the overlap window is
     /// measured from.
     pub superseded_at_unix_ms: Option<u64>,
+    /// Whether this version was below the tripwire floor when it was sealed (SB-9), so
+    /// detection is off for it. The below-floor fact I-037's warning reads; a single policy
+    /// bit, not a length (SB-1).
+    pub below_tripwire_floor: bool,
 }
 
 /// What [`SealedStore::names`] reports about one secret.
@@ -150,6 +173,11 @@ pub struct SecretMeta {
     pub state: KeyState,
     /// When the secret was first stored, in milliseconds since the Unix epoch.
     pub created_at_unix_ms: u64,
+    /// Whether the version a fresh resolution would use, or the highest version when none is in
+    /// service, was below the tripwire floor when it was sealed (SB-9). The key-level view of
+    /// the below-floor fact I-037's `nmcpctl secret set` warning reads: `true` means detection
+    /// is off for the value callers get. A single policy bit, not a length or a digest (SB-1).
+    pub below_tripwire_floor: bool,
     /// Every version, in ascending order, with its state.
     pub versions: Vec<VersionMeta>,
 }
@@ -278,8 +306,28 @@ struct VersionRecord {
     /// rather than returning every version of a key to `Active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quarantined_from: Option<KeyState>,
+    /// Whether this version's value was below the tripwire floor when it was sealed (SB-9).
+    ///
+    /// The below-floor fact the store records so I-037's `nmcpctl secret set` warning has
+    /// something to read: `true` means detection is off for this version, because the value is
+    /// shorter than the floor in force when it was written. It is a single policy bit, not a
+    /// length or a digest, so it does not breach SB-1: it discloses only whether the value
+    /// crosses the floor, which is exactly what the operator warning needs and nothing that
+    /// reconstructs material. Recomputing arming at scan time is the ring's job, against the
+    /// current value and the current floor, so this bit reflects the floor at write time and
+    /// does not decide detection; it informs the operator. `default` false so a version written
+    /// before the field existed reads back armed, which is the safe reading (detection on).
+    #[serde(default, skip_serializing_if = "is_false")]
+    below_tripwire_floor: bool,
     /// Every sealing of this version's value. Migration appends; nothing removes.
     blobs: Vec<BlobRecord>,
+}
+
+/// Skip a `false` boolean in a document, so a version that is not below the floor writes no
+/// field and a document written before the field existed round-trips byte for byte.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One secret's document, the unit of isolation and of atomic replacement.
@@ -305,6 +353,17 @@ struct SecretDocument {
 struct StoreConfig {
     schema: u32,
     overlap_window_secs: u64,
+    /// The exfiltration-tripwire arming floor, in bytes (SB-9). `default` so a `store.json`
+    /// written before the floor existed reads back at [`DEFAULT_TRIPWIRE_FLOOR`] rather than
+    /// being refused, the same additive discipline the document fields use; the schema is not
+    /// bumped, because bumping it would orphan every store written at schema one.
+    #[serde(default = "default_tripwire_floor")]
+    tripwire_floor: u64,
+}
+
+/// The serde default for a `store.json` written before the tripwire floor existed.
+const fn default_tripwire_floor() -> u64 {
+    DEFAULT_TRIPWIRE_FLOOR
 }
 
 /// The mutable half, behind one lock.
@@ -312,6 +371,10 @@ struct State {
     secrets: BTreeMap<SecretName, SecretDocument>,
     unreadable: Vec<UnreadableEntry>,
     overlap_window_secs: u64,
+    /// The exfiltration-tripwire arming floor, in bytes (SB-9). Read live by
+    /// [`SealedStore::tripwire_floor`] and used at write time to record each version's
+    /// below-floor fact.
+    tripwire_floor: u64,
     /// The store directory, or `None` for an ephemeral store.
     dir: Option<PathBuf>,
 }
@@ -378,7 +441,7 @@ impl SealedStore {
         let secrets_dir = dir.join(SECRETS_DIR);
         create_restricted_dir(&secrets_dir)?;
         verify_restricted(&secrets_dir, RESTRICTED_DIR_MODE)?;
-        let overlap_window_secs = load_config(dir)?;
+        let (overlap_window_secs, tripwire_floor) = load_config(dir)?;
         let (secrets, unreadable) = load_secrets(&secrets_dir)?;
         Ok(Self {
             sealer,
@@ -387,6 +450,7 @@ impl SealedStore {
                 secrets,
                 unreadable,
                 overlap_window_secs,
+                tripwire_floor,
                 dir: Some(dir.to_path_buf()),
             }),
         })
@@ -425,6 +489,7 @@ impl SealedStore {
                 secrets: BTreeMap::new(),
                 unreadable: Vec::new(),
                 overlap_window_secs: DEFAULT_OVERLAP_WINDOW_SECS,
+                tripwire_floor: DEFAULT_TRIPWIRE_FLOOR,
                 dir: None,
             }),
         }
@@ -445,15 +510,18 @@ impl SealedStore {
             .values()
             .map(|document| {
                 let current = current_version(document);
-                let state_now = current
+                let representative = current
                     .and_then(|version| document.versions.get(&version))
-                    .or_else(|| document.versions.values().next_back())
-                    .map_or(KeyState::Created, |record| record.lifecycle.state());
+                    .or_else(|| document.versions.values().next_back());
+                let state_now =
+                    representative.map_or(KeyState::Created, |record| record.lifecycle.state());
+                let below_floor = representative.is_some_and(|record| record.below_tripwire_floor);
                 SecretMeta {
                     name: document.name.clone(),
                     current_version: current,
                     state: state_now,
                     created_at_unix_ms: document.created_at_unix_ms,
+                    below_tripwire_floor: below_floor,
                     versions: document
                         .versions
                         .iter()
@@ -462,6 +530,7 @@ impl SealedStore {
                             state: record.lifecycle.state(),
                             created_at_unix_ms: record.created_at_unix_ms,
                             superseded_at_unix_ms: record.superseded_at_unix_ms,
+                            below_tripwire_floor: record.below_tripwire_floor,
                         })
                         .collect(),
                 }
@@ -654,7 +723,8 @@ impl SealedStore {
             });
         }
         let version = Version::first();
-        let record = self.seal_version(name, version, value, now)?;
+        let floor = state.tripwire_floor;
+        let record = self.seal_version(name, version, value, floor, now)?;
         let document = SecretDocument {
             schema: STORE_SCHEMA_VERSION,
             name: name.clone(),
@@ -691,6 +761,7 @@ impl SealedStore {
         sweep(&mut state, now);
         ensure_not_damaged(&state, name)?;
         let window_ms = state.overlap_window_secs.saturating_mul(1_000);
+        let floor = state.tripwire_floor;
         let Some(document) = state.secrets.get(name) else {
             return Err(StoreError::UnknownSecret {
                 name: name.to_string(),
@@ -714,7 +785,7 @@ impl SealedStore {
                 highest,
             });
         }
-        let fresh = self.seal_version(name, next, value, now)?;
+        let fresh = self.seal_version(name, next, value, floor, now)?;
         let mut updated = document.clone();
         let Some(prior) = updated.versions.get_mut(&current) else {
             // `current` was found in this same document one lookup ago, so this arm is belt
@@ -980,10 +1051,155 @@ impl SealedStore {
     /// [`StoreError`] when the configuration document cannot be written.
     pub fn set_overlap_window(&self, window: Duration) -> Result<(), StoreError> {
         let mut state = self.state.lock();
-        persist_config(state.dir.as_deref(), window.as_secs())?;
+        persist_config(state.dir.as_deref(), window.as_secs(), state.tripwire_floor)?;
         state.overlap_window_secs = window.as_secs();
         sweep(&mut state, (self.clock)());
         Ok(())
+    }
+
+    /// The exfiltration-tripwire arming floor, in bytes (SB-9).
+    ///
+    /// What the ring reads at stage 8 to arm [`nmcp_schema::SecretTripwire`] and decide, live
+    /// against each resolved value's length, which values are watched. The store owns the
+    /// configured value; the scanner is handed it.
+    #[must_use]
+    pub fn tripwire_floor(&self) -> u64 {
+        self.state.lock().tripwire_floor
+    }
+
+    /// Set the exfiltration-tripwire arming floor, and persist it (SB-9, section 8 item 2).
+    ///
+    /// The floor is the surface the operator ruling refuses a below-eight value at: a floor
+    /// under [`TRIPWIRE_FLOOR_MINIMUM`] makes the tripwire a guessing oracle (T13) rather than
+    /// a detector, so it is refused here, at the one place a floor is set, rather than left to
+    /// be caught later. A deployment may raise the floor without limit; it may not lower it past
+    /// the minimum. Persisted in [`STORE_CONFIG_FILE`] beside the overlap window, so a restart
+    /// does not silently return a deployment to the default.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::TripwireFloorTooLow`] when `floor` is below [`TRIPWIRE_FLOOR_MINIMUM`], and
+    /// [`StoreError`] when the configuration document cannot be written.
+    pub fn set_tripwire_floor(&self, floor: u64) -> Result<(), StoreError> {
+        if floor < TRIPWIRE_FLOOR_MINIMUM {
+            return Err(StoreError::TripwireFloorTooLow {
+                requested: floor,
+                minimum: TRIPWIRE_FLOOR_MINIMUM,
+            });
+        }
+        let mut state = self.state.lock();
+        persist_config(state.dir.as_deref(), state.overlap_window_secs, floor)?;
+        state.tripwire_floor = floor;
+        Ok(())
+    }
+
+    /// Withdraw `name` from service reversibly, the tripwire's default on-trip action (SB-9).
+    ///
+    /// Moves the in-service version through the FSM's `Active -> Suspended` edge (SB-14), which
+    /// an operator reverses (`Suspended -> Active` exists, and is the operator surface's, landing
+    /// with `nmcpctl` at I-037/I-038, exactly as `restore` reverses a quarantine). A suspended
+    /// key resolves nothing, so [`SealedStore::evaluate`] refuses it naming `key-state`, which is
+    /// how a dispatch after a trip is turned away. This is an FSM write, not a file operation:
+    /// nothing is deleted, and INV-1's no-delete rule is untouched.
+    ///
+    /// Only the `Active` version is moved. A version drained to `Superseded` in a rotation
+    /// overlap has no `Superseded -> Suspended` edge and is left to retire or be quarantined on
+    /// its own; an operator wanting an immediate cutover binds `quarantine` as the on-trip
+    /// action, which reaches every resolving version. In the ordinary one-active-version case
+    /// this is the whole key.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged, has no `Active` version to suspend, or
+    /// the document cannot be written. A key already suspended or quarantined has nothing to
+    /// suspend and is [`StoreError::NothingToSuspend`], which [`SealedStore::apply_on_trip`]
+    /// treats as already-withdrawn.
+    pub fn suspend(&self, name: &SecretName) -> Result<(), StoreError> {
+        let mut state = self.state.lock();
+        sweep(&mut state, (self.clock)());
+        ensure_not_damaged(&state, name)?;
+        let Some(document) = state.secrets.get(name) else {
+            return Err(StoreError::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        let mut updated = document.clone();
+        let mut moved = 0_usize;
+        for (version, record) in &mut updated.versions {
+            if record.lifecycle.state() != KeyState::Active {
+                continue;
+            }
+            record.lifecycle = record
+                .lifecycle
+                .advance(KeyState::Suspended)
+                .map_err(|source| StoreError::illegal(name, *version, source))?;
+            moved += 1;
+        }
+        if moved == 0 {
+            return Err(StoreError::NothingToSuspend {
+                name: name.to_string(),
+            });
+        }
+        persist_and_commit(&mut state, name, updated)?;
+        Ok(())
+    }
+
+    /// The on-trip action bound for `name`, defaulting to [`OnTripAction::Suspend`] (SB-9).
+    ///
+    /// Reads the key's binding, which is where the per-key override lives (section 8 item 1). An
+    /// unbound key has no override and returns the default, though in practice a tripped key is
+    /// always bound: an unbound key never resolves, so its value never reaches output to trip.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged.
+    pub fn on_trip_action(&self, name: &SecretName) -> Result<OnTripAction, StoreError> {
+        let mut state = self.state.lock();
+        sweep(&mut state, (self.clock)());
+        ensure_not_damaged(&state, name)?;
+        let Some(document) = state.secrets.get(name) else {
+            return Err(StoreError::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        Ok(document
+            .binding
+            .as_ref()
+            .map_or(OnTripAction::default(), |record| {
+                record.terms.on_trip_action()
+            }))
+    }
+
+    /// Apply `name`'s bound on-trip action after the tripwire caught a value of it (SB-9).
+    ///
+    /// The single call the ring makes on a trip: read the key's on-trip action and apply it,
+    /// returning what was applied so the ring can record it. [`OnTripAction::Suspend`] and
+    /// [`OnTripAction::Quarantine`] are FSM writes ([`SealedStore::suspend`] and
+    /// [`SealedStore::quarantine`]); [`OnTripAction::None`] changes no state. A key already
+    /// withdrawn (a second trip in the same call before suspension took, or an operator revoked
+    /// it in between) reports nothing to withdraw, which is treated as done rather than an error:
+    /// the redaction and the trip record, which are the ring's, have already happened, and the
+    /// key is out of service either way.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged, or the FSM write cannot be persisted.
+    /// A [`StoreError::NothingToSuspend`] or [`StoreError::NothingToQuarantine`] is folded into
+    /// `Ok`, because it means the key is already out of service.
+    pub fn apply_on_trip(&self, name: &SecretName) -> Result<OnTripAction, StoreError> {
+        let action = self.on_trip_action(name)?;
+        let outcome = match action {
+            OnTripAction::Suspend => self.suspend(name),
+            OnTripAction::Quarantine => self.quarantine(name),
+            OnTripAction::None => Ok(()),
+        };
+        match outcome {
+            Ok(())
+            | Err(StoreError::NothingToSuspend { .. } | StoreError::NothingToQuarantine { .. }) => {
+                Ok(action)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// The sealer every blob written from now on is sealed by.
@@ -1004,14 +1220,25 @@ impl SealedStore {
     ///
     /// Consumes the value: once the blob exists, the store owns nothing in plaintext, and
     /// [`Sealed`]'s drop erases the one copy it was handed before this returns.
+    ///
+    /// `floor` is the tripwire arming floor in force, so the below-floor fact is recorded from
+    /// the same plaintext that is being sealed, in the one place that still holds it. The
+    /// comparison yields a single policy bit and never the length itself (SB-1).
     fn seal_version(
         &self,
         name: &SecretName,
         version: Version,
         value: Sealed<Vec<u8>>,
+        floor: u64,
         now: u64,
     ) -> Result<VersionRecord, StoreError> {
         let context = SealContext::new(name.as_str(), version);
+        // The below-floor fact, read from the plaintext through the scoped-exposure API and
+        // reduced to one bit before the value is dropped: whether the value is shorter than the
+        // arming floor, which is all the operator warning (I-037) needs and nothing that
+        // reconstructs material.
+        let below_tripwire_floor =
+            value.with_exposed(|plain| u64::try_from(plain.len()).unwrap_or(u64::MAX) < floor);
         let blob = value
             .with_exposed(|plain| self.sealer.seal(plain, &context))
             .map_err(|source| StoreError::Seal {
@@ -1030,6 +1257,7 @@ impl SealedStore {
             created_at_unix_ms: now,
             superseded_at_unix_ms: None,
             quarantined_from: None,
+            below_tripwire_floor,
             blobs: vec![BlobRecord {
                 sealed_by: self.sealer.id(),
                 blob_hex: hex::encode(blob),
@@ -1207,7 +1435,11 @@ fn system_now_ms() -> u64 {
 }
 
 /// Read the store-level configuration, or the defaults when none was ever written.
-fn load_config(dir: &Path) -> Result<u64, StoreError> {
+///
+/// Returns the overlap window and the tripwire floor together, both from the one `store.json`.
+/// An absent file means both defaults, so a deployment that never chose either follows the
+/// current defaults rather than a frozen copy of an old one.
+fn load_config(dir: &Path) -> Result<(u64, u64), StoreError> {
     let path = dir.join(STORE_CONFIG_FILE);
     match fs::read_to_string(&path) {
         Ok(text) => {
@@ -1223,9 +1455,11 @@ fn load_config(dir: &Path) -> Result<u64, StoreError> {
                     path: path.display().to_string(),
                     reason: err.to_string(),
                 })?;
-            Ok(config.overlap_window_secs)
+            Ok((config.overlap_window_secs, config.tripwire_floor))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DEFAULT_OVERLAP_WINDOW_SECS),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok((DEFAULT_OVERLAP_WINDOW_SECS, DEFAULT_TRIPWIRE_FLOOR))
+        }
         Err(err) => Err(StoreError::Unreadable {
             path: path.display().to_string(),
             reason: err.kind().to_string(),
@@ -1407,7 +1641,14 @@ fn persist_secret(dir: Option<&Path>, document: &SecretDocument) -> Result<(), S
 }
 
 /// Write the store-level configuration, or do nothing for an ephemeral store.
-fn persist_config(dir: Option<&Path>, overlap_window_secs: u64) -> Result<(), StoreError> {
+///
+/// Writes both settings from one document, so setting either preserves the other: a setter reads
+/// the live pair off the state and passes both here, and the file always carries both.
+fn persist_config(
+    dir: Option<&Path>,
+    overlap_window_secs: u64,
+    tripwire_floor: u64,
+) -> Result<(), StoreError> {
     let Some(dir) = dir else {
         return Ok(());
     };
@@ -1415,6 +1656,7 @@ fn persist_config(dir: Option<&Path>, overlap_window_secs: u64) -> Result<(), St
     let config = StoreConfig {
         schema: STORE_SCHEMA_VERSION,
         overlap_window_secs,
+        tripwire_floor,
     };
     let body = serde_json::to_vec_pretty(&config).map_err(|err| StoreError::Unwritable {
         path: path.display().to_string(),
@@ -1604,6 +1846,33 @@ pub enum StoreError {
     NothingToQuarantine {
         /// The name.
         name: String,
+    },
+
+    /// No version of the key is in service to suspend.
+    ///
+    /// Only an `Active` version is suspendable (SB-14's `Active -> Suspended`), so a key already
+    /// suspended, quarantined or with nothing in service has nothing to suspend.
+    /// [`SealedStore::apply_on_trip`] folds this into `Ok`, because it means the key is already
+    /// out of service, which is the whole point of the trip's on-trip action.
+    #[error("no version of {name} is in service to suspend")]
+    NothingToSuspend {
+        /// The name.
+        name: String,
+    },
+
+    /// The requested tripwire arming floor is below the operator-ruled minimum (SB-9).
+    ///
+    /// Refused at the surface that sets the floor, because below the minimum the tripwire is a
+    /// guessing oracle (T13) rather than a detector. A single bound, named, so an operator who
+    /// asked for too low a floor is told the minimum rather than silently given one.
+    #[error(
+        "a tripwire floor of {requested} bytes is below the minimum of {minimum}; below it the tripwire is a guessing oracle rather than a detector"
+    )]
+    TripwireFloorTooLow {
+        /// The floor that was requested.
+        requested: u64,
+        /// The lowest floor the operator ruling permits.
+        minimum: u64,
     },
 
     /// The key has nothing a restore would change.
@@ -2982,5 +3251,172 @@ mod tests {
     fn the_store_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SealedStore>();
+    }
+
+    // - NMCP-SPEC-002 SB-9: the tripwire's store surface (I-035) -
+
+    use super::{DEFAULT_TRIPWIRE_FLOOR, TRIPWIRE_FLOOR_MINIMUM};
+    use crate::binding::{BindingRequest, KeyBinding, OnTripAction};
+
+    /// A binding that admits the fixture caller and tool, so a key can be evaluated and then
+    /// suspended by the on-trip action.
+    fn tripwire_binding(on_trip: Option<OnTripAction>) -> KeyBinding {
+        KeyBinding {
+            tools: vec!["keyed_run".to_string()],
+            programs: Vec::new(),
+            roots: Vec::new(),
+            callers: vec!["local".to_string()],
+            expires_at_unix_ms: None,
+            budget: None,
+            on_trip,
+        }
+    }
+
+    /// The floor defaults to sixteen and persists a set value across reopen; the store's default
+    /// equals the scanner's, so the two cannot drift.
+    #[test]
+    fn the_floor_defaults_persists_and_matches_the_scanner() {
+        assert_eq!(
+            DEFAULT_TRIPWIRE_FLOOR,
+            u64::try_from(nmcp_schema::DEFAULT_TRIPWIRE_FLOOR).unwrap()
+        );
+        let dir = TempDir::new("tripwire-floor");
+        {
+            let store = open(&dir);
+            assert_eq!(store.tripwire_floor(), DEFAULT_TRIPWIRE_FLOOR);
+            store.set_tripwire_floor(40).unwrap();
+            assert_eq!(store.tripwire_floor(), 40);
+        }
+        // Reopened, the set floor survives rather than returning to the default.
+        let store = open(&dir);
+        assert_eq!(store.tripwire_floor(), 40);
+    }
+
+    /// The floor is refused below the operator-ruled minimum, at the surface that sets it, and
+    /// the refusal names the minimum rather than silently clamping.
+    #[test]
+    fn a_floor_below_the_minimum_is_refused_naming_it() {
+        let store = SealedStore::ephemeral();
+        let refused = store
+            .set_tripwire_floor(TRIPWIRE_FLOOR_MINIMUM - 1)
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            StoreError::TripwireFloorTooLow { requested, minimum }
+                if requested == TRIPWIRE_FLOOR_MINIMUM - 1 && minimum == TRIPWIRE_FLOOR_MINIMUM
+        ));
+        // Exactly the minimum is accepted: the bound belongs to the permitted side.
+        store.set_tripwire_floor(TRIPWIRE_FLOOR_MINIMUM).unwrap();
+        assert_eq!(store.tripwire_floor(), TRIPWIRE_FLOOR_MINIMUM);
+    }
+
+    /// The below-floor fact is recorded at set time and readable, so I-037's warning has
+    /// something to read: a value at or above the floor arms, a shorter one does not, and the
+    /// short one still stores and would still resolve. Detection off is a fact, not a failure.
+    #[test]
+    fn the_below_floor_fact_is_recorded_and_readable() {
+        let store = SealedStore::ephemeral();
+        // Above the floor: detection on.
+        store.set(&name("api.token"), sealed(MATERIAL)).unwrap();
+        // Below the floor: nine bytes, under sixteen, so detection is off but it still stores.
+        store.set(&name("short.pin"), sealed(b"012345678")).unwrap();
+
+        let metas = store.names();
+        let armed = metas
+            .iter()
+            .find(|m| m.name.as_str() == "api.token")
+            .unwrap();
+        let short = metas
+            .iter()
+            .find(|m| m.name.as_str() == "short.pin")
+            .unwrap();
+        assert!(!armed.below_tripwire_floor, "a value above the floor arms");
+        assert!(
+            short.below_tripwire_floor,
+            "a value below the floor does not arm"
+        );
+        // The version-level fact matches the key-level convenience.
+        assert!(!armed.versions[0].below_tripwire_floor);
+        assert!(short.versions[0].below_tripwire_floor);
+        // The below-floor key still holds a value, which resolution would return: detection is
+        // off, the key is not.
+        assert_eq!(short.state, KeyState::Active);
+    }
+
+    /// Suspension moves the active version through `Active -> Suspended` and nothing else: the
+    /// value stays on disk (INV-1), and evaluation then refuses the key naming `key-state`.
+    #[test]
+    fn suspend_withdraws_the_active_version_reversibly_and_deletes_nothing() {
+        let dir = TempDir::new("tripwire-suspend");
+        let store = open(&dir);
+        let key = name("deploy.db");
+        store.set(&key, sealed(MATERIAL)).unwrap();
+        store.bind(&key, tripwire_binding(None)).unwrap();
+
+        store.suspend(&key).unwrap();
+        let meta = &store.names()[0];
+        assert_eq!(meta.state, KeyState::Suspended);
+        assert_eq!(
+            meta.current_version, None,
+            "a suspended key resolves nothing"
+        );
+
+        // The blob file is intact: suspension is an FSM write, not a delete (INV-1).
+        let doc = std::fs::read_to_string(
+            dir.path()
+                .join("store")
+                .join("secrets")
+                .join("deploy.db.json"),
+        )
+        .unwrap();
+        assert!(doc.contains("blob_hex"));
+
+        // A dispatch after suspension refuses at evaluation naming key-state.
+        let request = BindingRequest::new("keyed_run", "local");
+        let denied = store.evaluate(&key, &request).unwrap_err();
+        assert_eq!(denied.rule(), "key-state");
+
+        // Nothing to suspend a second time: the key is already withdrawn.
+        assert!(matches!(
+            store.suspend(&key).unwrap_err(),
+            StoreError::NothingToSuspend { .. }
+        ));
+    }
+
+    /// The on-trip action is read off the binding, defaults to suspend, and `apply_on_trip`
+    /// applies each: suspend and quarantine withdraw the key, none leaves it Active, and a
+    /// key already withdrawn folds into Ok.
+    #[test]
+    fn apply_on_trip_honours_the_per_key_override() {
+        // Default (absent) is suspend.
+        let store = SealedStore::ephemeral();
+        let key = name("deploy.db");
+        store.set(&key, sealed(MATERIAL)).unwrap();
+        store.bind(&key, tripwire_binding(None)).unwrap();
+        assert_eq!(store.on_trip_action(&key).unwrap(), OnTripAction::Suspend);
+        assert_eq!(store.apply_on_trip(&key).unwrap(), OnTripAction::Suspend);
+        assert_eq!(store.names()[0].state, KeyState::Suspended);
+        // A second application is a no-op success: the key is already out of service.
+        assert_eq!(store.apply_on_trip(&key).unwrap(), OnTripAction::Suspend);
+
+        // Explicit quarantine override withdraws harder.
+        let store = SealedStore::ephemeral();
+        let key = name("hard.key");
+        store.set(&key, sealed(MATERIAL)).unwrap();
+        store
+            .bind(&key, tripwire_binding(Some(OnTripAction::Quarantine)))
+            .unwrap();
+        assert_eq!(store.apply_on_trip(&key).unwrap(), OnTripAction::Quarantine);
+        assert_eq!(store.names()[0].state, KeyState::Quarantined);
+
+        // Explicit none leaves the key in service: detection without withdrawal.
+        let store = SealedStore::ephemeral();
+        let key = name("watch.key");
+        store.set(&key, sealed(MATERIAL)).unwrap();
+        store
+            .bind(&key, tripwire_binding(Some(OnTripAction::None)))
+            .unwrap();
+        assert_eq!(store.apply_on_trip(&key).unwrap(), OnTripAction::None);
+        assert_eq!(store.names()[0].state, KeyState::Active);
     }
 }

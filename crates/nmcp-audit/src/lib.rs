@@ -77,6 +77,24 @@ pub const DENIED_DECISION: &str = "denied";
 /// The verdict an ABAC rule refused (Stage 1.5).
 pub const ABAC_DENIED_DECISION: &str = "abac_denied";
 
+/// The decision an exfiltration tripwire record carries (NMCP-SPEC-002 SB-9).
+///
+/// Written by the ring at NMCP-SPEC-003 stage 8 when an armed injected value occurred in the
+/// serialized tool result: the value is redacted, this record is chained, and the key's on-trip
+/// policy is applied. It is a decision string of its own rather than a reuse of `denied`,
+/// because SB-7 requires it be distinguishable from a routine refusal: a trip is an exfiltration
+/// event an operator is paged on, and [`event_log_severity`] maps it to [`EventLogSeverity::Error`]
+/// explicitly for that reason. The record names the key, the slot and the rule `tripwire`, and
+/// never the value or a value-derived length or digest (SB-1).
+pub const SECRET_TRIP_DECISION: &str = "secret_trip";
+
+/// The rule a tripwire record names, distinct from a binding rule (NMCP-SPEC-002 SB-9).
+///
+/// A resolving call's records name their binding rule (`binding.<name>`); a trip names this,
+/// so a reader can tell the use that authorized a resolution from the detection that a value
+/// then reached agent-visible output.
+pub const TRIPWIRE_RULE: &str = "tripwire";
+
 /// The verdict a call awaiting a human carries.
 pub const HITL_PENDING_DECISION: &str = "hitl_pending";
 
@@ -91,11 +109,17 @@ pub const UNSPECIFIED_DECISION: &str = "unspecified";
 
 /// Whether a decision string is a real authorization verdict rather than an effect marker.
 ///
-/// One function rather than a comparison at each reader. Four strings mean "not a verdict":
+/// One function rather than a comparison at each reader. Five strings mean "not a verdict":
 /// `effect`, `unspecified` from every record written before effect records were named,
-/// `auth_reject` from a credential that never reached the ring, and `intent` from the ring's
-/// own pre-effect record. The chain is append-only, so every one of them stays true forever,
-/// and a reader that knows only some of them miscounts without failing.
+/// `auth_reject` from a credential that never reached the ring, `intent` from the ring's own
+/// pre-effect record, and `secret_trip` from the exfiltration tripwire (NMCP-SPEC-002 SB-9).
+/// The chain is append-only, so every one of them stays true forever, and a reader that knows
+/// only some of them miscounts without failing.
+///
+/// `secret_trip` joins the list for the same reason `intent` did: it is an additional record on
+/// a call's own `call_id`, not the call's verdict, so a reader counting allowed and denied calls
+/// or measuring their latency must not count it. It also carries no duration, so counting it
+/// would report a phantom unmeasured authorization in the latency history.
 #[must_use]
 pub fn is_authorization_decision(decision: &str) -> bool {
     let decision = decision.trim();
@@ -104,6 +128,7 @@ pub fn is_authorization_decision(decision: &str) -> bool {
         && decision != EFFECT_DECISION
         && decision != AUTH_REJECT_DECISION
         && decision != INTENT_DECISION
+        && decision != SECRET_TRIP_DECISION
 }
 
 /// One line in the audit chain.
@@ -571,9 +596,12 @@ pub enum EventLogSeverity {
 
 /// Derive the severity from the record's decision.
 ///
-/// A throttled authentication window is the one Error. It means a source kept presenting bad
-/// credentials past the threshold, which is the shape of an attack in progress rather than a
-/// fat-fingered token, and it is the record an operator wants to be paged on.
+/// A throttled authentication window is one Error, and an exfiltration tripwire is the other.
+/// The throttled window means a source kept presenting bad credentials past the threshold, which
+/// is the shape of an attack in progress rather than a fat-fingered token; a `secret_trip` means
+/// an injected credential reached agent-visible output, which is exfiltration in progress. Both
+/// are the record an operator wants to be paged on, and SB-7 requires the trip specifically not
+/// to land as a Warning indistinguishable from a routine refusal.
 ///
 /// An unrecognised decision reads as a Warning rather than Information, deliberately. Success
 /// has had one name since the beginning, so a decision string this build does not know is far
@@ -583,6 +611,9 @@ pub enum EventLogSeverity {
 pub fn event_log_severity(event: &AuditEvent) -> EventLogSeverity {
     match event.decision.as_str() {
         AUTH_REJECT_DECISION if event.throttled == Some(true) => EventLogSeverity::Error,
+        // A trip is not a routine refusal; SB-7 requires it be distinguishable from one, so it
+        // is named here explicitly rather than left to the Warning catch-all below.
+        SECRET_TRIP_DECISION => EventLogSeverity::Error,
         AUTH_REJECT_DECISION
         | DENIED_DECISION
         | ABAC_DENIED_DECISION
@@ -1407,6 +1438,27 @@ mod tests {
         let throttled =
             AuditEvent::auth_reject("203.0.113.0/24", "static", 10_000, "expired").throttled();
         assert_eq!(event_log_severity(&throttled), EventLogSeverity::Error);
+
+        // The other Error: an exfiltration tripwire. SB-7 requires it be distinguishable from
+        // a routine refusal, so it is not the Warning the catch-all would give it (NMCP-SPEC-002
+        // SB-9). Without the explicit arm, `secret_trip` would fall through to Warning and land
+        // beside a policy denial a SOC filters out.
+        assert_eq!(
+            severity_of(SECRET_TRIP_DECISION),
+            EventLogSeverity::Error,
+            "a trip is exfiltration in progress, not a routine refusal (SB-7, SB-9)"
+        );
+    }
+
+    /// A trip record is an additional event on a call's own id, not the call's verdict, so it is
+    /// not an authorization decision: a reader counting allowed and denied calls, or measuring
+    /// their latency, must not count it, exactly as it must not count the intent record.
+    #[test]
+    fn a_trip_record_is_not_an_authorization_verdict() {
+        assert!(!is_authorization_decision(SECRET_TRIP_DECISION));
+        // The verdicts a call actually carries stay verdicts.
+        assert!(is_authorization_decision(ALLOWED_DECISION));
+        assert!(is_authorization_decision(DENIED_DECISION));
     }
 
     /// M4-1, the third defect. Every record carried one Event ID, and SIEM rules key on Event

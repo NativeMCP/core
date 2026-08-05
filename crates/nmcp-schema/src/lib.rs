@@ -69,6 +69,14 @@
 //! [`Denial::SecretUnavailable`] is the refusal, added through the `non_exhaustive` headroom
 //! section 4.5 reserved for exactly it.
 //!
+//! I-035 added the exfiltration tripwire: [`SecretTripwire`] and [`redaction_marker`], the
+//! literal detector SB-9 runs after the effect. It lands here rather than in `nmcp-secrets`
+//! because it needs [`SealedSecret`]'s scoped exposure and must be reachable from both
+//! `nmcp-router`'s ring stage 8 and `nmcp-exec`'s `env` output path, and `nmcp-schema` is the
+//! one crate both already depend on; the arming floor stays store configuration in
+//! `nmcp-secrets`, handed in rather than owned here. The tripwire module documentation argues
+//! the placement, the literal-match concession (SB-A5) and the confirmation-oracle cost (T13).
+//!
 //! I-049 added the request lifecycle: [`RequestState`] and the guard types that walk it. It
 //! arrived here at NMCP-SPEC-003 v1.4 from `nmcp-host`, which re-exports it, and it belongs
 //! here on the merits rather than for reach: the lifecycle is part of what every participant in
@@ -88,6 +96,7 @@ mod registry;
 mod scope;
 mod secret_ref;
 mod secrets;
+mod tripwire;
 
 pub use authority::{
     CapabilityGrant, Denial, GrantedAuthority, HeldAuthority, ToolAuthority, ToolEffect, ToolReach,
@@ -111,6 +120,9 @@ pub use secret_ref::{
     SecretSlotCatalog, SecretSlotError, secret_slots,
 };
 pub use secrets::{ResolvedSecrets, SealedSecret};
+pub use tripwire::{
+    DEFAULT_TRIPWIRE_FLOOR, REDACTION_MARKER_PREFIX, SecretTripwire, TripwireScan, redaction_marker,
+};
 
 /// Semantic version of this crate, taken from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

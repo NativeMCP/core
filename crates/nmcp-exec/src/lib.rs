@@ -9,15 +9,16 @@
 use anyhow::{Context, bail};
 use nmcp_audit::{AuditEvent, AuditSink};
 use nmcp_policy::{Permission, PolicyConfig, absolute_path};
-use nmcp_schema::SealedSecret;
+use nmcp_schema::{SealedSecret, SecretTripwire};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
@@ -616,7 +617,8 @@ impl CommandBroker {
     ///
     /// Returns the error this operation can fail with.
     pub async fn execute(&self, req: ExecuteRequest) -> anyhow::Result<ExecutionReport> {
-        self.execute_with_injected_env(req, &[]).await
+        self.execute_with_injected_env(req, &[], nmcp_schema::DEFAULT_TRIPWIRE_FLOOR)
+            .await
     }
 
     /// [`CommandBroker::execute`] with broker-injected environment variables (NMCP-SPEC-002
@@ -641,6 +643,11 @@ impl CommandBroker {
     /// zeroize, the same class of intermediate the platform sealers are required to zero
     /// where they can and `std` cannot be asked to.
     ///
+    /// The `floor` is the tripwire arming floor (SB-9): a value shorter than it does not arm,
+    /// so a short injected value passes through captured output unredacted, which is detection
+    /// being off rather than a failure (T14). The store owns the floor; this method is handed
+    /// it, and [`CommandBroker::execute`] passes the default for a call with no injection.
+    ///
     /// # Errors
     ///
     /// Everything [`CommandBroker::execute`] can fail with, plus a refusal naming the
@@ -651,6 +658,7 @@ impl CommandBroker {
         &self,
         req: ExecuteRequest,
         injected_env: &[(String, SealedSecret)],
+        floor: usize,
     ) -> anyhow::Result<ExecutionReport> {
         self.policy.require(Permission::Execute, &req.cwd)?;
         reject_delete_intent(&req.program, &req.args)?;
@@ -683,14 +691,23 @@ impl CommandBroker {
         let output = tokio::time::timeout(Duration::from_millis(req.timeout_ms), child.output())
             .await
             .context("command timed out")??;
+        // SB-9's tripwire on the synchronous path: the captured stdout and stderr are the
+        // agent-visible surface, and an injected value that reached them is redacted here,
+        // before the tails are built, so a caller's report never carries the value. This path
+        // captures the output in memory, so redaction is at result-assembly time; there is no
+        // persisted log to serve later. The marker names the injected variable, which is the
+        // name this crate knows a value by.
+        let tripwire = tripwire_for(injected_env, floor);
+        let stdout = tripwire.scan_bytes(&output.stdout).redacted;
+        let stderr = tripwire.scan_bytes(&output.stderr).redacted;
         let report = ExecutionReport {
             cwd: req.cwd.display().to_string(),
             program: req.program.clone(),
             args: req.args.clone(),
             exit_code: output.status.code(),
             duration_ms: started.elapsed().as_millis(),
-            stdout_tail: tail_text(&String::from_utf8_lossy(&output.stdout), DEFAULT_TAIL_BYTES),
-            stderr_tail: tail_text(&String::from_utf8_lossy(&output.stderr), DEFAULT_TAIL_BYTES),
+            stdout_tail: tail_text(&String::from_utf8_lossy(&stdout), DEFAULT_TAIL_BYTES),
+            stderr_tail: tail_text(&String::from_utf8_lossy(&stderr), DEFAULT_TAIL_BYTES),
             summary: "command executed and report captured".into(),
         };
         // The `env=` line is built from `redacted_env` and from nothing else, which is
@@ -848,7 +865,8 @@ impl CommandBroker {
         &self,
         req: ExecuteStartRequest,
     ) -> anyhow::Result<ExecuteJobStartReport> {
-        self.execute_start_with_injected_env(req, &[]).await
+        self.execute_start_with_injected_env(req, &[], nmcp_schema::DEFAULT_TRIPWIRE_FLOOR)
+            .await
     }
 
     /// [`CommandBroker::execute_start`] with broker-injected environment variables.
@@ -861,6 +879,22 @@ impl CommandBroker {
     /// sealed carriers are borrowed and are done with before this returns: the child holds
     /// its own copy from the spawn, so the borrow does not outlive the start call even
     /// though the job does.
+    ///
+    /// ## The persisted logs are post-redaction, not raw (SB-9, I-035)
+    ///
+    /// `execute_tail` serves the persisted logs from disk in a **later** request, when the
+    /// injected value is no longer active in that request and a request-scoped scan would see
+    /// nothing (T1b). So the redaction has to happen before the bytes reach disk, not at serve
+    /// time. The base streamed the child's stdout and stderr straight into the log files, which
+    /// would persist the raw value; this restructures it so the child's output is piped through
+    /// the broker, each chunk is scanned against this call's tripwire, and the **redacted**
+    /// bytes are what is appended to the log. A running job stays live-tailable, chunk by chunk;
+    /// the durable log a later `execute_tail` reads is post-redaction by construction. The one
+    /// residual is SB-9's own named evasion: a value straddling a stream read boundary spans two
+    /// chunks and neither half matches, exactly the "value straddling a stream read boundary"
+    /// case SB-9 lists, which literal detection concedes (SB-A5). The tripwire is passed to the
+    /// monitor task by shared handle, so the material lives as long as the job produces output,
+    /// which is what redacting a stream requires; it drops when the job ends.
     ///
     /// # Errors
     ///
@@ -875,6 +909,7 @@ impl CommandBroker {
         &self,
         req: ExecuteStartRequest,
         injected_env: &[(String, SealedSecret)],
+        floor: usize,
     ) -> anyhow::Result<ExecuteJobStartReport> {
         self.policy.require(Permission::Execute, &req.cwd)?;
         reject_delete_intent(&req.program, &req.args)?;
@@ -937,16 +972,6 @@ impl CommandBroker {
         };
         metadata.redacted_env = resolved.environment.redacted_env.clone();
         write_job_metadata(&metadata_path, &mut metadata)?;
-        let stdout = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stdout_log)
-            .with_context(|| format!("opening stdout log {}", stdout_log.display()))?;
-        let stderr = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_log)
-            .with_context(|| format!("opening stderr log {}", stderr_log.display()))?;
         let mut command = Command::new(&resolved.path);
         apply_command_options(
             &mut command,
@@ -968,9 +993,12 @@ impl CommandBroker {
             self.audit_job_event("execute_start_failed", &metadata)?;
             return Ok(start_report(&metadata));
         }
-        command
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+        // Piped rather than redirected to the log files directly, so the broker sees the
+        // child's output and can redact it before it reaches disk (SB-9, I-035). The base
+        // used `Stdio::from(file)`, which persists the raw value; the monitor task drains
+        // these pipes, scans each chunk against `tripwire`, and appends the redacted bytes
+        // to the logs.
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -998,6 +1026,11 @@ impl CommandBroker {
             self.jobs.clone(),
             cancel_rx,
             permit,
+            JobLogs {
+                stdout: stdout_log,
+                stderr: stderr_log,
+                tripwire: Arc::new(tripwire_for(injected_env, floor)),
+            },
         ));
         Ok(start_report(&metadata))
     }
@@ -1167,6 +1200,18 @@ impl CommandBroker {
     }
 }
 
+/// The persisted logs a job's output is redacted into, and the tripwire that redacts it (SB-9).
+///
+/// Carried into [`monitor_job`] together because they belong together: the monitor drains the
+/// child's piped stdout and stderr, scans each chunk against `tripwire`, and appends the
+/// redacted bytes to these paths, so the persisted log is post-redaction rather than the raw
+/// value a later `execute_tail` would otherwise serve (T1b).
+struct JobLogs {
+    stdout: PathBuf,
+    stderr: PathBuf,
+    tripwire: Arc<SecretTripwire>,
+}
+
 async fn monitor_job(
     mut child: Child,
     mut metadata: ExecuteJobMetadata,
@@ -1175,9 +1220,23 @@ async fn monitor_job(
     jobs: ExecuteJobRegistry,
     cancel_rx: oneshot::Receiver<()>,
     _permit: OwnedSemaphorePermit,
+    logs: JobLogs,
 ) {
     let job_id = metadata.job_id.clone();
     let timeout_ms = metadata.timeout_ms;
+    // Drain the piped output concurrently with waiting for the child: reading each pipe as it
+    // fills is what keeps the child from blocking on a full pipe buffer, and it is where the
+    // redaction happens, chunk by chunk, before the bytes reach the log (SB-9, I-035).
+    let stdout_drain = tokio::spawn(drain_redacted(
+        child.stdout.take(),
+        logs.stdout,
+        Arc::clone(&logs.tripwire),
+    ));
+    let stderr_drain = tokio::spawn(drain_redacted(
+        child.stderr.take(),
+        logs.stderr,
+        logs.tripwire,
+    ));
     let outcome = tokio::select! {
         status = child.wait() => match status {
             Ok(status) => (ExecuteJobStatus::Exited, status.code(), None, "job exited".to_string()),
@@ -1194,6 +1253,11 @@ async fn monitor_job(
             (ExecuteJobStatus::Cancelled, status.and_then(|s| s.code()), None, "job cancelled by NativeMCP".to_string())
         },
     };
+    // Flush the redacted logs before marking the job finished, so a reader that sees a terminal
+    // status sees the whole log, post-redaction. The child's stdio has closed by now (it exited
+    // or was killed), so each drain reaches EOF and returns.
+    let _ = stdout_drain.await;
+    let _ = stderr_drain.await;
     metadata.status = outcome.0;
     metadata.exit_code = outcome.1;
     metadata.error = outcome.2;
@@ -1216,6 +1280,46 @@ async fn monitor_job(
     );
     let _ = audit.append(&event);
     jobs.finish(&job_id).await;
+}
+
+/// Read a child pipe to EOF, redacting each chunk against the tripwire before appending it to
+/// the log (NMCP-SPEC-002 SB-9, I-035).
+///
+/// The persisted-before-serve guarantee for a durable job's logs: the bytes written here are the
+/// redacted bytes, so a later `execute_tail` reading this file from disk cannot serve the raw
+/// value (T1b). An empty tripwire, which is every job with no injected value, redacts nothing, so
+/// the log is byte-identical to what the child produced and every existing job behaves as before.
+///
+/// The named residual is SB-9's own: a value that straddles two reads spans two chunks and
+/// neither half matches, the "value straddling a stream read boundary" evasion the spec lists
+/// and literal detection concedes (SB-A5). Nothing here reassembles across reads, because doing
+/// so would mean buffering the whole stream and losing the live tail.
+async fn drain_redacted(
+    reader: Option<impl AsyncReadExt + Unpin>,
+    path: PathBuf,
+    tripwire: Arc<SecretTripwire>,
+) -> anyhow::Result<()> {
+    let Some(mut reader) = reader else {
+        return Ok(());
+    };
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .with_context(|| format!("opening job log {}", path.display()))?;
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).unwrap_or(&buffer);
+        let redacted = tripwire.scan_bytes(chunk).redacted;
+        file.write_all(&redacted).await?;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 fn apply_command_options(
@@ -1962,6 +2066,23 @@ fn redact_env_with_injected(
 /// The names an injection will place in the child environment, for the redaction rule.
 fn injected_names(injected_env: &[(String, SealedSecret)]) -> BTreeSet<String> {
     injected_env.iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// The exfiltration tripwire for this call's injected values (NMCP-SPEC-002 SB-9, I-035).
+///
+/// Built from the same `(variable, value)` pairs the `env` modality injects, so the surface a
+/// value could leak on and the value watched for are the one set. The marker names the injected
+/// variable, which is the name this crate knows a value by; the ring, which holds the key name,
+/// names the key on its own surfaces. `floor` is the store's arming floor, handed in: a value
+/// below it is not armed, so a short injected value is never redacted, which is detection being
+/// off for it (T14). The values are shared handles, not copies of material.
+fn tripwire_for(injected_env: &[(String, SealedSecret)], floor: usize) -> SecretTripwire {
+    SecretTripwire::armed(
+        floor,
+        injected_env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    )
 }
 
 /// Move injected material into the child's environment map, at spawn (SB-4).
@@ -3257,8 +3378,11 @@ mod tests {
 
     /// Distinctive material with no English substring, so absence assertions cannot collide
     /// with legitimate prose, and long enough that no fragment of a path or a timestamp
-    /// mimics it.
+    /// mimics it. Thirty-two bytes, above the tripwire floor, so it arms (SB-9).
     const INJECTED_MATERIAL: &str = "zk8qw-4vnt7-2rjx9-pm3hd-injected";
+
+    /// The tripwire arming floor the injected-env tests pass, the store default (SB-9).
+    const TRIPWIRE_FLOOR: usize = nmcp_schema::DEFAULT_TRIPWIRE_FLOOR;
 
     fn injected(var: &str) -> Vec<(String, SealedSecret)> {
         vec![(
@@ -3276,12 +3400,16 @@ mod tests {
         format!("echo ${var}")
     }
 
-    /// The modality works: the child process observes the injected variable. The child's
-    /// copy is the child's, which is SB-1's stated bound; past the process boundary the
-    /// program allowlist is the whole control, and that allowlist is the binding's,
-    /// enforced at stage 5b rather than here.
+    /// The modality delivers the value to the child, proven through the tripwire's own marker:
+    /// the child echoes `$DATABASE_URL`, and the value it printed comes back
+    /// `[nmcp:redacted/DATABASE_URL]` rather than the material. The marker is only present when
+    /// the child actually echoed the injected value (an undelivered variable echoes empty and
+    /// produces no marker), so its presence proves delivery, and its replacing the material
+    /// proves I-035 redacts the synchronous tail (SB-9). The child's copy is the child's, which
+    /// is SB-1's stated bound; past the process boundary the program allowlist is the whole
+    /// control, and that allowlist is the binding's, enforced at stage 5b rather than here.
     #[tokio::test]
-    async fn an_injected_variable_reaches_the_child_process() {
+    async fn an_injected_variable_reaches_the_child_and_is_redacted_in_the_tail() {
         let root = temp_root("nmcp-exec-inject-reaches");
         let report = broker(&root)
             .execute_with_injected_env(
@@ -3295,15 +3423,56 @@ mod tests {
                     profile: None,
                 },
                 &injected("DATABASE_URL"),
+                TRIPWIRE_FLOOR,
             )
             .await
             .expect("execute");
         assert_eq!(report.exit_code, Some(0));
         assert!(
-            report.stdout_tail.contains(INJECTED_MATERIAL),
-            "the child observes the injected value: {}",
+            report.stdout_tail.contains("[nmcp:redacted/DATABASE_URL]"),
+            "the child echoed the injected value and it was redacted: {}",
             report.stdout_tail
         );
+        assert!(
+            !report.stdout_tail.contains(INJECTED_MATERIAL),
+            "no byte window of the injected value survives in the tail (SB-9)"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A below-floor injected value is not armed, so it passes through captured output
+    /// unredacted: detection is off for a short value, which is a fact rather than a failure
+    /// (T14). The same echo as the test above, with a nine-byte value and the default floor.
+    #[tokio::test]
+    async fn a_below_floor_injected_value_passes_through_the_tail_unredacted() {
+        let root = temp_root("nmcp-exec-inject-belowfloor");
+        let short = "pin12345"; // eight bytes, below the sixteen-byte floor
+        let report = broker(&root)
+            .execute_with_injected_env(
+                ExecuteRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args(&print_env_script("DATABASE_URL")),
+                    timeout_ms: 10_000,
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &[(
+                    "DATABASE_URL".to_string(),
+                    SealedSecret::new(short.as_bytes().to_vec()),
+                )],
+                TRIPWIRE_FLOOR,
+            )
+            .await
+            .expect("execute");
+        assert_eq!(report.exit_code, Some(0));
+        assert!(
+            report.stdout_tail.contains(short),
+            "a below-floor value is not armed, so it is not redacted: {}",
+            report.stdout_tail
+        );
+        assert!(!report.stdout_tail.contains("[nmcp:redacted/"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3336,6 +3505,7 @@ mod tests {
                     profile: None,
                 },
                 &injected("DATABASE_URL"),
+                TRIPWIRE_FLOOR,
             )
             .await
             .expect("execute");
@@ -3354,10 +3524,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Persisted-log coverage (SB-9, I-035, T1b): after a durable job whose child echoes the
+    /// injected value, the bytes on disk in `stdout.log` are post-redaction, not the raw value.
+    /// This is the surface `execute_tail` serves from disk in a later request, so the redaction
+    /// has to be in the persisted bytes rather than applied at serve time, and the pipe-through
+    /// restructure is what puts it there. The test reads the log file directly, not through any
+    /// tail path, so it measures the persisted bytes themselves.
+    #[tokio::test]
+    async fn a_durable_jobs_persisted_log_is_post_redaction_on_disk() {
+        let root = temp_root("nmcp-exec-inject-persisted");
+        let broker = broker(&root);
+        let start = broker
+            .execute_start_with_injected_env(
+                ExecuteStartRequest {
+                    cwd: root.clone(),
+                    program: shell_program(),
+                    args: shell_args(&print_env_script("DATABASE_URL")),
+                    timeout_ms: Some(10_000),
+                    env: BTreeMap::new(),
+                    inherit_service_env: Some(false),
+                    profile: None,
+                },
+                &injected("DATABASE_URL"),
+                TRIPWIRE_FLOOR,
+            )
+            .await
+            .expect("start");
+        wait_for_terminal(&broker, &start.job_id)
+            .await
+            .expect("wait");
+
+        // The raw bytes on disk, read directly rather than through a tail: no byte window of
+        // the material survives, and the marker is what stands in its place.
+        let log_path = root
+            .join("exec-jobs")
+            .join(&start.job_id)
+            .join("stdout.log");
+        let bytes = std::fs::read(&log_path).expect("stdout.log");
+        assert!(
+            !bytes
+                .windows(INJECTED_MATERIAL.len())
+                .any(|window| window == INJECTED_MATERIAL.as_bytes()),
+            "the persisted log carries no byte window of the material (T1b)"
+        );
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("[nmcp:redacted/DATABASE_URL]"),
+            "the persisted bytes are post-redaction, not raw"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The durable-job half of T1c plus SB-4's third hardening: the persisted `job.json`
     /// and every status surface show `<redacted>` for the injected name, a caller value
-    /// colliding with it neither wins nor leaks, and the child observes the injected value
-    /// rather than the caller's.
+    /// colliding with it neither wins nor leaks, and the value the child echoed is redacted
+    /// in the persisted log (SB-9, I-035). The injection winning the collision is proven by the
+    /// marker's presence, since the marker appears only when the injected value, not the
+    /// caller's `caller-plain-qq17`, is what the child printed.
     #[tokio::test]
     async fn an_injected_name_is_redacted_in_job_metadata_and_wins_a_collision() {
         let root = temp_root("nmcp-exec-inject-job");
@@ -3375,6 +3597,7 @@ mod tests {
                     profile: None,
                 },
                 &injected("DATABASE_URL"),
+                TRIPWIRE_FLOOR,
             )
             .await
             .expect("start");
@@ -3383,9 +3606,13 @@ mod tests {
             .expect("wait");
         assert_eq!(status.exit_code, Some(0));
         assert!(
-            status.stdout_tail.contains(INJECTED_MATERIAL),
-            "the injection wins the collision in the child: {}",
+            status.stdout_tail.contains("[nmcp:redacted/DATABASE_URL]"),
+            "the injected value won the collision and was redacted in the log: {}",
             status.stdout_tail
+        );
+        assert!(
+            !status.stdout_tail.contains(INJECTED_MATERIAL),
+            "no byte window of the injected value survives in the served tail (SB-9)"
         );
         assert!(!status.stdout_tail.contains("caller-plain-qq17"));
 
@@ -3431,6 +3658,7 @@ mod tests {
                     profile: None,
                 },
                 &injected("DATABASE_URL"),
+                TRIPWIRE_FLOOR,
             )
             .await
             .expect("execute");
@@ -3474,6 +3702,7 @@ mod tests {
                     "DATABASE_URL".to_string(),
                     SealedSecret::new(vec![0xFF, 0xFE, 0x90, 0x00]),
                 )],
+                TRIPWIRE_FLOOR,
             )
             .await
             .expect_err("non-UTF-8 material is refused");

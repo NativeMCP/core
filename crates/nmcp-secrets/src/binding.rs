@@ -183,6 +183,69 @@ pub struct KeyBinding {
     /// records where the counter lives and how the window advances (G-2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<UseBudget>,
+    /// What the exfiltration tripwire does to this key on a trip (SB-9). Absent is
+    /// [`OnTripAction::Suspend`], the operator ruling's default; the same optional,
+    /// skip-when-absent discipline as `expires_at_unix_ms` and `budget`, so a binding written
+    /// before this field existed reads back with the default rather than being refused. It is
+    /// operator-written policy, so it belongs in the terms an operator writes rather than in the
+    /// evaluator-written spend state beside them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_trip: Option<OnTripAction>,
+}
+
+impl KeyBinding {
+    /// The on-trip action this binding sets, defaulting to [`OnTripAction::Suspend`] when the
+    /// operator wrote none (SB-9, section 8 item 1).
+    #[must_use]
+    pub fn on_trip_action(&self) -> OnTripAction {
+        self.on_trip.unwrap_or_default()
+    }
+}
+
+/// What the tripwire does to a key when an armed value of it reaches agent-visible output
+/// (NMCP-SPEC-002 SB-9, section 8 item 1).
+///
+/// The per-key override SB-9 calls "the key's on-trip policy". It is binding-adjacent because
+/// the binding block is the per-key policy surface that exists, and because SB-9 names it a
+/// per-key setting; it sits on [`KeyBinding`] beside the allowlists rather than in a second
+/// place a key's policy could disagree with itself. Absent is [`Self::Suspend`], the operator
+/// ruling's default (section 8 item 1): quarantine is the heavier state, and T13 argues for
+/// making a trip terminal for the attempt rather than for the key, so suspension, which is
+/// reversible, is the default and quarantine is the opt-in for a key an operator wants revoked
+/// on any leak. `None` redacts and audits but changes no state, for a key whose appearing in
+/// output is expected and whose detection is wanted only for the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OnTripAction {
+    /// Withdraw the key from service reversibly through the FSM's `Active -> Suspended` edge
+    /// (SB-14), which an operator reverses. The default, and what T13's one-shot bound relies
+    /// on: a confirmed hit suspends, so a low-entropy value is recoverable in at most one guess.
+    #[default]
+    Suspend,
+    /// Revoke the key through the FSM's `Active -> Quarantined` edge (SB-14), the heavier,
+    /// immediate withdrawal, for a key an operator wants gone on any leak rather than paused.
+    Quarantine,
+    /// Redact and audit, but change no key state. Detection without withdrawal, for a key whose
+    /// value legitimately appears in output and whose trip is wanted only on the chain.
+    None,
+}
+
+impl OnTripAction {
+    /// The action's stable name, for an audit summary and an operator message.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Suspend => "suspend",
+            Self::Quarantine => "quarantine",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for OnTripAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// A count of uses per fixed window (SB-6).
@@ -641,6 +704,7 @@ mod tests {
             callers: vec!["operator.local".to_string()],
             expires_at_unix_ms: None,
             budget: None,
+            on_trip: None,
         }
     }
 
@@ -1558,5 +1622,53 @@ mod tests {
         for text in &rendered {
             assert_material_absent(text, MATERIAL);
         }
+    }
+
+    // - NMCP-SPEC-002 SB-9: the per-key on-trip override (I-035) -
+
+    use super::OnTripAction;
+
+    /// The on-trip action defaults to suspend when the operator wrote none, serializes to the
+    /// vocabulary the spec and the CLI use, and round-trips. Suspend is the operator ruling's
+    /// default (section 8 item 1); an absent field reads as it rather than being refused.
+    #[test]
+    fn the_on_trip_action_defaults_to_suspend_and_round_trips() {
+        assert_eq!(OnTripAction::default(), OnTripAction::Suspend);
+
+        // A binding with no on_trip reads back as suspend.
+        let mut binding = full_binding();
+        binding.on_trip = None;
+        assert_eq!(binding.on_trip_action(), OnTripAction::Suspend);
+        // A binding written before the field existed carries no key for it, so it is absent
+        // and defaults; and a present value is honoured.
+        binding.on_trip = Some(OnTripAction::Quarantine);
+        assert_eq!(binding.on_trip_action(), OnTripAction::Quarantine);
+
+        for (action, wire) in [
+            (OnTripAction::Suspend, "\"suspend\""),
+            (OnTripAction::Quarantine, "\"quarantine\""),
+            (OnTripAction::None, "\"none\""),
+        ] {
+            let text = serde_json::to_string(&action).unwrap();
+            assert_eq!(text, wire);
+            let back: OnTripAction = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, action);
+            assert_eq!(action.as_str(), wire.trim_matches('"'));
+        }
+    }
+
+    /// A binding block serialized without an `on_trip` field parses, defaulting to suspend, so a
+    /// store written before this field existed opens unchanged (the additive discipline).
+    #[test]
+    fn a_binding_without_on_trip_parses_and_defaults() {
+        let json = r#"{
+            "tools": ["exec.run"],
+            "programs": [],
+            "roots": [],
+            "callers": ["operator.local"]
+        }"#;
+        let binding: KeyBinding = serde_json::from_str(json).unwrap();
+        assert_eq!(binding.on_trip, None);
+        assert_eq!(binding.on_trip_action(), OnTripAction::Suspend);
     }
 }
