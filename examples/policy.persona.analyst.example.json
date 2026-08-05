@@ -1,0 +1,37 @@
+{
+  "admin_bind": "127.0.0.1:18769",
+  "mcp_bind": "127.0.0.1:18770",
+  "mcp_allowed_origins": [],
+  "mcp_require_client_auth": true,
+  "mcp_clients": [
+    {
+      "agent_id": "replace-me",
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "auto_approve": true,
+  "audit_path": "C:\\ProgramData\\NativeMCP\\audit\\nativemcp-mcp.audit.jsonl",
+  "exec_state_dir": "C:\\ProgramData\\NativeMCP\\work\\exec-jobs",
+  "tool_paths": {},
+  "execution_profiles": {
+    "readonly": {
+      "path_prepend": [],
+      "env": {},
+      "inherit_service_env": false
+    }
+  },
+  "default_execution_profile": "readonly",
+  "roots": [
+    {
+      "id": "data",
+      "path": "D:\\data",
+      "permissions": [
+        "list",
+        "read",
+        "search",
+        "scan",
+        "report"
+      ]
+    }
+  ]
+}
