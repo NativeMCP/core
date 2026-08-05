@@ -16,6 +16,7 @@ members = [
 "crates/nmcp-schema",
 "crates/nmcp-audit",
 "crates/nmcp-host",
+"crates/nmcp-secrets",
 ]
 
 [workspace.package]
@@ -77,3 +78,13 @@ thiserror = "2.0.11"
 serde_json = "1.0.135"
 serde = { version = "1.0.217", features = ["derive"] }
 chrono = { version = "0.4.39", features = ["serde"] }
+# NMCP-SPEC-002 additions, each an INV-7 reviewed change the specification requests
+# rather than assumes. SB-1 names `zeroize` for erasure of material on drop. The core
+# file sealer's cipher is a maintained AEAD rather than a construction written and
+# reviewed nowhere, which is the alternative SB-A7 exists to prevent; its keys and
+# nonces come from the operating system generator, with no seedable fallback. `hex`
+# is the at-rest encoding for sealed blobs inside the store's JSON documents.
+zeroize = "1.9.0"
+chacha20poly1305 = "0.11.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
