@@ -1,6 +1,6 @@
 [package]
 name = "nmcp-secrets"
-description = "Sealed secret store, sealer abstraction and key lifecycle for NativeMCP servers."
+description = "Sealed secret store, sealer abstraction and key lifecycle for nMCP servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

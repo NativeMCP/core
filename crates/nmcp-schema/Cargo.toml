@@ -1,6 +1,6 @@
 [package]
 name = "nmcp-schema"
-description = "Tool contract, capability manifest and configuration schema for NativeMCP servers."
+description = "Tool contract, capability manifest and configuration schema for nMCP servers."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

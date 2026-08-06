@@ -257,9 +257,9 @@ impl PolicyChangePlan {
 /// Paths tried, in order, when looking for one under no root in either policy. Only the first
 /// that qualifies is used. They are deliberately implausible as real roots.
 const OUTSIDE_CANDIDATES: &[&str] = &[
-    r"Z:\__nativemcp_outside_all_roots__",
-    r"Y:\__nativemcp_outside_all_roots__",
-    r"\\__nativemcp__\outside\all\roots",
+    r"Z:\__nmcp_outside_all_roots__",
+    r"Y:\__nmcp_outside_all_roots__",
+    r"\\__nmcp__\outside\all\roots",
 ];
 
 fn verdict(policy: &PolicyConfig, permission: Permission, path: &str) -> (Verdict, Option<String>) {

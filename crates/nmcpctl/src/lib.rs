@@ -125,7 +125,7 @@ pub struct CtlIo<'a> {
 #[command(
     name = "nmcpctl",
     version,
-    about = "NativeMCP operator commands: the secret broker's operator surface, policy tools \
+    about = "nMCP operator commands: the secret broker's operator surface, policy tools \
              and audit verification"
 )]
 pub struct Cli {

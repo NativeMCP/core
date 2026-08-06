@@ -1,6 +1,6 @@
 [package]
 name = "nmcp-gateway"
-description = "Upstream MCP proxy provider: governed admission catalog, native transports and credential injection for NativeMCP."
+description = "Upstream MCP proxy provider: governed admission catalog, native transports and credential injection for nMCP."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

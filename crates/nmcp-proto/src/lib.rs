@@ -302,7 +302,7 @@ pub fn discover_result(tools: &[Value]) -> Value {
     json!({
         "supportedVersions": SUPPORTED_PROTOCOL_VERSIONS,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": "nativemcp-core", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "nmcp-core", "version": env!("CARGO_PKG_VERSION") },
         "instructions": SERVER_INSTRUCTIONS,
         "tools": tools,
         "ttlMs": TOOLS_LIST_TTL_MS,
@@ -317,7 +317,7 @@ pub fn discover_result(tools: &[Value]) -> Value {
 pub fn initialize_result(protocol_version: &str) -> Value {
     json!({
         "protocolVersion": protocol_version,
-        "serverInfo": { "name": "nativemcp-core", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "nmcp-core", "version": env!("CARGO_PKG_VERSION") },
         "capabilities": { "tools": {} }
     })
 }
@@ -352,14 +352,14 @@ pub fn tool_list() -> Vec<ToolSpec> {
         ToolSpec { name: "move_file".into(), description: "Move a file to a different directory. Audited separately from rename.".into(), input_schema: json!({"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}) },
         ToolSpec { name: "backup_file".into(), description: "Rename a file to .bak, .bak1, .bak2, etc. This is the only destructive-adjacent operation.".into(), input_schema: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) },
         ToolSpec { name: "execute".into(), description: "Run a short configured local command and return an execution report. timeout_ms defaults to 30000 to stay below connector request limits; use execute_start for durable long-running work.".into(), input_schema: json!({"type":"object","properties":{"cwd":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_ms":{"type":"integer","description":"Optional command timeout in milliseconds. Defaults to 30000 (30 seconds)."},"profile":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"inherit_service_env":{"type":"boolean"}},"required":["cwd","program"]}) },
-        ToolSpec { name: "execute_start".into(), description: "Start a long-running command as a durable NativeMCP job and return immediately with job_id and log paths.".into(), input_schema: json!({"type":"object","properties":{"cwd":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_ms":{"type":"integer"},"profile":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"inherit_service_env":{"type":"boolean"}},"required":["cwd","program"]}) },
+        ToolSpec { name: "execute_start".into(), description: "Start a long-running command as a durable nMCP job and return immediately with job_id and log paths.".into(), input_schema: json!({"type":"object","properties":{"cwd":{"type":"string"},"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"timeout_ms":{"type":"integer"},"profile":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"inherit_service_env":{"type":"boolean"}},"required":["cwd","program"]}) },
         ToolSpec { name: "execute_resolve_program".into(), description: "Resolve a program using request env, configured tool aliases, execution profiles, service PATH, and Windows PATHEXT without starting it.".into(), input_schema: json!({"type":"object","properties":{"program":{"type":"string"},"profile":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"inherit_service_env":{"type":"boolean"}},"required":["program"]}) },
         ToolSpec { name: "execute_env_report".into(), description: "Report the service execution environment, configured execution profiles, tool aliases, effective exec state directory, and redacted env preview.".into(), input_schema: json!({"type":"object","properties":{"profile":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}},"inherit_service_env":{"type":"boolean"}}}) },
         ToolSpec { name: "execute_status".into(), description: "Return current status for an execute job, including PID, elapsed time, command shape, and exit code when finished.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}) },
         ToolSpec { name: "execute_tail".into(), description: "Return bounded stdout and stderr tails from an execute job's append-only log files.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["job_id"]}) },
         ToolSpec { name: "execute_wait".into(), description: "Wait briefly for an execute job and return status plus bounded tails; use status/result for later polling.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"},"timeout_ms":{"type":"integer"},"max_bytes":{"type":"integer"}},"required":["job_id"]}) },
         ToolSpec { name: "execute_result".into(), description: "Return the final report for an execute job, or running status plus log tails if still active.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}) },
-        ToolSpec { name: "execute_cancel".into(), description: "Cancel only a process job created by NativeMCP and audit the cancellation.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}) },
+        ToolSpec { name: "execute_cancel".into(), description: "Cancel only a process job created by nMCP and audit the cancellation.".into(), input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"}},"required":["job_id"]}) },
     ]
 }
 
@@ -466,7 +466,7 @@ mod tests {
                 "discover advertises {version} but the negotiator refuses it"
             );
         }
-        assert_eq!(result["serverInfo"]["name"], "nativemcp-core");
+        assert_eq!(result["serverInfo"]["name"], "nmcp-core");
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["ttlMs"], TOOLS_LIST_TTL_MS);
         assert_eq!(result["tools"][0]["name"], "list_roots");
@@ -545,7 +545,7 @@ mod tests {
     fn initialize_result_reports_the_negotiated_revision() {
         let result = initialize_result("2025-11-25");
         assert_eq!(result["protocolVersion"], "2025-11-25");
-        assert_eq!(result["serverInfo"]["name"], "nativemcp-core");
+        assert_eq!(result["serverInfo"]["name"], "nmcp-core");
         assert!(result["capabilities"]["tools"].is_object());
     }
 
