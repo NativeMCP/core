@@ -1939,3 +1939,203 @@ mod tests {
         assert_send_sync::<Arc<dyn ToolRegistry>>();
     }
 }
+
+#[cfg(test)]
+mod upstream_gateway_lifecycle {
+    //! RC-18's gateway half, driven end to end against the real pieces: the actual
+    //! `UpstreamProvider` fetching from a live loopback upstream, and the actual index it
+    //! registers into. The registry half of RC-18 is graded above with a synthetic
+    //! provider; what that cannot grade is the seam this module exists for, that the
+    //! provider's `contracts()` are built from a verified fetch and that the registry's
+    //! `refresh` is the one moment they become resolvable.
+    //!
+    //! G-8 is the second half: whether the `tools_sha256` pin is verified before or after
+    //! the index is rebuilt decides whether a tampered catalogue is ever briefly
+    //! resolvable. The gateway verifies before its cache is replaced, this module refreshes
+    //! the index off that cache after a tampered fetch, and what stays resolvable is the
+    //! last verified catalogue, which is the security property stated as a test.
+    //!
+    //! The test lives in this crate deliberately: the kernel composes providers, a provider
+    //! never links the kernel (RC-12, RC-A5), and this is the composition direction the
+    //! daemon wave will wire for real.
+
+    // Tests assert on shapes, verdicts and JSON, where expect/indexing ARE the assertion:
+    // a panic in a test is the failure signal, so the production rationale for the
+    // workspace denies (availability plus an audit gap) does not apply. Scoped to the test
+    // module, named in the PR.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+
+    use super::IndexedToolRegistry;
+    use nmcp_gateway::{UpstreamProvider, UpstreamStatus};
+    use nmcp_policy::{PolicyConfig, UpstreamConfig};
+    use nmcp_schema::{CatalogView, ToolProvider, ToolRegistry};
+    use parking_lot::RwLock;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A loopback upstream serving whatever `tools` currently holds.
+    async fn mock_upstream(tools: Arc<RwLock<Value>>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let tools = Arc::clone(&tools);
+                tokio::spawn(async move {
+                    let mut data = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    for _ in 0..8 {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(k) => {
+                                data.extend_from_slice(&tmp[..k]);
+                                if String::from_utf8_lossy(&data).contains("tools/list") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let body = json!({
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "result": {"tools": tools.read().clone()}
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_audit() -> nmcp_audit::AuditSink {
+        nmcp_audit::AuditSink::open(
+            std::env::temp_dir().join(format!("nmcp-host-gateway-{}.jsonl", uuid::Uuid::new_v4())),
+        )
+        .expect("audit sink")
+    }
+
+    fn listed_names(registry: &IndexedToolRegistry) -> Vec<String> {
+        registry
+            .list_for(&CatalogView::default())
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The whole chain the plan names: fetch, pin verify, cache, registry refresh,
+    /// resolvable; then the tampered fetch that must change none of it.
+    #[tokio::test]
+    async fn the_upstream_lifecycle_reaches_the_index_and_a_tampered_list_never_does() {
+        let annotations = json!({"readOnlyHint": true, "customTier": 3});
+        let pinned = json!([{
+            "name": "echo",
+            "description": "echo tool",
+            "inputSchema": {"type": "object"},
+            "annotations": annotations
+        }]);
+        let pin = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&pinned).expect("serialize"))
+        );
+        let tools = Arc::new(RwLock::new(pinned));
+        let addr = mock_upstream(Arc::clone(&tools)).await;
+
+        let mut config = UpstreamConfig::new("up", format!("http://{addr}"));
+        config.tools_sha256 = Some(pin);
+        let provider =
+            UpstreamProvider::new(config, test_audit(), None, None).expect("provider builds");
+
+        // RC-18: the provider registers EMPTY, before its cache warms, and that is a
+        // successful registration rather than a refusal.
+        let registry = IndexedToolRegistry::new(Arc::new(RwLock::new(PolicyConfig::default())));
+        let as_provider: Arc<dyn ToolProvider> = provider.clone();
+        registry
+            .register(as_provider)
+            .expect("an empty upstream registers");
+        assert!(registry.resolve("up_echo").is_none());
+        assert!(listed_names(&registry).is_empty());
+
+        // The cache warms. Nothing becomes resolvable on its own: the index is read at
+        // registration and refresh, never on dispatch (RC-9).
+        for _ in 0..100 {
+            if matches!(provider.status(), UpstreamStatus::Online) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(matches!(provider.status(), UpstreamStatus::Online));
+        assert!(registry.resolve("up_echo").is_none());
+
+        // The registry refresh picks up the warm, verified cache: resolvable under both
+        // non-empty-id name forms, listable, and the upstream's own annotations ride the
+        // listing verbatim (RC-21), never a first-party derivation.
+        registry.refresh("up").expect("refresh");
+        let (owner, local) = registry
+            .resolve("up_echo")
+            .expect("resolvable after refresh");
+        assert_eq!(owner.provider_id(), "up");
+        assert_eq!(local, "echo");
+        assert!(registry.resolve("up::echo").is_some());
+        let listed = registry.list_for(&CatalogView::default());
+        let echo = listed
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some("up_echo"))
+            .expect("listed");
+        assert_eq!(echo.get("annotations"), Some(&annotations));
+
+        // The upstream turns hostile: same endpoint, a list the pin does not match. The
+        // fetch is refused BEFORE the provider cache is replaced, so the registry refresh
+        // that follows rebuilds from the last verified catalogue: the old tool stays
+        // resolvable, the tampered one never resolves and never lists, even briefly (G-8).
+        *tools.write() = json!([
+            {"name": "echo", "description": "echo tool", "inputSchema": {"type": "object"},
+             "annotations": {"readOnlyHint": true, "customTier": 3}},
+            {"name": "exfiltrate", "description": "added after the pin was taken"}
+        ]);
+        provider.refresh();
+        let mut refused = false;
+        for _ in 0..100 {
+            if let UpstreamStatus::Offline { reason } = provider.status() {
+                assert!(reason.contains("tools_sha256 mismatch"), "{reason}");
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(refused, "the tampered fetch must be refused");
+
+        registry
+            .refresh("up")
+            .expect("refresh after the refused fetch");
+        assert!(
+            registry.resolve("up_echo").is_some(),
+            "the last verified catalogue must stay resolvable"
+        );
+        assert!(
+            registry.resolve("up_exfiltrate").is_none(),
+            "a tampered catalogue must never become resolvable"
+        );
+        assert!(!listed_names(&registry).contains(&"up_exfiltrate".to_string()));
+
+        provider.shutdown();
+    }
+}

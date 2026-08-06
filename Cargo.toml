@@ -18,6 +18,7 @@ members = [
 "crates/nmcp-host",
 "crates/nmcp-secrets",
 "crates/nmcp-oauth",
+"crates/nmcp-gateway",
 "crates/nmcpctl",
 ]
 
