@@ -71,6 +71,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binding::{
     BINDING_SCHEMA_VERSION, BindingDenial, BindingRecord, BindingRequest, KeyBinding, OnTripAction,
+    UseBudget,
 };
 use crate::file_sealer::MemorySealer;
 use crate::grant::{BindingGrant, BindingRuleId};
@@ -180,6 +181,41 @@ pub struct SecretMeta {
     pub below_tripwire_floor: bool,
     /// Every version, in ascending order, with its state.
     pub versions: Vec<VersionMeta>,
+}
+
+/// What the operator surface reports about one key's binding: the terms reduced to their
+/// shape, and the budget's live spend state.
+///
+/// The read half `nmcpctl secret list` (I-037) needs beside [`SecretMeta`], and an addition
+/// to the SB-14 surface in the same additive sense as [`SealedStore::bind`]: SB-R2's binding
+/// summary has to come from somewhere, and a second parser over this store's own documents in
+/// another crate is the two-copies drift SB-2 records the base already paid for. Allowlists
+/// are reported as sizes rather than contents, which is what a list view needs; the operator
+/// who wants the lists wrote them and re-reads them at [`SealedStore::bind`] time. Nothing
+/// here is material or derived from material (SB-1): counts, timestamps and policy names
+/// describe the terms of use, not the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingSummary {
+    /// How many tools the tool allowlist admits. Zero admits none (SB-6).
+    pub tools: usize,
+    /// How many program basenames the `env` modality's allowlist admits. Zero admits none.
+    pub programs: usize,
+    /// How many root identifiers the root allowlist admits. Zero admits none.
+    pub roots: usize,
+    /// How many caller identities the caller allowlist admits. Zero admits none.
+    pub callers: usize,
+    /// When the binding stops admitting anything, if the operator set an expiry.
+    pub expires_at_unix_ms: Option<u64>,
+    /// The use budget's terms, when the binding is metered.
+    pub budget: Option<UseBudget>,
+    /// Grants minted inside the window open at the time of asking; zero when no window is
+    /// open, including when the last one has closed. The boundary belongs to the closed side
+    /// (`elapsed >= window` means closed), read with the same arithmetic the evaluator
+    /// spends by, so the list and the gate cannot disagree about whether a window is open.
+    pub used_in_open_window: u32,
+    /// What the exfiltration tripwire does to this key on a trip (SB-9): the binding's
+    /// setting, or the operator ruling's default when the binding does not say.
+    pub on_trip: OnTripAction,
 }
 
 /// One file the store found and could not read, and why.
@@ -1096,8 +1132,8 @@ impl SealedStore {
     /// Withdraw `name` from service reversibly, the tripwire's default on-trip action (SB-9).
     ///
     /// Moves the in-service version through the FSM's `Active -> Suspended` edge (SB-14), which
-    /// an operator reverses (`Suspended -> Active` exists, and is the operator surface's, landing
-    /// with `nmcpctl` at I-037/I-038, exactly as `restore` reverses a quarantine). A suspended
+    /// an operator reverses through [`SealedStore::resume`] (`nmcpctl secret resume`, landed at
+    /// I-037/I-038, exactly as `restore` reverses a quarantine). A suspended
     /// key resolves nothing, so [`SealedStore::evaluate`] refuses it naming `key-state`, which is
     /// how a dispatch after a trip is turned away. This is an FSM write, not a file operation:
     /// nothing is deleted, and INV-1's no-delete rule is untouched.
@@ -1144,6 +1180,62 @@ impl SealedStore {
         Ok(())
     }
 
+    /// Return `name` to service, reversing a suspension.
+    ///
+    /// The reverse half of [`SealedStore::suspend`], and an addition to the SB-14 surface in
+    /// the same sense `suspend` was: the FSM edge is SB-14's own (`Suspended -> Active`, the
+    /// edge the specification writes beside the state list), and the store method landed with
+    /// the operator surface at I-037/I-038, mirroring [`SealedStore::restore`]'s shape:
+    /// operator-only, immediate, an FSM write, and nothing deleted.
+    ///
+    /// The highest suspended version is promoted, and only when no version is in service,
+    /// because at most one version of a key is ever [`KeyState::Active`] and that invariant
+    /// is load-bearing for resolution. Nothing this crate's own writers produce can hold a
+    /// suspended version beside an active one, or two suspended versions at once
+    /// ([`SealedStore::suspend`] moves only the active version, and there is at most one),
+    /// but a document written by another generation or edited by an operator can, and the
+    /// store reads those: promoting into a document that already has a version in service is
+    /// refused rather than performed, because performing it would write the exact shape load
+    /// validation refuses as [`UnreadableReason::AmbiguousActiveVersion`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged, has nothing to resume
+    /// ([`StoreError::NothingToResume`]: no version is suspended, or a version is already in
+    /// service), or the document cannot be written.
+    pub fn resume(&self, name: &SecretName) -> Result<(), StoreError> {
+        let mut state = self.state.lock();
+        sweep(&mut state, (self.clock)());
+        ensure_not_damaged(&state, name)?;
+        let Some(document) = state.secrets.get(name) else {
+            return Err(StoreError::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        let mut updated = document.clone();
+        let mut moved = 0_usize;
+        if current_version(&updated).is_none()
+            && let Some((version, record)) = updated
+                .versions
+                .iter_mut()
+                .rev()
+                .find(|(_, record)| record.lifecycle.state() == KeyState::Suspended)
+        {
+            record.lifecycle = record
+                .lifecycle
+                .advance(KeyState::Active)
+                .map_err(|source| StoreError::illegal(name, *version, source))?;
+            moved += 1;
+        }
+        if moved == 0 {
+            return Err(StoreError::NothingToResume {
+                name: name.to_string(),
+            });
+        }
+        persist_and_commit(&mut state, name, updated)?;
+        Ok(())
+    }
+
     /// The on-trip action bound for `name`, defaulting to [`OnTripAction::Suspend`] (SB-9).
     ///
     /// Reads the key's binding, which is where the per-key override lives (section 8 item 1). An
@@ -1168,6 +1260,53 @@ impl SealedStore {
             .map_or(OnTripAction::default(), |record| {
                 record.terms.on_trip_action()
             }))
+    }
+
+    /// The shape of `name`'s binding, or `None` when the operator has not bound it.
+    ///
+    /// What `nmcpctl secret list` (I-037) prints beside each key's states: the read half of
+    /// [`SealedStore::bind`], reduced to what a list needs (see [`BindingSummary`] for what
+    /// travels and why sizes rather than contents). `None` is a real answer rather than an
+    /// error, because an unbound key is a legitimate state the list must show: it is deny by
+    /// default made visible, exactly as [`SealedStore::evaluate`] refuses it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the key is absent or damaged.
+    pub fn binding_summary(&self, name: &SecretName) -> Result<Option<BindingSummary>, StoreError> {
+        let mut state = self.state.lock();
+        let now = (self.clock)();
+        sweep(&mut state, now);
+        ensure_not_damaged(&state, name)?;
+        let Some(document) = state.secrets.get(name) else {
+            return Err(StoreError::UnknownSecret {
+                name: name.to_string(),
+            });
+        };
+        Ok(document.binding.as_ref().map(|record| {
+            let terms = &record.terms;
+            // Open means `elapsed < window`, the complement of the closed side the
+            // evaluator's spend arithmetic uses, over the same saturating subtraction.
+            let used_in_open_window = match (terms.budget, record.spent) {
+                (Some(budget), Some(spent))
+                    if now.saturating_sub(spent.window_started_at_unix_ms)
+                        < budget.window_secs.saturating_mul(1_000) =>
+                {
+                    spent.used
+                }
+                _ => 0,
+            };
+            BindingSummary {
+                tools: terms.tools.len(),
+                programs: terms.programs.len(),
+                roots: terms.roots.len(),
+                callers: terms.callers.len(),
+                expires_at_unix_ms: terms.expires_at_unix_ms,
+                budget: terms.budget,
+                used_in_open_window,
+                on_trip: terms.on_trip_action(),
+            }
+        }))
     }
 
     /// Apply `name`'s bound on-trip action after the tripwire caught a value of it (SB-9).
@@ -1856,6 +1995,20 @@ pub enum StoreError {
     /// out of service, which is the whole point of the trip's on-trip action.
     #[error("no version of {name} is in service to suspend")]
     NothingToSuspend {
+        /// The name.
+        name: String,
+    },
+
+    /// The key has nothing a resume would change.
+    ///
+    /// Two shapes land here and both are refusals rather than no-ops: no version of the key
+    /// is suspended, or a version is already in service, in which case promoting a suspended
+    /// one would put two versions in service at once, breaking the invariant resolution
+    /// depends on ([`SealedStore::resume`] documents why the second shape exists at all).
+    #[error(
+        "secret {name} has nothing to resume: no version is suspended, or one is already in service"
+    )]
+    NothingToResume {
         /// The name.
         name: String,
     },
@@ -3256,7 +3409,7 @@ mod tests {
     // - NMCP-SPEC-002 SB-9: the tripwire's store surface (I-035) -
 
     use super::{DEFAULT_TRIPWIRE_FLOOR, TRIPWIRE_FLOOR_MINIMUM};
-    use crate::binding::{BindingRequest, KeyBinding, OnTripAction};
+    use crate::binding::{BindingRequest, KeyBinding, OnTripAction, UseBudget};
 
     /// A binding that admits the fixture caller and tool, so a key can be evaluated and then
     /// suspended by the on-trip action.
@@ -3418,5 +3571,152 @@ mod tests {
             .unwrap();
         assert_eq!(store.apply_on_trip(&key).unwrap(), OnTripAction::None);
         assert_eq!(store.names()[0].state, KeyState::Active);
+    }
+
+    // - I-037/I-038: resume, the reverse of suspend, and the binding summary -
+
+    /// `Suspended -> Active` walked through the store: the round trip the operator surface
+    /// drives, persisted like every other FSM write, and refused when already in service.
+    #[test]
+    fn resume_returns_a_suspended_key_to_service_and_persists_it() {
+        let dir = TempDir::new("store-resume");
+        let key = name("deploy.db");
+        {
+            let store = open(&dir);
+            store.set(&key, sealed(MATERIAL)).unwrap();
+            store.bind(&key, tripwire_binding(None)).unwrap();
+            store.suspend(&key).unwrap();
+            assert_eq!(store.names()[0].state, KeyState::Suspended);
+            // Withdrawn: evaluation refuses naming key-state.
+            let denied = store
+                .evaluate(&key, &BindingRequest::new("keyed_run", "local"))
+                .unwrap_err();
+            assert_eq!(denied.rule(), "key-state");
+
+            store.resume(&key).unwrap();
+            let meta = &store.names()[0];
+            assert_eq!(meta.state, KeyState::Active);
+            assert_eq!(meta.current_version, Some(Version::first()));
+            // Back in service: evaluation mints and the material resolves.
+            let minted = store
+                .evaluate(&key, &BindingRequest::new("keyed_run", "local"))
+                .unwrap();
+            assert_eq!(exposed(&store.resolve(minted).unwrap()), MATERIAL.to_vec());
+            // Nothing left to resume: the refusal names both shapes it covers.
+            let refused = store.resume(&key).unwrap_err();
+            assert!(matches!(&refused, StoreError::NothingToResume { .. }));
+            assert!(
+                refused.to_string().contains("nothing to resume"),
+                "{refused}"
+            );
+        }
+        // A second process reads the resumed state back off disk.
+        let store = open(&dir);
+        assert_eq!(store.names()[0].state, KeyState::Active);
+        assert!(matches!(
+            store.resume(&name("absent")).unwrap_err(),
+            StoreError::UnknownSecret { .. }
+        ));
+    }
+
+    /// A document holding a suspended version beside an active one is nothing this crate's
+    /// writers produce, and the store reads foreign documents: resume must refuse rather than
+    /// promote, because promotion would write the two-in-service shape load validation
+    /// refuses as `AmbiguousActiveVersion`.
+    #[test]
+    fn resume_refuses_to_promote_beside_a_version_already_in_service() {
+        let dir = TempDir::new("store-resume-beside-active");
+        let key = name("edited.key");
+        {
+            let store = open(&dir);
+            store.set(&key, sealed(b"first-vv19-qq27")).unwrap();
+            store.rotate(&key, sealed(b"second-hh40-kk63")).unwrap();
+        }
+        // A foreign edit parks the superseded version in Suspended, beside the active one.
+        tamper(&dir.path().join("store"), "edited.key.json", |value| {
+            value["versions"]["1"]["lifecycle"] = serde_json::json!("suspended");
+        });
+        let store = open(&dir);
+        let refused = store.resume(&key).unwrap_err();
+        assert!(matches!(&refused, StoreError::NothingToResume { .. }));
+        assert!(
+            refused.to_string().contains("already in service"),
+            "{refused}"
+        );
+        // Nothing moved: version two is still the one in service, version one still parked.
+        let meta = &store.names()[0];
+        assert_eq!(meta.current_version, Some(Version::first().next()));
+        assert_eq!(meta.versions[0].state, KeyState::Suspended);
+    }
+
+    /// The binding summary reports the terms' shape and the budget's live spend, `None` for
+    /// an unbound key, and the same closed-side window boundary the evaluator spends by.
+    #[test]
+    fn binding_summary_reports_shape_and_live_spend_and_absence() {
+        let dir = TempDir::new("store-binding-summary");
+        let (store, clock) = open_with_clock(&dir);
+        let key = name("api.token");
+        store.set(&key, sealed(MATERIAL)).unwrap();
+        // Unbound is a real answer, not an error; an unknown name is an error.
+        assert_eq!(store.binding_summary(&key).unwrap(), None);
+        assert!(matches!(
+            store.binding_summary(&name("absent")).unwrap_err(),
+            StoreError::UnknownSecret { .. }
+        ));
+
+        let expiry = clock.load(Ordering::SeqCst) + 1_000_000;
+        store
+            .bind(
+                &key,
+                KeyBinding {
+                    tools: vec!["keyed_run".to_string(), "keyed_fetch".to_string()],
+                    programs: vec!["curl".to_string()],
+                    roots: Vec::new(),
+                    callers: vec!["local".to_string()],
+                    expires_at_unix_ms: Some(expiry),
+                    budget: Some(UseBudget {
+                        uses: 3,
+                        window_secs: 100,
+                    }),
+                    on_trip: None,
+                },
+            )
+            .unwrap();
+        let summary = store.binding_summary(&key).unwrap().unwrap();
+        assert_eq!(
+            (
+                summary.tools,
+                summary.programs,
+                summary.roots,
+                summary.callers
+            ),
+            (2, 1, 0, 1)
+        );
+        assert_eq!(summary.expires_at_unix_ms, Some(expiry));
+        assert_eq!(summary.budget.map(|budget| budget.uses), Some(3));
+        assert_eq!(summary.used_in_open_window, 0, "no window open before use");
+        assert_eq!(
+            summary.on_trip,
+            OnTripAction::Suspend,
+            "absent on_trip reads as the operator ruling's default"
+        );
+
+        // One mint opens the window and the summary reads the live spend; the grant is
+        // consumed against the store, so the spent use is a real resolution.
+        let grant = store
+            .evaluate(&key, &BindingRequest::new("keyed_run", "local"))
+            .unwrap();
+        assert_eq!(
+            store.resolve(grant).unwrap().with_exposed(Vec::clone),
+            MATERIAL.to_vec()
+        );
+        let spent = store.binding_summary(&key).unwrap().unwrap();
+        assert_eq!(spent.used_in_open_window, 1);
+
+        // At exactly the boundary the window has closed (the evaluator's own reading), so
+        // the open-window spend reads zero again.
+        clock.fetch_add(100 * 1_000, Ordering::SeqCst);
+        let closed = store.binding_summary(&key).unwrap().unwrap();
+        assert_eq!(closed.used_in_open_window, 0);
     }
 }
