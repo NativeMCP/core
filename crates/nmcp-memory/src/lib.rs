@@ -495,20 +495,43 @@ impl SqliteMemoryStore {
     /// Mark a fact as expired immediately (governed removal). MEM-5.
     /// Sets `ttl_at = now`; the row remains for audit. Content is not deleted.
     ///
+    /// Scoped. `scope_root` is part of the predicate, not a hint: a fact belonging
+    /// to another scope is not expired and the call reports `false`, identically to
+    /// a fact that does not exist. Telling the two apart would be an existence
+    /// oracle over another scope's identifiers.
+    ///
+    /// This argument did not exist before I-079. `write`, `search` and `list` all
+    /// carried `scope_root` in their predicate and these two mutations did not, so
+    /// a caller holding a fact's UUID could expire a fact in a scope they do not
+    /// own. The crate's own `scope_isolation_no_cross_root_reads` test asserted the
+    /// read half of that property and was named as though it covered all of it.
+    ///
     /// # Errors
     ///
     /// `SQLite` failure.
-    pub fn expire_now(&self, id: Uuid) -> anyhow::Result<bool> {
+    pub fn expire_now(&self, scope_root: &str, id: Uuid) -> anyhow::Result<bool> {
+        let scope = canonical_scope(scope_root);
         let conn = self.conn.lock();
         let now = dt_to_sql(Utc::now());
         let changed = conn.execute(
-            "UPDATE memory SET ttl_at = ?1 WHERE id = ?2",
-            params![now, id.to_string()],
+            "UPDATE memory SET ttl_at = ?1 WHERE id = ?2 AND scope_root = ?3",
+            params![now, id.to_string(), scope],
         )?;
         Ok(changed > 0)
     }
 
     /// Read a single fact by id regardless of TTL (for audit/admin purposes).
+    ///
+    /// **Deliberately unscoped, and the only method that is.** It serves the audit
+    /// and admin surface, which exists precisely to see across scopes, and it
+    /// bypasses the TTL filter for the same reason. I-079 scoped the two mutations
+    /// beside it and left this one alone on purpose.
+    ///
+    /// The consequence is a rule no signature can enforce: **no tool path may reach
+    /// this method.** A provider that called it would hand a caller another scope's
+    /// content, which is the isolation failure `authorized_scope` exists to prevent.
+    /// The memory provider landing at I-072 calls `search`, `list`, `write`,
+    /// `refresh_by_id` and `expire_now`, and not this.
     ///
     /// # Errors
     ///
@@ -562,19 +585,27 @@ impl SqliteMemoryStore {
     /// # Errors
     ///
     /// `SQLite` failure.
-    pub fn refresh_by_id(&self, id: Uuid, extend_ttl_secs: Option<i64>) -> anyhow::Result<bool> {
+    /// Scoped, for the reason given on [`SqliteMemoryStore::expire_now`]. A fact in
+    /// another scope is not refreshed and the call reports `false`.
+    pub fn refresh_by_id(
+        &self,
+        scope_root: &str,
+        id: Uuid,
+        extend_ttl_secs: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let scope = canonical_scope(scope_root);
         let conn = self.conn.lock();
         let now = Utc::now();
         let new_ttl = extend_ttl_secs.map(|s| dt_to_sql(now + Duration::seconds(s)));
         let changed = if let Some(ref ttl_str) = new_ttl {
             conn.execute(
-                "UPDATE memory SET refreshed_at = ?1, ttl_at = ?2 WHERE id = ?3",
-                params![dt_to_sql(now), ttl_str, id.to_string()],
+                "UPDATE memory SET refreshed_at = ?1, ttl_at = ?2 WHERE id = ?3 AND scope_root = ?4",
+                params![dt_to_sql(now), ttl_str, id.to_string(), scope],
             )?
         } else {
             conn.execute(
-                "UPDATE memory SET refreshed_at = ?1 WHERE id = ?2",
-                params![dt_to_sql(now), id.to_string()],
+                "UPDATE memory SET refreshed_at = ?1 WHERE id = ?2 AND scope_root = ?3",
+                params![dt_to_sql(now), id.to_string(), scope],
             )?
         };
         Ok(changed > 0)
@@ -681,7 +712,7 @@ mod tests {
         let before = store.list("scope/expire").expect("list before expire");
         assert_eq!(before.len(), 1);
 
-        store.expire_now(id).expect("expire_now");
+        store.expire_now("scope/expire", id).expect("expire_now");
 
         let after = store.list("scope/expire").expect("list after expire");
         assert!(after.is_empty(), "fact should be expired");
@@ -761,6 +792,105 @@ mod tests {
         assert_eq!(canonical_scope("Root/Proj"), canonical_scope("root/proj"));
     }
 
+    // I-079. The crate had a test named scope_isolation_no_cross_root_reads and no
+    // counterpart for writes, while expire_now and refresh_by_id matched on id alone.
+    // A caller holding a fact's UUID could expire another scope's memory: not data
+    // loss, since the row survives for audit, but a cross-scope denial, which is the
+    // same isolation boundary the read test was written to defend.
+    #[test]
+    fn scope_isolation_no_cross_root_mutations() {
+        let store = tmp_store();
+        let alice = store
+            .write(MemoryFact::new("root/alice", "alice fact"))
+            .expect("write");
+
+        // Bob knows the id and cannot use it.
+        assert!(
+            !store.expire_now("root/bob", alice).expect("expire"),
+            "a fact in another scope must not be expirable"
+        );
+        assert!(
+            !store
+                .refresh_by_id("root/bob", alice, Some(3600))
+                .expect("refresh"),
+            "a fact in another scope must not be refreshable"
+        );
+
+        // And the refusal is indistinguishable from the fact not existing, so the
+        // return value is not an existence oracle over another scope's identifiers.
+        assert!(
+            !store
+                .expire_now("root/bob", Uuid::new_v4())
+                .expect("expire"),
+            "a fact that does not exist reports the same false"
+        );
+
+        // Alice is untouched by any of it.
+        let alice_facts = store.list("root/alice").expect("list");
+        assert_eq!(alice_facts.len(), 1, "the fact must still be live");
+
+        // The owner can still do both.
+        assert!(
+            store
+                .refresh_by_id("root/alice", alice, Some(3600))
+                .expect("refresh"),
+            "the owning scope must still refresh"
+        );
+        assert!(
+            store.expire_now("root/alice", alice).expect("expire"),
+            "the owning scope must still expire"
+        );
+        assert!(
+            store.list("root/alice").expect("list").is_empty(),
+            "the owner's expire must take effect"
+        );
+    }
+
+    // The scope predicate must normalise exactly as write does. A mismatch would
+    // present as an isolation success while actually being a bug: the owner locked
+    // out of their own fact.
+    //
+    // Case only, because that is the part `canonical_scope` delivers on every
+    // platform. Separator folding is asserted separately below, and the reason it
+    // has to be is itself a finding.
+    #[test]
+    fn the_mutation_scope_predicate_normalises_case_like_write_does() {
+        let store = tmp_store();
+        let id = store
+            .write(MemoryFact::new("Root/Mixed", "fact"))
+            .expect("write");
+        assert!(
+            store
+                .refresh_by_id("root/mixed", id, None)
+                .expect("refresh"),
+            "a case difference must not read as a different scope"
+        );
+        assert!(
+            store.expire_now("ROOT/MIXED", id).expect("expire"),
+            "a case difference must not read as a different scope"
+        );
+    }
+
+    // `canonical_scope` says it "converts any path separator to `/`" and keeps DB
+    // keys "platform-independent". It does that with `PathBuf::components()`, and a
+    // backslash is an ordinary filename character on Unix, so the claim holds on
+    // Windows and not elsewhere. The behaviour is consistent within one install,
+    // which is the only place it matters today, so I-079 asserts what is true per
+    // platform rather than changing the normaliser as a side effect of a scope fix.
+    // The doc overclaim is recorded rather than silently worked around.
+    #[test]
+    #[cfg(windows)]
+    fn the_mutation_scope_predicate_folds_separators_on_windows() {
+        let store = tmp_store();
+        let id = store
+            .write(MemoryFact::new(r"Root\Mixed", "fact"))
+            .expect("write");
+        assert!(
+            store.expire_now("root/mixed", id).expect("expire"),
+            "on Windows a backslash and a forward slash are the same scope"
+        );
+    }
+
     // refresh_by_id updates refreshed_at without creating a new row.
     #[test]
     fn refresh_by_id_updates_timestamp() {
@@ -769,7 +899,9 @@ mod tests {
             .write(MemoryFact::new("scope/refresh", "fact to refresh"))
             .expect("write");
 
-        let found = store.refresh_by_id(id, Some(3600)).expect("refresh");
+        let found = store
+            .refresh_by_id("scope/refresh", id, Some(3600))
+            .expect("refresh");
         assert!(found, "refresh_by_id should return true for existing fact");
 
         let facts = store.list("scope/refresh").expect("list");
