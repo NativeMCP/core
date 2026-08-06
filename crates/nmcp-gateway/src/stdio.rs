@@ -529,7 +529,7 @@ mod tests {
         let script = std::env::temp_dir().join(format!("nmcp-stdio-{}.ps1", uuid::Uuid::new_v4()));
         std::fs::write(
             &script,
-            r#"
+            r"
 $ErrorActionPreference = 'Stop'
 while ($true) {
   $line = [Console]::In.ReadLine()
@@ -549,7 +549,7 @@ while ($true) {
     [Console]::Out.WriteLine((@{jsonrpc='2.0';id=$msg.id;error=@{code=-32601;message='method not found'}} | ConvertTo-Json -Compress -Depth 6))
   }
 }
-"#,
+",
         )
         .expect("write fake server");
 

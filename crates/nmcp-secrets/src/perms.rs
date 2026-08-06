@@ -113,7 +113,16 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> Result<(), PermsError> {
 }
 
 /// Apply `mode`. Not enforced off Unix; see [`crate::KeyProtection::PlatformDefault`].
+///
+/// # Errors
+///
+/// Never, on this platform. The signature is fallible because the contract is, and because
+/// NMCP-SPEC-002 SB-16's `StoreHardening` gives this arm an implementation that can fail.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the contract is fallible and SB-16 makes this arm fallible too; callers are cfg-agnostic"
+)]
 pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<(), PermsError> {
     Ok(())
 }
@@ -146,7 +155,17 @@ pub fn verify_restricted(path: &Path, required: u32) -> Result<(), PermsError> {
 
 /// Refuse a path the filesystem is not protecting. Not enforced off Unix; see
 /// [`crate::KeyProtection::PlatformDefault`].
+///
+/// # Errors
+///
+/// Never, on this platform, which is the gap `KeyProtection::PlatformDefault` names and
+/// NMCP-SPEC-002 SB-16's `StoreHardening` closes. The signature is fallible because the
+/// contract is.
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the contract is fallible and SB-16 makes this arm fallible too; callers are cfg-agnostic"
+)]
 pub fn verify_restricted(_path: &Path, _required: u32) -> Result<(), PermsError> {
     Ok(())
 }

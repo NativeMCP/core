@@ -650,7 +650,7 @@ pub fn list_windows_drives() -> anyhow::Result<Vec<DriveReport>> {
         let mut drives = Vec::new();
         for letter in b'A'..=b'Z' {
             let name = format!("{}:", letter as char);
-            let path = format!("{}\\", name);
+            let path = format!("{name}\\");
             if Path::new(&path).exists() {
                 drives.push(DriveReport { name, path });
             }

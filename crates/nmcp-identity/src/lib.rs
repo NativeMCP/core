@@ -34,8 +34,7 @@ pub fn program_data_root() -> PathBuf {
     #[cfg(windows)]
     {
         std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+            .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
             .join(DATA_DIR_NAME)
     }
     #[cfg(not(windows))]
