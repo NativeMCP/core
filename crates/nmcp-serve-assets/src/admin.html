@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>nMCP Admin</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico"/>
+<link rel="icon" type="image/png" href="/assets/icons/nmcp.png"/>
+<meta name="theme-color" content="#0f1117"/>
+<style>
+{{ADMIN_CSS}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside class="sb">
+  <div class="sb-brand">
+    <div class="sb-logo">
+      <img class="sb-logo-mark" src="/assets/icons/nmcp.png" alt="" aria-hidden="true"/>
+      <span>nMCP</span>
+    </div>
+    <div class="sb-tagline">Admin console &middot; v0.2.0</div>
+    <div class="sb-online">
+      <div class="sb-dot" id="sb-dot"></div>
+      <span class="sb-online-lbl" id="sb-status-lbl">Checking&hellip;</span>
+    </div>
+  </div>
+  <nav class="sb-nav" id="sb-nav">
+    <div class="sb-group">
+      <div class="sb-group-lbl">Main</div>
+      <button class="sb-item active" data-section="dashboard" onclick="nav('dashboard')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span class="sb-item-lbl">Dashboard</span>
+      </button>
+      <button class="sb-item" data-section="files" onclick="nav('files')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 7.5A2.5 2.5 0 015.5 5h3.7l2.8 1.75H18.5A2.5 2.5 0 0121 9.25V16.5A2.5 2.5 0 0118.5 19h-13A2.5 2.5 0 013 16.5v-9z"/></svg>
+        <span class="sb-item-lbl">Files</span>
+      </button>
+      <button class="sb-item" data-section="policy" onclick="nav('policy')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l8 4v6c0 5-3.5 9.74-8 11-4.5-1.26-8-6-8-11V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg>
+        <span class="sb-item-lbl">Policy &amp; roots</span>
+      </button>
+      <button class="sb-item" data-section="execution" onclick="nav('execution')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+        <span class="sb-item-lbl">Execution</span>
+      </button>
+      <button class="sb-item" data-section="upstreams" onclick="nav('upstreams')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v4M8.5 17.5l3.5-6.5M15.5 17.5L12 11"/></svg>
+        <span class="sb-item-lbl">MCP Gateway</span>
+        <span class="sb-item-badge" id="upstream-badge" style="display:none">0</span>
+      </button>
+    </div>
+    <div class="sb-group">
+      <div class="sb-group-lbl">Monitor</div>
+      <button class="sb-item" data-section="inspector" onclick="nav('inspector')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h16v4H4zM4 10h10v10H4zM16 10h4v10h-4z"/><path d="M7 13h4M7 16h3"/></svg>
+        <span class="sb-item-lbl">Inspector</span>
+        <span class="sb-item-badge" id="hitl-badge" style="display:none">0</span>
+      </button>
+      <button class="sb-item" data-section="audit" onclick="nav('audit')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 12h6M9 16h4M7 4H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V6a2 2 0 00-2-2h-2M9 4h6v4H9V4z"/></svg>
+        <span class="sb-item-lbl">Audit Viewer</span>
+        <span class="sb-item-badge" id="audit-badge" style="display:none">0</span>
+      </button>
+      <button class="sb-item" data-section="diagnostics" onclick="nav('diagnostics')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+        <span class="sb-item-lbl">Diagnostics</span>
+      </button>
+      <button class="sb-item" data-section="settings" onclick="nav('settings')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        <span class="sb-item-lbl">Settings</span>
+      </button>
+    </div>
+  </nav>
+  <div class="sb-footer">
+    <div class="sb-ep" id="sb-ep-admin">Admin: 127.0.0.1:18769</div>
+    <div class="sb-ep" id="sb-ep-mcp">MCP: 127.0.0.1:18770</div>
+  </div>
+</aside>
+<div class="main">
+  <div class="topbar" id="topbar">
+    <span class="tb-title" id="tb-title">Dashboard</span>
+
+  </div>
+  <div class="content" id="content"><div class="loading"><div class="spinner"></div> Loading&hellip;</div></div>
+  <div class="statusbar" id="statusbar">
+    <span id="sb-items">Ready</span>
+    <span class="grow"></span>
+    <span class="sb-tag ok" id="sb-health">Checking&hellip;</span>
+    <span class="sb-tag info" id="sb-auto"></span>
+  </div>
+</div>
+</div>
+<div id="modal-layer"></div>
+<div class="toast-layer" id="toast-layer"></div>
+
+<script>
+{{ADMIN_JS}}
+</script>
+</body>
+</html>
