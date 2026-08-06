@@ -16,8 +16,8 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
-nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.2.0" }
 parking_lot.workspace = true
 serde_json.workspace = true
 
@@ -28,8 +28,8 @@ async-trait.workspace = true
 # test-only edge is the composition direction the specs declare (the kernel composes
 # providers; a provider never links the kernel, RC-12/RC-A5), which is why the test lives
 # in this crate rather than `nmcp-gateway` taking a dev edge on `nmcp-host`.
-nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
-nmcp-gateway = { path = "../nmcp-gateway", version = "0.1.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
+nmcp-gateway = { path = "../nmcp-gateway", version = "0.2.0" }
 sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true

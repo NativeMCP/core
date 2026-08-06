@@ -18,9 +18,9 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
-nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
-nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
-nmcp-secrets = { path = "../nmcp-secrets", version = "0.1.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
+nmcp-secrets = { path = "../nmcp-secrets", version = "0.2.0" }
 rpassword.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

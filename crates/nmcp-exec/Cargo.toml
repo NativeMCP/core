@@ -17,11 +17,11 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
-nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
 # NMCP-SPEC-002 SB-4 (I-034): the sealed carrier the `env` injection modality receives
 # material in. `nmcp-schema -> nmcp-policy` only, so the edge is acyclic.
-nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.2.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

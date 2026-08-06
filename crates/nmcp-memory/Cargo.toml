@@ -19,7 +19,7 @@ workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true }
-nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.2.0" }
 parking_lot.workspace = true
 regex.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }

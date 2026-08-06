@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
