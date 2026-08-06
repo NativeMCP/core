@@ -23,12 +23,15 @@ ignore = [
     # exists anywhere in this process. A sidechannel that recovers a private key cannot recover
     # one that is not there.
     #
-    # The alternatives were both worse. Staying on `jsonwebtoken` 9 keeps GHSA-h395-gr6q-cpjc,
-    # a type confusion leading to authorization bypass, in the crate whose whole job is deciding
-    # whether a token may be accepted; that is the live risk this entry exists to remove.
-    # Switching to the `aws_lc_rs` backend pulls the aws-lc tree, whose OpenSSL licence component
+    # All three alternatives were worse, and the third was measured rather than reasoned about.
+    # Staying on `jsonwebtoken` 9 keeps GHSA-h395-gr6q-cpjc, a type confusion leading to
+    # authorization bypass, in the crate whose whole job is deciding whether a token may be
+    # accepted. The `aws_lc_rs` backend pulls the aws-lc tree, whose OpenSSL licence component
     # sits outside the allow list below and which this workspace already declined once, for
-    # `reqwest`.
+    # `reqwest`. And a backend-free bump to 10.x, which is what Dependabot proposed and what
+    # carries neither `rsa` nor `ring`, **panics at the first verification**: "Could not
+    # automatically determine the process-level CryptoProvider from jsonwebtoken crate
+    # features". A remote caller presenting any token would take the listener down.
     #
     # Revisit if this workspace ever SIGNS a JWT. At that moment a private key enters the
     # process, the reasoning above stops holding, and this entry must go rather than be widened.
