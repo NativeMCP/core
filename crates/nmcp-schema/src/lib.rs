@@ -115,9 +115,9 @@ pub use provider::ToolProvider;
 pub use registry::{CatalogView, RegistrationError, ToolRegistry};
 pub use scope::MemoryScope;
 pub use secret_ref::{
-    InjectionModality, RESERVED_SECRET_NAMESPACES, SECRET_NAME_MAX_CHARS, SECRET_REF_PREFIX,
-    SECRET_SLOT_ANNOTATION, SECRET_SLOT_MARKER, SecretRef, SecretRefError, SecretSlot,
-    SecretSlotCatalog, SecretSlotError, secret_slots,
+    InjectionModality, OAUTH_GRANT_NAMESPACE, RESERVED_SECRET_NAMESPACES, SECRET_NAME_MAX_CHARS,
+    SECRET_REF_PREFIX, SECRET_SLOT_ANNOTATION, SECRET_SLOT_MARKER, SecretRef, SecretRefError,
+    SecretSlot, SecretSlotCatalog, SecretSlotError, secret_slots,
 };
 pub use secrets::{ResolvedSecrets, SealedSecret};
 pub use tripwire::{
