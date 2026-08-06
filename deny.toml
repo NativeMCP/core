@@ -6,7 +6,34 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# The one entry, named here rather than left implicit, in the same discipline the licence
+# section uses: an exception is a reviewed decision recorded in the file, never a silent
+# addition.
+ignore = [
+    # RUSTSEC-2023-0071, the Marvin attack: a timing sidechannel in the pure-Rust `rsa` crate
+    # that can recover a **private** key from an attacker who can observe the timing of
+    # operations using it. Unpatched upstream; the advisory's own text says the only workaround
+    # is to avoid the crate.
+    #
+    # It does not apply to this graph, and the reason is structural rather than a judgement
+    # about likelihood. `rsa` arrives through `jsonwebtoken`'s `rust_crypto` backend, which
+    # `nmcp-authn` uses to VERIFY inbound bearer tokens. Verification is a public-key operation.
+    # `nmcp-authn` constructs `DecodingKey` and never `EncodingKey` (three uses to zero), every
+    # key arrives as a public JWK over an issuer's metadata endpoint, and no RSA private key
+    # exists anywhere in this process. A sidechannel that recovers a private key cannot recover
+    # one that is not there.
+    #
+    # The alternatives were both worse. Staying on `jsonwebtoken` 9 keeps GHSA-h395-gr6q-cpjc,
+    # a type confusion leading to authorization bypass, in the crate whose whole job is deciding
+    # whether a token may be accepted; that is the live risk this entry exists to remove.
+    # Switching to the `aws_lc_rs` backend pulls the aws-lc tree, whose OpenSSL licence component
+    # sits outside the allow list below and which this workspace already declined once, for
+    # `reqwest`.
+    #
+    # Revisit if this workspace ever SIGNS a JWT. At that moment a private key enters the
+    # process, the reasoning above stops holding, and this entry must go rather than be widened.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2
