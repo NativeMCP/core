@@ -7,6 +7,7 @@ members = [
 "crates/nmcp-reports",
 "crates/nmcp-local",
 "crates/nmcp-serve",
+"crates/nmcp-authn",
 "crates/nmcp-serve-assets",
 "crates/nmcp-abac",
 "crates/nmcp-router",
@@ -112,3 +113,12 @@ rpassword = "7.5.4"
 # Security.framework on macOS) is MIT/Apache-2.0 throughout, hand-checked.
 # `json` is the response-body decoding the token endpoints speak.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "native-tls"] }
+# I-074 addition, an INV-7 reviewed change: the inbound resource-server half of OAuth
+# (NMCP-PLAN-002 finding F-1) decodes and verifies a bearer token's JWT, which the
+# outbound broker in `nmcp-oauth` never had to do. `jsonwebtoken` is the algorithm
+# allowlist, the JWKS key type and the signature check, and RS-9's rule that `none`
+# and any algorithm outside the list is refused is enforced against its `Algorithm`
+# rather than against a string this repository parses. MIT, inside deny.toml's allow
+# list. Default features off: the `use_pem` default pulls a PEM parser this crate has
+# no use for, because every key arrives as a JWK over the metadata endpoint.
+jsonwebtoken = { version = "9.3.1", default-features = false }

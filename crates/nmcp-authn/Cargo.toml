@@ -1,0 +1,27 @@
+[package]
+name = "nmcp-authn"
+description = "Inbound access token acceptance for nMCP: the resource-server half of OAuth, with the algorithm allowlist, issuer and audience binding, subject mapping, and a key cache whose trust ceiling is testable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+jsonwebtoken.workspace = true
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
+parking_lot.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
