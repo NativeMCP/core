@@ -37,6 +37,20 @@ pub const MAX_JOB_WAIT_MS: u64 = 30_000;
 pub const DEFAULT_TAIL_BYTES: usize = 16_000;
 /// The `MAX_TAIL_BYTES` constant.
 pub const MAX_TAIL_BYTES: usize = 64_000;
+/// How long a killed job's output drains are given to reach EOF before the job is marked
+/// terminal regardless (I-069).
+///
+/// `Child::kill` signals the one process nMCP spawned, not the tree beneath it. A descendant
+/// that inherited the job's stdout and stderr holds those pipe write ends open after its parent
+/// is reaped, so [`drain_redacted`] sees no EOF until that descendant exits by itself. Awaiting
+/// the drains unconditionally therefore tied a cancelled job's terminal state to the completion
+/// of the work the cancel was supposed to stop: cancelling `sleep 10` still took ten seconds to
+/// report `cancelled`.
+///
+/// Two seconds is three orders of magnitude above the EOF a fully terminated tree produces, and
+/// far below any wait deadline a caller sets, so the grace expiring is evidence about the job
+/// rather than about load on the machine.
+pub const KILLED_JOB_DRAIN_GRACE_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// The `ExecuteRequest` structure.
@@ -1237,6 +1251,11 @@ async fn monitor_job(
         logs.stderr,
         logs.tripwire,
     ));
+    // Taken before the handles are consumed below, so the grace path can stop the drains rather
+    // than detach them. Dropping a `JoinHandle` leaves its task running, which would let a log
+    // keep growing after the status that says the job is over.
+    let stdout_abort = stdout_drain.abort_handle();
+    let stderr_abort = stderr_drain.abort_handle();
     let outcome = tokio::select! {
         status = child.wait() => match status {
             Ok(status) => (ExecuteJobStatus::Exited, status.code(), None, "job exited".to_string()),
@@ -1254,14 +1273,55 @@ async fn monitor_job(
         },
     };
     // Flush the redacted logs before marking the job finished, so a reader that sees a terminal
-    // status sees the whole log, post-redaction. The child's stdio has closed by now (it exited
-    // or was killed), so each drain reaches EOF and returns.
-    let _ = stdout_drain.await;
-    let _ = stderr_drain.await;
+    // status sees the log post-redaction rather than a later `execute_tail` serving raw bytes
+    // (T1b). That guarantee is about redaction, and it holds either way here: bytes not drained
+    // are never written to the log at all, so no unredacted byte is ever served.
+    //
+    // What does not hold unconditionally is completeness, and I-069 is why. The comment this
+    // replaced asserted "the child's stdio has closed by now (it exited or was killed), so each
+    // drain reaches EOF and returns". That is true when the child exited, and false when it was
+    // killed: `Child::kill` reaps the child, and a descendant that inherited the pipes keeps
+    // the write ends open. So the killed paths get a bounded grace and the natural-exit path
+    // does not. On a natural exit a descendant still writing is producing the job's output,
+    // which the caller asked for; after a kill it is a process that outlived the kill.
+    let killed = matches!(
+        outcome.0,
+        ExecuteJobStatus::Cancelled | ExecuteJobStatus::TimedOut
+    );
+    let drain_both = async move {
+        let _ = stdout_drain.await;
+        let _ = stderr_drain.await;
+    };
+    let logs_complete = if killed {
+        let within_grace =
+            tokio::time::timeout(Duration::from_millis(KILLED_JOB_DRAIN_GRACE_MS), drain_both)
+                .await
+                .is_ok();
+        if !within_grace {
+            stdout_abort.abort();
+            stderr_abort.abort();
+        }
+        within_grace
+    } else {
+        drain_both.await;
+        true
+    };
     metadata.status = outcome.0;
     metadata.exit_code = outcome.1;
     metadata.error = outcome.2;
-    metadata.summary = outcome.3;
+    // The claim is exactly what was observed and no more. Only the child and its descendants
+    // ever held these write ends, so a pipe still open after the child was reaped means a
+    // descendant outlived the kill. The converse does not follow: a descendant that closed or
+    // redirected its own stdio survives without holding the pipe, and this says nothing about
+    // it. Terminating the tree rather than the process is I-080.
+    metadata.summary = if logs_complete {
+        outcome.3
+    } else {
+        format!(
+            "{}; descendant processes still held the job's output pipes {KILLED_JOB_DRAIN_GRACE_MS}ms after the kill, so they outlived it and this log is truncated",
+            outcome.3
+        )
+    };
     metadata.finished_unix_ms = Some(now_unix_ms());
     let _ = write_job_metadata(&metadata_path, &mut metadata);
     let mut event = AuditEvent::effect(
@@ -1272,11 +1332,15 @@ async fn monitor_job(
     // comes off the job metadata, which is where it was persisted for exactly this moment.
     event.call_id = metadata.call_id;
     event.path = Some(metadata.cwd.clone());
+    // The audit line carries the survival fact too. A reader reconstructing what nMCP did to a
+    // cancelled job from the trail alone would otherwise read `status=cancelled` and conclude
+    // the work stopped.
     event.summary = format!(
-        "status={}; exit={:?}; duration_ms={}",
+        "status={}; exit={:?}; duration_ms={}; logs_complete={}",
         metadata.status.as_str(),
         metadata.exit_code,
-        elapsed_ms(&metadata)
+        elapsed_ms(&metadata),
+        logs_complete
     );
     let _ = audit.append(&event);
     jobs.finish(&job_id).await;
@@ -2263,6 +2327,64 @@ mod tests {
         format!("sleep {secs}; echo {out}; echo {err} >&2")
     }
 
+    /// A script that starts a long-running descendant and then proves it is running, with the
+    /// marker that proves it.
+    ///
+    /// `sleep_print_script` cannot serve this purpose. A test that starts it and cancels
+    /// immediately is racing the shell: on Windows the cancel wins, `cmd.exe` never reaches
+    /// `ping`, and a test written to assert something about a surviving descendant passes with
+    /// no descendant in existence. That was measured, not supposed.
+    ///
+    /// The ordering here is what makes the marker mean something. The sleeper is backgrounded
+    /// before the marker is printed, so a reader that has seen the marker knows the sleeper
+    /// already exists rather than that the shell is about to start it.
+    #[cfg(not(windows))]
+    fn descendant_marker_script() -> (String, &'static str) {
+        (
+            "sleep 10 & echo nmcp-descendant-up; wait".into(),
+            "nmcp-descendant-up",
+        )
+    }
+    /// The Windows form, where `ping` announces itself.
+    ///
+    /// `cmd.exe` has no reliable way to background a child and report it, so the marker is the
+    /// descendant's own first output instead, which is stronger: the bytes cannot exist unless
+    /// `ping` is running. The address rather than the banner text, because the banner is
+    /// localized and the address is not, and nothing else in this command line can emit it.
+    #[cfg(windows)]
+    fn descendant_marker_script() -> (String, &'static str) {
+        ("ping -n 12 127.0.0.1".into(), "127.0.0.1")
+    }
+
+    /// Poll a running job until its stdout carries `marker`, so the caller can act on a job
+    /// whose descendant is known to be up.
+    ///
+    /// Fails rather than proceeding if the marker never arrives, because every assertion that
+    /// follows one of these waits is about a descendant, and a silent proceed would turn a
+    /// missing precondition into a passing test.
+    async fn wait_for_marker(broker: &CommandBroker, job_id: &str, marker: &str) {
+        for _ in 0..100 {
+            let report = broker
+                .execute_status(ExecuteJobIdRequest {
+                    job_id: job_id.into(),
+                })
+                .expect("status");
+            assert_eq!(
+                report.status, "running",
+                "the job ended before its descendant announced itself, so nothing that follows \
+                 would be testing what it says it tests. Summary: {}",
+                report.summary
+            );
+            if report.stdout_tail.contains(marker) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "job {job_id} never emitted {marker:?}, so its descendant was never observed running"
+        );
+    }
+
     async fn wait_for_terminal(
         broker: &CommandBroker,
         job_id: &str,
@@ -3164,6 +3286,168 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// I-069. The defect this pins is not that the terminal status was wrong, it is that it
+    /// arrived only when the work the cancel was supposed to stop had finished by itself.
+    ///
+    /// `execute_cancel_cancels_running_owned_job` above asserted the status and nothing about
+    /// when, so on this tree at f48cdad it passed while taking 10.03s to cancel a ten-second
+    /// sleep. The cancel reaped `/bin/sh`; the `sleep` it had forked inherited the job's stdout
+    /// and stderr, held those write ends open, and `monitor_job` awaited the drains before
+    /// writing the terminal metadata. The wait deadline is ten seconds, started 75ms after the
+    /// cancel, so the assertion turned on a 75ms margin against a ten-second race. On the macOS
+    /// leg of PR #39 it lost, and the report came back "running".
+    ///
+    /// A ten-second script and a six-second bound cannot both be satisfied by a job that runs
+    /// to completion, so this fails on the unfixed code by construction rather than by timing.
+    ///
+    /// The marker wait is what makes that true on every platform. Cancelling straight after the
+    /// start races the shell, and on Windows the cancel wins: `cmd.exe` had not reached `ping`,
+    /// so there was no descendant, no held pipe, and a bound of six seconds against a job that
+    /// was already over. Waiting for the descendant to announce itself makes the ten seconds
+    /// real before the clock starts.
+    #[tokio::test]
+    async fn a_cancelled_job_reaches_its_terminal_state_when_it_is_cancelled() {
+        let root = temp_root("nmcp-exec-cancel-prompt");
+        let broker = broker(&root);
+        let (script, marker) = descendant_marker_script();
+        let start = broker
+            .execute_start(ExecuteStartRequest {
+                cwd: root.clone(),
+                program: shell_program(),
+                args: shell_args(&script),
+                timeout_ms: Some(30_000),
+                env: BTreeMap::new(),
+                inherit_service_env: Some(true),
+                profile: None,
+            })
+            .await
+            .expect("start");
+        wait_for_marker(&broker, &start.job_id, marker).await;
+        let began = Instant::now();
+        broker
+            .execute_cancel(ExecuteCancelRequest {
+                job_id: start.job_id.clone(),
+            })
+            .await
+            .expect("cancel");
+        let final_report = wait_for_terminal(&broker, &start.job_id)
+            .await
+            .expect("wait");
+        let elapsed = began.elapsed();
+        assert_eq!(final_report.status, "cancelled");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a cancelled job reached its terminal state after {elapsed:?}, which is the natural \
+             lifetime of the ten-second script rather than a consequence of the cancel. The \
+             grace is {KILLED_JOB_DRAIN_GRACE_MS}ms, so the fixed path lands near two seconds."
+        );
+    }
+
+    /// I-069. The grace expiring is a positive observation, and the record has to carry it.
+    ///
+    /// Only the child and its descendants ever hold these pipe write ends, so a pipe still open
+    /// after the child was reaped means a descendant outlived the kill. Without this the status
+    /// and the audit line would both say `cancelled` while the work continued, which is a false
+    /// entry in an immutable trail rather than a missing one.
+    ///
+    /// The negative case is
+    /// `a_cancel_that_leaves_nothing_behind_reports_a_complete_log`, and the two are only
+    /// meaningful together: this one alone would pass against an unconditional string.
+    ///
+    /// The descendant has to exist before the cancel for any of this to mean anything, which is
+    /// what the marker wait establishes and what the first version of this test did not.
+    #[tokio::test]
+    async fn a_cancel_that_outlives_its_descendants_says_so_in_the_record() {
+        let root = temp_root("nmcp-exec-cancel-survivors");
+        let broker = broker(&root);
+        let (script, marker) = descendant_marker_script();
+        let start = broker
+            .execute_start(ExecuteStartRequest {
+                cwd: root.clone(),
+                program: shell_program(),
+                args: shell_args(&script),
+                timeout_ms: Some(30_000),
+                env: BTreeMap::new(),
+                inherit_service_env: Some(true),
+                profile: None,
+            })
+            .await
+            .expect("start");
+        wait_for_marker(&broker, &start.job_id, marker).await;
+        broker
+            .execute_cancel(ExecuteCancelRequest {
+                job_id: start.job_id.clone(),
+            })
+            .await
+            .expect("cancel");
+        let final_report = wait_for_terminal(&broker, &start.job_id)
+            .await
+            .expect("wait");
+        assert_eq!(final_report.status, "cancelled");
+        assert!(
+            final_report.summary.contains("outlived it"),
+            "the shell forks the sleeper, so cancelling the shell leaves a process holding the \
+             job's pipes and the summary has to say so. Got: {}",
+            final_report.summary
+        );
+        let audit = std::fs::read_to_string(root.join("audit.jsonl")).expect("audit");
+        assert!(
+            audit.contains("logs_complete=false"),
+            "the trail carries the same fact, so a reader reconstructing the job from the audit \
+             alone does not read `status=cancelled` and conclude the work stopped"
+        );
+    }
+
+    /// I-069, the negative case that makes the positive one mean something.
+    ///
+    /// `exec` replaces the shell's image rather than forking, so the process nMCP spawned is the
+    /// sleeper itself and killing it closes the pipes at once. The drains reach EOF inside the
+    /// grace, the log is complete, and the summary is the plain cancellation line.
+    ///
+    /// Unix only, deliberately. `cmd.exe` has no `exec`: every `cmd /C` shape forks, so the
+    /// no-descendant case cannot be constructed there through the shell the other tests use.
+    /// Both CI legs that run this are the ones the defect was observed on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_that_leaves_nothing_behind_reports_a_complete_log() {
+        let root = temp_root("nmcp-exec-cancel-clean");
+        let broker = broker(&root);
+        let start = broker
+            .execute_start(ExecuteStartRequest {
+                cwd: root.clone(),
+                program: shell_program(),
+                args: shell_args("exec sleep 10"),
+                timeout_ms: Some(30_000),
+                env: BTreeMap::new(),
+                inherit_service_env: Some(true),
+                profile: None,
+            })
+            .await
+            .expect("start");
+        let began = Instant::now();
+        broker
+            .execute_cancel(ExecuteCancelRequest {
+                job_id: start.job_id.clone(),
+            })
+            .await
+            .expect("cancel");
+        let final_report = wait_for_terminal(&broker, &start.job_id)
+            .await
+            .expect("wait");
+        let elapsed = began.elapsed();
+        assert_eq!(final_report.status, "cancelled");
+        assert!(
+            !final_report.summary.contains("outlived it"),
+            "nothing outlived this kill, so the summary must not claim otherwise. Got: {}",
+            final_report.summary
+        );
+        assert!(
+            elapsed < Duration::from_millis(KILLED_JOB_DRAIN_GRACE_MS),
+            "with no descendant holding the pipes the drains reach EOF at once, so this must not \
+             spend the grace at all. Took {elapsed:?}."
+        );
     }
 
     /// G5-6. Every write stamps the moment it happened, including for a job that is still
