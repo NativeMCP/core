@@ -32,8 +32,20 @@ jobs:
       - run: cargo fmt --all -- --check
 
   lint:
-    name: clippy
-    runs-on: ubuntu-latest
+    # Three legs, because the lint set is not platform-neutral and neither is the
+    # code. Every #[cfg(windows)] and #[cfg(not(unix))] arm in this workspace was
+    # invisible to this gate while it ran on ubuntu alone, and five real errors
+    # accumulated behind it. W3b is entirely Windows code, so the gap was about to
+    # get much worse than five.
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1

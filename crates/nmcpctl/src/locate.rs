@@ -40,7 +40,15 @@ pub(crate) fn resolve_key_dir(flag: Option<PathBuf>, store_dir: &Path) -> PathBu
 }
 
 /// The platform's conventional location, exactly as [`STORE_HELP`] documents it.
+///
+/// Infallible on this platform, because `%ProgramData%` has a documented fallback. The other
+/// two arms fail when the environment names no home, and [`resolve_store_dir`] is
+/// `cfg`-agnostic, so the signature is shared across the three rather than narrowed here.
 #[cfg(target_os = "windows")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shared signature with the two fallible arms; the caller is cfg-agnostic"
+)]
 fn default_store_dir() -> Result<PathBuf, CtlError> {
     let base = std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from);
