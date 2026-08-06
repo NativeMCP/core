@@ -4,6 +4,7 @@ members = [
 "xtask",
 "crates/nmcp-inspector",
 "crates/nmcp-devtools",
+"crates/nmcp-reports",
 "crates/nmcp-abac",
 "crates/nmcp-router",
 "crates/nmcp-transport",
