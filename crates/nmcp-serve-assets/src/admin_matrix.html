@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>nMCP - Operator Matrix</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico"/>
+<link rel="icon" type="image/png" href="/assets/icons/nmcp.png"/>
+<meta name="theme-color" content="#06080c"/>
+<style>
+{{ADMIN_MATRIX_CSS}}
+</style>
+</head>
+<body>
+<div class="om-scanlines" aria-hidden="true"></div>
+<div class="om-shell">
+  <aside class="om-rail" aria-label="Operator Matrix navigation">
+    <div class="om-brand" title="nMCP Operator Matrix"><img src="/assets/icons/nmcp.png" alt=""/><span></span></div>
+    <nav class="om-nav" id="om-nav">
+      <button class="om-nav-item active" data-view="cockpit" title="Runtime Cockpit" onclick="matrixNav('cockpit')">C</button>
+      <button class="om-nav-item" data-view="sessions" title="Sessions & Streams" onclick="matrixNav('sessions')">S</button>
+      <button class="om-nav-item" data-view="policy" title="Policy Matrix" onclick="matrixNav('policy')">P</button>
+      <button class="om-nav-item" data-view="gateway" title="Gateway Store" onclick="matrixNav('gateway')">G</button>
+      <button class="om-nav-item" data-view="execution" title="Execution Console" onclick="matrixNav('execution')">E</button>
+      <button class="om-nav-item" data-view="audit" title="Audit Tape" onclick="matrixNav('audit')">A</button>
+      <button class="om-nav-item" data-view="diagnostics" title="Diagnostics" onclick="matrixNav('diagnostics')">D</button>
+    </nav>
+    <div class="om-rail-bottom">
+      <button class="om-nav-item" title="Enterprise Classic" onclick="location.href='/admin'">X</button>
+    </div>
+  </aside>
+
+  <main class="om-main">
+    <header class="om-topbar">
+      <div class="om-title-wrap"><div class="om-kicker">nMCP Admin Console</div><h1 id="matrix-title">OPERATOR MATRIX</h1></div>
+      <div class="om-pills" id="matrix-pills"></div>
+      <div class="om-profile"><label for="matrix-profile">View</label><select id="matrix-profile" onchange="setMatrixProfile(this.value)"><option value="enterprise">Enterprise</option><option value="dev">Dev</option><option value="sysadmin">SysAdmin</option><option value="security">Security</option><option value="store">Gateway Store</option></select></div>
+      <div class="om-clock" id="matrix-clock">UTC --:--:--</div>
+    </header>
+
+    <section class="om-workspace">
+      <div class="om-content" id="matrix-content"><div class="om-loading">Loading Operator Matrix...</div></div>
+      <aside class="om-context" id="matrix-context"></aside>
+    </section>
+  </main>
+</div>
+<div class="om-toast-layer" id="matrix-toasts"></div>
+<div class="om-modal-layer" id="matrix-modal"></div>
+<script>
+{{ADMIN_MATRIX_JS}}
+</script>
+</body>
+</html>

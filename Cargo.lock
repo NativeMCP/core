@@ -1316,6 +1316,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nmcp-serve-assets"
+version = "0.2.0"
+
+[[package]]
 name = "nmcp-transport"
 version = "0.2.0"
 dependencies = [

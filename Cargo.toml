@@ -5,6 +5,7 @@ members = [
 "crates/nmcp-inspector",
 "crates/nmcp-devtools",
 "crates/nmcp-reports",
+"crates/nmcp-serve-assets",
 "crates/nmcp-abac",
 "crates/nmcp-router",
 "crates/nmcp-transport",
