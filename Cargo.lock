@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-abac"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-devtools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1111,7 +1111,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "nmcp-audit",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "nmcp-audit",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -1163,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "nmcp-audit",
@@ -1179,11 +1179,11 @@ dependencies = [
 
 [[package]]
 name = "nmcp-identity"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nmcp-inspector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-oauth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "hex",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "nmcp-identity",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-router"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "nmcp-policy",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-secrets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.4.3",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "nmcp-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "parking_lot",
  "serde",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "nmcpctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "nmcp-audit",
@@ -2482,7 +2482,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

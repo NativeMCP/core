@@ -17,10 +17,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
 nmcp-identity.workspace = true
-nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
-nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.2.0" }
 # Ring stage 5b (NMCP-SPEC-002 SB-5, I-034): the ring holds the store handle and wires
 # binding evaluation to resolution. A new production edge, verified acyclic with cargo tree:
 # `nmcp-secrets -> nmcp-schema -> nmcp-policy -> nmcp-identity` and nothing in that chain
@@ -28,7 +28,7 @@ nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
 # resolution"; the ring is one function and it lives in this crate until I-031 moves
 # composition, and NMCP-SPEC-003 4.6, the governing frozen text, constrains the stage's
 # position rather than its crate.
-nmcp-secrets = { path = "../nmcp-secrets", version = "0.1.0" }
+nmcp-secrets = { path = "../nmcp-secrets", version = "0.2.0" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -51,8 +51,8 @@ async-trait.workspace = true
 # I-031 a dependency cycle, so `RequestState` moved to `nmcp-schema` at spec v1.4 instead.
 # Writing a second index here to avoid this dev edge would mean every ring assertion in this
 # crate was measured against a fake.
-nmcp-host = { path = "../nmcp-host", version = "0.1.0" }
+nmcp-host = { path = "../nmcp-host", version = "0.2.0" }
 # Test-only, and only for RC-6's oracle: the deleted `tool_policy_spec` table's path-argument
 # lists are graded against the shipped first-party input schemas, which live here. It was a
 # production dependency until I-047d, for `tool_annotations`, which RC-8 deletes.
-nmcp-proto = { path = "../nmcp-proto", version = "0.1.0" }
+nmcp-proto = { path = "../nmcp-proto", version = "0.2.0" }
