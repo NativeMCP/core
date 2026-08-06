@@ -42,6 +42,7 @@
 //! `audit_event_log`. The whole path ports.
 
 mod auth_attempts;
+pub mod diagnostics;
 mod peer;
 
 use std::path::{Path, PathBuf};
@@ -55,6 +56,7 @@ use nmcp_gateway::GatewayRegistry;
 use nmcp_host::IndexedToolRegistry;
 use nmcp_oauth::Broker;
 use nmcp_policy::PolicyConfig;
+use nmcp_policy::machine::{MachinePolicySource, NoFleetPolicy};
 use nmcp_router::SharedRouter;
 use nmcp_secrets::{FileSealer, SealedStore, Sealer, default_key_dir};
 use nmcp_transport::{RedactionPipeline, SessionRegistry, TransportConfig};
@@ -145,6 +147,42 @@ impl ExecutionEventEmitter {
     }
 }
 
+/// The absolute URL of this resource's metadata document (G3-11, RS-6).
+///
+/// RFC 9728 Section 3.1 builds it by inserting `/.well-known/oauth-protected-resource` between
+/// the resource identifier's authority and its path, so `https://mcp.example.com/mcp` becomes
+/// `https://mcp.example.com/.well-known/oauth-protected-resource/mcp`. That is the second of
+/// the two routes this server registers, which is why both exist.
+///
+/// At the crate root rather than in `diagnostics`, because the doctor is only its first caller:
+/// the lanes' `WWW-Authenticate` challenge is the other, and that lands with I-075.
+///
+/// Policy validation guarantees the identifier is absolute and carries no fragment, so the
+/// parse below has no failure case a loaded policy can reach.
+#[must_use]
+pub fn resource_metadata_url(resource: &str) -> String {
+    // A query string is not part of a resource identifier under RFC 8707 and is dropped here
+    // rather than carried into a well-known URL where it would mean nothing.
+    let trimmed = resource.split('?').next().unwrap_or(resource);
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return format!("{trimmed}/.well-known/oauth-protected-resource");
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, path.trim_end_matches('/')),
+        None => (rest, ""),
+    };
+    if path.is_empty() {
+        format!("{scheme}://{authority}/.well-known/oauth-protected-resource")
+    } else {
+        format!("{scheme}://{authority}/.well-known/oauth-protected-resource/{path}")
+    }
+}
+
+/// A fleet-policy reader the daemon was given, shared across requests.
+///
+/// `Send + Sync` because [`AppState`] is cloned into every handler and read concurrently.
+pub type SharedMachinePolicySource = Arc<dyn MachinePolicySource + Send + Sync>;
+
 /// The object graph NMCP-SPEC-004 section 5.2 freezes.
 ///
 /// See the module doc for why fourteen fields rather than sixteen or seventeen.
@@ -202,6 +240,19 @@ pub struct AppState {
     /// whose whole job is to be the one authority over sealed material. Core's is a `Mutex`
     /// over a document, so sharing the handle is the only shape that keeps one authority.
     pub secrets: Arc<SealedStore>,
+    /// The fleet-policy source the doctor reads. Amendment A-6, not in section 5.2's table.
+    ///
+    /// The base's doctor called `MachinePolicy::from_registry()`, a free function with nothing
+    /// to inject, so WD-8's acceptance criterion, a doctor check on a **managed** machine, could
+    /// not be written. `nmcp-policy` already carries `MachinePolicySource` for exactly this and
+    /// nothing was reading it: in core `from_registry` reads no registry and hardcodes
+    /// `NoFleetPolicy`, so the doctor answered "the fleet has no opinion" on every platform with
+    /// no way to show it otherwise.
+    ///
+    /// Held rather than passed because the doctor reads it per request, which is how the base
+    /// read the registry, and because WinMCP binds its Group Policy reader once at construction
+    /// (NMCP-SPEC-001 R-3).
+    pub machine_policy: SharedMachinePolicySource,
     /// Component (c). OAuth grants, brokered to every upstream that names a provider (G6-9).
     ///
     /// One per process. Two brokers over the same providers would each run a sweep, and two
@@ -213,10 +264,12 @@ pub struct AppState {
 impl AppState {
     /// The number of fields this graph carries today.
     ///
-    /// Stated rather than inferred, and asserted by a test, because two more arrive later:
+    /// Stated rather than inferred, and asserted by a test, because more arrive later:
     /// `jwks` with I-074 and `catalog` with I-077. A frozen graph that grows without anyone
-    /// editing a number is a graph that is not frozen.
-    pub const FIELD_COUNT: usize = 14;
+    /// editing a number is a graph that is not frozen, and this constant moving is the whole
+    /// mechanism: `machine_policy` took it from fourteen to fifteen at I-076 and that edit is
+    /// visible in the diff rather than inferred from a compile.
+    pub const FIELD_COUNT: usize = 15;
 
     /// Build the graph with no policy file, so every store is ephemeral.
     ///
@@ -264,6 +317,23 @@ impl AppState {
         policy_path: Option<PathBuf>,
         sealer_for: SealerFactory,
     ) -> anyhow::Result<Self> {
+        Self::with_sealer_and_fleet(policy, policy_path, sealer_for, Arc::new(NoFleetPolicy))
+    }
+
+    /// Build the graph binding both platform concerns: the sealer and the fleet-policy reader.
+    ///
+    /// This is the constructor WinMCP calls. Core's other constructors bind `FileSealer` and
+    /// [`NoFleetPolicy`], which is exactly the behaviour the base gave every non-Windows build.
+    ///
+    /// # Errors
+    ///
+    /// As [`AppState::with_sealer`].
+    pub fn with_sealer_and_fleet(
+        policy: PolicyConfig,
+        policy_path: Option<PathBuf>,
+        sealer_for: SealerFactory,
+        machine_policy: SharedMachinePolicySource,
+    ) -> anyhow::Result<Self> {
         // (a) Sealed store, or ephemeral where there is nowhere to persist.
         let secrets = match policy_path.as_deref().and_then(Path::parent) {
             Some(dir) => {
@@ -305,6 +375,7 @@ impl AppState {
             Arc::new(r)
         };
         Ok(Self {
+            machine_policy,
             auth_attempts: Arc::new(auth_attempts::AuthAttemptLedger::new()),
             policy: policy_arc,
             policy_path,
@@ -458,6 +529,7 @@ mod tests {
         let root = temp_root("fields");
         let state = AppState::new(policy_in(&root)).expect("state");
         let AppState {
+            machine_policy: _,
             auth_attempts: _,
             policy: _,
             policy_path: _,
@@ -474,6 +546,7 @@ mod tests {
             oauth: _,
         } = state;
         let named = [
+            "machine_policy",
             "auth_attempts",
             "policy",
             "policy_path",
