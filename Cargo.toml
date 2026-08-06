@@ -17,6 +17,7 @@ members = [
 "crates/nmcp-audit",
 "crates/nmcp-host",
 "crates/nmcp-secrets",
+"crates/nmcp-oauth",
 "crates/nmcpctl",
 ]
 
@@ -96,3 +97,13 @@ hex = "0.4.3"
 # every process listing (T5), which is the modality SB-A2 removed by
 # construction. Apache-2.0/MIT, inside the deny.toml allow list.
 rpassword = "7.5.4"
+# I-017 addition, an INV-7 reviewed change: the OAuth broker's outbound HTTP
+# client, for the RFC 8628 device flow and token refresh. The hyper 1 family it
+# rides on is already in this graph through axum; the additions are reqwest
+# itself and the platform TLS stack. Default features are off: `native-tls` is
+# chosen over the 0.13-era rustls default because the aws-lc tree that default
+# pulls in carries an OpenSSL license component outside deny.toml's allow list,
+# while the native-tls path (openssl bindings on Linux, schannel on Windows,
+# Security.framework on macOS) is MIT/Apache-2.0 throughout, hand-checked.
+# `json` is the response-body decoding the token endpoints speak.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "native-tls"] }

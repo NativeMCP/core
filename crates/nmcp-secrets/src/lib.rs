@@ -87,6 +87,10 @@ pub use file_sealer::{
 pub use grant::{BindingGrant, BindingRuleId};
 pub use lifecycle::{IllegalTransition, KeyLifecycle, KeyState};
 pub use name::{SecretName, SecretNameError, Version, VersionError};
+pub use perms::{
+    PermsError, RESTRICTED_DIR_MODE, RESTRICTED_FILE_MODE, create_restricted_dir,
+    verify_restricted, write_restricted,
+};
 pub use sealed::Sealed;
 pub use sealer::{SECRET_ENTROPY, SealContext, SealError, Sealer, SealerId};
 pub use store::{

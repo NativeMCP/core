@@ -60,9 +60,19 @@ pub const SECRET_REF_PREFIX: &str = "nmcp://secret/";
 /// The longest secret name the SB-2 grammar admits, in characters.
 pub const SECRET_NAME_MAX_CHARS: usize = 64;
 
+/// The namespace label the OAuth broker owns (SB-2, and the SB-10 carve-out).
+///
+/// The broker's grant names are this label, a separator, and a provider id. The label is
+/// defined once, here, because two spellings of one namespace is how a reserving parser and
+/// the broker that owns the namespace come to disagree about what is reserved; `nmcp-oauth`
+/// re-exports this constant rather than carrying a copy, and
+/// [`RESERVED_SECRET_NAMESPACES`] is built from it rather than restating it.
+pub const OAUTH_GRANT_NAMESPACE: &str = "oauth";
+
 /// Namespaces no reference may address, whoever owns the store underneath.
 ///
-/// `oauth` is the OAuth broker's (SB-2). The broker's own grant names are `oauth/<provider>`,
+/// [`OAUTH_GRANT_NAMESPACE`] is the OAuth broker's (SB-2). The broker's own grant names are
+/// `oauth/<provider>`,
 /// and the separator is outside the SB-2 character class, so the grammar alone already refuses
 /// every one of them. That is exactly why this table cannot be only a prefix test: the one
 /// name the grammar would otherwise admit is the bare namespace label, so the label is refused
@@ -72,7 +82,7 @@ pub const SECRET_NAME_MAX_CHARS: usize = 64;
 ///
 /// The refusal happens in [`SecretRef::parse`] rather than in a filter applied afterwards,
 /// because a filter is a thing a later caller can forget to call and a parse is not.
-pub const RESERVED_SECRET_NAMESPACES: &[&str] = &["oauth"];
+pub const RESERVED_SECRET_NAMESPACES: &[&str] = &[OAUTH_GRANT_NAMESPACE];
 
 /// The input-schema keyword that marks a property as a `secret_ref` slot (SB-3).
 pub const SECRET_SLOT_ANNOTATION: &str = "x-nmcp-secret-ref";

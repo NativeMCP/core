@@ -5,6 +5,13 @@
 //! the guarantee. Two callers applying "the same" restriction from two copies of the code is
 //! how they stop being the same, so both call this.
 //!
+//! Public from the OAuth port (I-017): the SB-10 carve-out gives the broker sealed storage of
+//! its own, in a directory of its own, and that storage owes its files exactly this
+//! restriction. Exporting the one implementation is what keeps "the same restriction" a fact
+//! rather than a phrase, for the same reason both of this crate's own callers already share
+//! it; a third copy in `nmcp-oauth` would be the two-copies drift SB-2 records the base
+//! paying for, one module over.
+//!
 //! Enforced on Unix, not enforced elsewhere, and the difference is reported rather than assumed
 //! either way: see [`crate::KeyProtection`].
 
@@ -12,17 +19,17 @@ use std::fs;
 use std::path::Path;
 
 /// The mode a file holding key material or sealed blobs must have on Unix.
-pub(crate) const RESTRICTED_FILE_MODE: u32 = 0o600;
+pub const RESTRICTED_FILE_MODE: u32 = 0o600;
 
 /// The mode a directory holding either must have on Unix.
-pub(crate) const RESTRICTED_DIR_MODE: u32 = 0o700;
+pub const RESTRICTED_DIR_MODE: u32 = 0o700;
 
 /// Why a path is not usable for material.
 ///
 /// Carries a path, a mode and an error kind. No material and nothing derived from material: a
 /// mode is a property of the container, not of what is in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PermsError {
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PermsError {
     /// The path is readable by somebody other than its owner.
     ///
     /// Constructed only by the Unix [`verify_restricted`]: mode bits do not exist in `std`
@@ -35,6 +42,9 @@ pub(crate) enum PermsError {
     /// scoped to exactly this variant on exactly the platforms whose builds never construct
     /// it, which is the fact it states.
     #[cfg_attr(not(unix), allow(dead_code))]
+    #[error(
+        "{path} is mode {mode:o} and material storage requires {required:o}, since filesystem permissions are the whole of the guarantee"
+    )]
     Exposed {
         /// The offending path.
         path: String,
@@ -44,6 +54,7 @@ pub(crate) enum PermsError {
         required: u32,
     },
     /// The path could not be created, read or restricted.
+    #[error("{path} could not be created, read or restricted: {reason}")]
     Failed {
         /// The path involved.
         path: String,
@@ -64,7 +75,11 @@ impl PermsError {
 }
 
 /// Create `dir` and every parent, restricting `dir` itself where the platform allows it.
-pub(crate) fn create_restricted_dir(dir: &Path) -> Result<(), PermsError> {
+///
+/// # Errors
+///
+/// [`PermsError`] when the directory cannot be created or restricted.
+pub fn create_restricted_dir(dir: &Path) -> Result<(), PermsError> {
     if !dir.exists() {
         fs::create_dir_all(dir).map_err(|err| PermsError::failed(dir, &err))?;
         set_mode(dir, RESTRICTED_DIR_MODE)?;
@@ -79,7 +94,11 @@ pub(crate) fn create_restricted_dir(dir: &Path) -> Result<(), PermsError> {
 /// Named rather than hidden: closing it needs `OpenOptions::mode`, which is a Unix-only
 /// extension, and the directory these files sit in is already `0700`, so an attacker who can
 /// exploit the window can already read the directory.
-pub(crate) fn write_restricted(path: &Path, body: &[u8], mode: u32) -> Result<(), PermsError> {
+///
+/// # Errors
+///
+/// [`PermsError`] when the file cannot be written or restricted.
+pub fn write_restricted(path: &Path, body: &[u8], mode: u32) -> Result<(), PermsError> {
     fs::write(path, body).map_err(|err| PermsError::failed(path, &err))?;
     set_mode(path, mode)
 }
@@ -104,8 +123,13 @@ pub(crate) fn set_mode(_path: &Path, _mode: u32) -> Result<(), PermsError> {
 /// Compares the permission bits against the required mode and refuses anything wider. Narrower
 /// is accepted: an operator who tightened a key directory to `0500` has not weakened anything,
 /// and refusing them would be this code insisting on write access it does not need.
+///
+/// # Errors
+///
+/// [`PermsError::Exposed`] when the path is wider than `required`, and
+/// [`PermsError::Failed`] when it cannot be inspected at all.
 #[cfg(unix)]
-pub(crate) fn verify_restricted(path: &Path, required: u32) -> Result<(), PermsError> {
+pub fn verify_restricted(path: &Path, required: u32) -> Result<(), PermsError> {
     use std::os::unix::fs::PermissionsExt;
 
     let metadata = fs::metadata(path).map_err(|err| PermsError::failed(path, &err))?;
@@ -123,6 +147,6 @@ pub(crate) fn verify_restricted(path: &Path, required: u32) -> Result<(), PermsE
 /// Refuse a path the filesystem is not protecting. Not enforced off Unix; see
 /// [`crate::KeyProtection::PlatformDefault`].
 #[cfg(not(unix))]
-pub(crate) fn verify_restricted(_path: &Path, _required: u32) -> Result<(), PermsError> {
+pub fn verify_restricted(_path: &Path, _required: u32) -> Result<(), PermsError> {
     Ok(())
 }
