@@ -314,7 +314,7 @@ impl PolicyConfig {
             }
             _ => (
                 "(unattributed)",
-                "Compare the local policy file against the NativeMCP Group Policy settings \
+                "Compare the local policy file against the nMCP Group Policy settings \
                  on this machine.",
             ),
         };

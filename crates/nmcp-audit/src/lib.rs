@@ -1316,7 +1316,7 @@ mod tests {
     #[test]
     fn render_mirror_message_is_bounded_and_informative() {
         let mut evt = AuditEvent::new("inspect_file_integrity", "returned file integrity report");
-        evt.path = Some(r"D:\projects\nativemcp-core\docs\file.md".into());
+        evt.path = Some(r"D:\projects\nmcp-core\docs\file.md".into());
         evt.permission = Some("read".into());
         let message = render_mirror_message(&evt);
         let document: serde_json::Value = serde_json::from_str(&message).expect("valid JSON");
@@ -1325,7 +1325,7 @@ mod tests {
         assert_eq!(document["decision"], "unspecified");
         assert_eq!(document["class"], "read");
         assert_eq!(document["event_id"], 1010);
-        assert_eq!(document["path"], r"D:\projects\nativemcp-core\docs\file.md");
+        assert_eq!(document["path"], r"D:\projects\nmcp-core\docs\file.md");
         assert!(message.chars().count() <= EVENT_LOG_MESSAGE_LIMIT);
     }
 

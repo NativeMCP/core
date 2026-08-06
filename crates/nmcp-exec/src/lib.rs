@@ -1122,7 +1122,7 @@ impl CommandBroker {
     ) -> anyhow::Result<ExecuteJobStatusReport> {
         let metadata = self.read_metadata(&req.job_id)?;
         if !metadata.status.is_terminal() && !self.jobs.cancel_owned(&req.job_id).await {
-            bail!("job is not owned by this NativeMCP process or is no longer running");
+            bail!("job is not owned by this nMCP process or is no longer running");
         }
         let mut event = self.effect("execute_cancel", format!("job_id={}", req.job_id));
         event.path = Some(metadata.cwd.clone());
@@ -1245,12 +1245,12 @@ async fn monitor_job(
         () = tokio::time::sleep(Duration::from_millis(timeout_ms)) => {
             let _ = child.kill().await;
             let status = child.wait().await.ok();
-            (ExecuteJobStatus::TimedOut, status.and_then(|s| s.code()), None, "job timed out and was cancelled by NativeMCP".to_string())
+            (ExecuteJobStatus::TimedOut, status.and_then(|s| s.code()), None, "job timed out and was cancelled by nMCP".to_string())
         },
         _ = cancel_rx => {
             let _ = child.kill().await;
             let status = child.wait().await.ok();
-            (ExecuteJobStatus::Cancelled, status.and_then(|s| s.code()), None, "job cancelled by NativeMCP".to_string())
+            (ExecuteJobStatus::Cancelled, status.and_then(|s| s.code()), None, "job cancelled by nMCP".to_string())
         },
     };
     // Flush the redacted logs before marking the job finished, so a reader that sees a terminal

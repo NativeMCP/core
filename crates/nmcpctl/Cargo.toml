@@ -1,6 +1,6 @@
 [package]
 name = "nmcpctl"
-description = "Operator command surface for NativeMCP: the secret broker's write half, policy tools and audit verification."
+description = "Operator command surface for nMCP: the secret broker's write half, policy tools and audit verification."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

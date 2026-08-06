@@ -1,6 +1,6 @@
 [package]
 name = "nmcp-oauth"
-description = "OAuth device-code broker for NativeMCP upstreams; grants live sealed under the broker's reserved namespace and never in policy."
+description = "OAuth device-code broker for nMCP upstreams; grants live sealed under the broker's reserved namespace and never in policy."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

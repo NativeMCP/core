@@ -274,7 +274,7 @@ impl StdioLink {
             json!({
                 "protocolVersion": CLIENT_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": { "name": "NativeMCP", "version": env!("CARGO_PKG_VERSION") },
+                "clientInfo": { "name": "nMCP", "version": env!("CARGO_PKG_VERSION") },
             }),
             HANDSHAKE_TIMEOUT,
         )

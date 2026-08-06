@@ -220,7 +220,7 @@ impl Permission {
     ///
     /// The `Err` is the operator-facing sentence, not a code: it is handed straight to
     /// `serde::de::Error::custom` and ends up in [`PolicyError::MalformedJson`], which is what
-    /// `NativeMCPctl validate`, daemon startup and hot reload all print.
+    /// `nmcpctl validate`, daemon startup and hot reload all print.
     ///
     /// Delegates the success half to [`Permission::from_canonical`] so the two entry points
     /// cannot disagree about which names resolve. What this one adds is the refusal
@@ -971,7 +971,7 @@ pub struct PolicyConfig {
     /// Enable the SSE streaming lane (GET /mcp). Default true.
     #[serde(default = "default_true")]
     pub enable_sse_lane: bool,
-    /// Enable the non-standard WebSocket lane (GET /mcp/ws). Opt-in NativeMCP
+    /// Enable the non-standard WebSocket lane (GET /mcp/ws). Opt-in nMCP
     /// extension, not standard MCP (see ADR-0001). Default false.
     #[serde(default)]
     pub enable_ws_lane: bool,
@@ -1399,7 +1399,7 @@ impl PolicyConfig {
 
     /// Parse policy JSON and enforce semantic validation in one step.
     ///
-    /// Every file-based load path goes through here so that `NativeMCPctl validate`,
+    /// Every file-based load path goes through here so that `nmcpctl validate`,
     /// daemon startup, and policy hot reload cannot drift apart on what counts as a valid
     /// policy. Before this existed all three parsed with serde and skipped
     /// `validate_semantics` entirely, so `validate` printed "valid policy" for
@@ -3838,7 +3838,7 @@ mod tests {
     }
 
     #[test]
-    fn nativemcp_policy_defaults_use_programdata_paths() {
+    fn nmcp_policy_defaults_use_programdata_paths() {
         let policy = PolicyConfig::default();
         assert!(policy.audit_path.ends_with(nmcp_identity::AUDIT_FILE));
         assert!(

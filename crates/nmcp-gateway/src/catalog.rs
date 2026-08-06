@@ -436,7 +436,7 @@ impl GatewayCatalog {
 pub fn default_gateway_catalog() -> GatewayCatalog {
     GatewayCatalog {
         schema_version: 1,
-        generated_by: "NativeMCP Gateway Catalog".to_string(),
+        generated_by: "nMCP Gateway Catalog".to_string(),
         default_policy: "enable nothing by default; admit runtime upstreams only through \
                          policy-gated activation; catalog entries arrive by feed snapshot, \
                          never compiled in"

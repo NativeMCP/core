@@ -155,7 +155,7 @@ impl SealContext {
 /// Sealing and unsealing, whoever provides it.
 ///
 /// The trait NMCP-SPEC-001 R-4 places outside this repository: DPAPI in WinMCP, Keychain in
-/// MacMCP, secret-service in LinuxMCP, and enterprise backends in the private layer. This crate
+/// macMCP, secret-service in LinuxMCP, and enterprise backends in the private layer. This crate
 /// ships a real implementation of it ([`crate::FileSealer`]) rather than a mock, so headless
 /// Linux and CI have a complete one (SB-A7).
 ///

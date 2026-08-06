@@ -244,7 +244,7 @@ fn denial_result(declared: &ToolAuthority, denial: &Denial) -> ToolCallResult {
                  outbound git publishing is approved."
             }
             _ => {
-                "Adjust the NativeMCP policy root permissions or use a path inside an approved \
+                "Adjust the nMCP policy root permissions or use a path inside an approved \
                  root."
             }
         },

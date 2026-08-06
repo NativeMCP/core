@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "xtask", about = "NativeMCP workspace maintenance commands")]
+#[command(name = "xtask", about = "nMCP workspace maintenance commands")]
 struct Cli {
     #[command(subcommand)]
     command: Xtask,

@@ -1,6 +1,6 @@
 # NativeMCP Governance Invariants
 
-Status: **normative**. Applies to `core`, `WinMCP`, `LinuxMCP` and `MacMCP`.
+Status: **normative**. Applies to `core`, `WinMCP`, `LinuxMCP` and `macMCP`.
 
 An invariant is a property that holds in every code path, in every release, on
 every platform. It is not a default, not a recommended setting, and not
