@@ -1,0 +1,44 @@
+[package]
+name = "nmcp-gateway"
+description = "Upstream MCP proxy provider: governed admission catalog, native transports and credential injection for NativeMCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+# Manifest signature verification only (`verify_manifest_signature`). One definition of what
+# a signed tools/list means, in the crate that owns descriptor integrity, rather than a
+# second copy here that could drift from the one the tests grade.
+nmcp-abac = { path = "../nmcp-abac", version = "0.1.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-oauth = { path = "../nmcp-oauth", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.1.0" }
+nmcp-secrets = { path = "../nmcp-secrets", version = "0.1.0" }
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# Drift lock only: the stdio transport speaks one protocol revision as a client, and the
+# test asserting that revision is one this server family actually supports reads the
+# supported set from the crate that owns it instead of restating it here.
+nmcp-proto = { path = "../nmcp-proto", version = "0.1.0" }

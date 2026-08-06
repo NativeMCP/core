@@ -23,4 +23,13 @@ serde_json.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+# The RC-18 gateway-side lifecycle and the G-8 pin-before-index proof are graded here,
+# against the real `UpstreamProvider` and the real index together. The direction of this
+# test-only edge is the composition direction the specs declare (the kernel composes
+# providers; a provider never links the kernel, RC-12/RC-A5), which is why the test lives
+# in this crate rather than `nmcp-gateway` taking a dev edge on `nmcp-host`.
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-gateway = { path = "../nmcp-gateway", version = "0.1.0" }
+sha2.workspace = true
 tokio.workspace = true
+uuid.workspace = true
