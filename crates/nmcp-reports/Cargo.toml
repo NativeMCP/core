@@ -1,0 +1,22 @@
+[package]
+name = "nmcp-reports"
+description = "Bounded repository scanning and content search for nMCP: secret-candidate detection, walk budgets that report which bound stopped them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+regex.workspace = true
+serde.workspace = true
+walkdir.workspace = true

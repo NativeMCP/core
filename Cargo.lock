@@ -1256,6 +1256,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nmcp-reports"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "walkdir",
+]
+
+[[package]]
 name = "nmcp-router"
 version = "0.2.0"
 dependencies = [
