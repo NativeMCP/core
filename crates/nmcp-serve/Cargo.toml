@@ -1,0 +1,33 @@
+[package]
+name = "nmcp-serve"
+description = "The nMCP served surface: the object graph the daemon is built from, the peer resolution the audit record and the throttle each need, and the coalescing ledger for failed authentication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+nmcp-abac = { path = "../nmcp-abac", version = "0.2.0" }
+nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
+nmcp-exec = { path = "../nmcp-exec", version = "0.2.0" }
+nmcp-gateway = { path = "../nmcp-gateway", version = "0.2.0" }
+nmcp-host = { path = "../nmcp-host", version = "0.2.0" }
+nmcp-oauth = { path = "../nmcp-oauth", version = "0.2.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
+nmcp-router = { path = "../nmcp-router", version = "0.2.0" }
+nmcp-secrets = { path = "../nmcp-secrets", version = "0.2.0" }
+nmcp-transport = { path = "../nmcp-transport", version = "0.2.0" }
+parking_lot.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

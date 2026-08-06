@@ -1336,6 +1336,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nmcp-serve"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "nmcp-abac",
+ "nmcp-audit",
+ "nmcp-exec",
+ "nmcp-gateway",
+ "nmcp-host",
+ "nmcp-oauth",
+ "nmcp-policy",
+ "nmcp-router",
+ "nmcp-secrets",
+ "nmcp-transport",
+ "parking_lot",
+ "serde_json",
+]
+
+[[package]]
 name = "nmcp-serve-assets"
 version = "0.2.0"
 
