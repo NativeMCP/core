@@ -15,10 +15,17 @@
 //!   through the full policy/ABAC/audit ring.
 
 use anyhow::Context;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
+use nmcp_policy::Permission;
+use nmcp_schema::{
+    CallContext, CapabilityGrant, GrantedAuthority, ToolAuthority, ToolCallResult, ToolContract,
+    ToolEffect, ToolProvider, ToolReach,
+};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -612,6 +619,378 @@ impl SqliteMemoryStore {
     }
 }
 
+// ── MemoryProvider (I-072a) ──────────────────────────────────────────────────
+
+/// The five memory tools, as a governed provider.
+///
+/// # Why this lives here now
+///
+/// The base put this provider in `mcp-server` for one stated reason: `mcp-router` imported
+/// `mcp-memory` for `MemoryScope`, so `mcp-memory` could not depend on `mcp-router` without
+/// a cycle. That cycle is gone. `ToolProvider` moved to `nmcp-schema` under RC-D1, whose
+/// only workspace edge is `nmcp-policy` (RC-1), and `nmcp-router` has no edge to this crate
+/// at all. So the provider ships beside the store it drives, which is where a reader looking
+/// for "what can a caller do to memory" will look first.
+///
+/// # What this provider does not do
+///
+/// No policy check. The base guarded each of the five tools with a `policy_grants` call
+/// against `Permission::MemoryRead` or `MemoryWrite`; all five are deleted and replaced by
+/// the declared `ToolAuthority` the ring authorizes against before `call` is entered. That
+/// is RC-20's rule and the `ToolProvider` doc's first sentence.
+///
+/// # What it does do, and must keep doing
+///
+/// The scope check stays, because it is not a policy check. `authorized_scope` compares a
+/// caller-supplied `scope_root` against the scope derived from the authenticated call
+/// context and refuses a mismatch. It is an isolation control over an identifier the ring
+/// has no opinion about, and deleting it alongside the permission guards would have been the
+/// mistake this doc exists to prevent.
+///
+/// # Why `scope_root` is not a `path_arg`
+///
+/// It looks like a path and it is not one. `path_args` names arguments the kernel resolves a
+/// *root* from, and a root resolved from a caller-supplied scope string is exactly the
+/// confused-deputy shape RC-20 is about: the kernel would authorize against whatever the
+/// caller sent while the store queried the context scope. Every one of these five tools
+/// declares `path_args: vec![]` with a permission, which the contract documents as "the
+/// caller must hold this permission on some root, and no root is resolved for this call".
+/// That is precisely true here: memory is scoped by `ctx.memory_scope`, never by an argument.
+pub struct MemoryProvider {
+    store: SqliteMemoryStore,
+}
+
+impl MemoryProvider {
+    /// Wrap a store as a provider.
+    #[must_use]
+    pub fn new(store: SqliteMemoryStore) -> Self {
+        Self { store }
+    }
+}
+
+/// The scope this call is authorized for, taken from the context and never from arguments.
+fn scope_from_context(ctx: &CallContext) -> String {
+    canonical_scope(&ctx.memory_scope.to_string())
+}
+
+/// Refuse a caller who names a scope other than their own.
+///
+/// Returns the **context** scope on success, never the requested one, even when the two
+/// agree. A caller-supplied `scope_root` is at most a corroborating assertion that must
+/// match; it is never the value the store is queried with. That asymmetry is the isolation
+/// control, and it is why a caller cannot reach another scope by spelling it correctly.
+fn authorized_scope(args: &Value, ctx: &CallContext, tool: &str) -> Result<String, ToolCallResult> {
+    let expected = scope_from_context(ctx);
+    if let Some(requested) = args.get("scope_root").and_then(Value::as_str)
+        && canonical_scope(requested) != expected
+    {
+        return Err(ToolCallResult::err_with_metadata(
+            format!("{tool}: requested scope_root does not match authenticated memory scope"),
+            "policy_denied",
+            Some("Omit scope_root or use the scope derived from the authenticated call context."),
+        ));
+    }
+    Ok(expected)
+}
+
+/// Read a required UUID argument.
+fn required_uuid(args: &Value, tool: &str) -> Result<Uuid, ToolCallResult> {
+    let Some(raw) = args.get("id").and_then(Value::as_str) else {
+        return Err(ToolCallResult::err(format!("{tool}: `id` is required")));
+    };
+    Uuid::parse_str(raw).map_or_else(
+        |_| Err(ToolCallResult::err(format!("{tool}: invalid UUID `{raw}`"))),
+        Ok,
+    )
+}
+
+/// What a memory tool needs in order to run.
+///
+/// Exhaustive over the five names `contracts` declares, with no wildcard arm, so a tool added
+/// there without a line here does not compile. Same shape as `dev_tool_authority`, and for
+/// the same reason: an authority reached by a fallback is an authority nobody decided.
+fn memory_tool_authority(name: &str) -> ToolAuthority {
+    let (permission, effect) = match name {
+        "mem.read" | "mem.list" => (Permission::MemoryRead, ToolEffect::Observe),
+        "mem.write" | "mem.refresh" | "mem.expire_now" => {
+            (Permission::MemoryWrite, ToolEffect::Mutate)
+        }
+        other => return unknown_memory_authority(other),
+    };
+    ToolAuthority {
+        permission: Some(permission),
+        // Deliberately empty: see the type doc. Memory is scoped by the call context.
+        path_args: Vec::new(),
+        grants: Vec::new(),
+        effect,
+        // The store is a local SQLite file and the embedder makes no network call, which is
+        // this crate's zero-egress invariant and is asserted by `mem3_lexical_embedder_zero_egress`.
+        reach: ToolReach::Local,
+    }
+}
+
+/// The authority of a memory tool this crate declares and has no line for.
+///
+/// Unreachable through [`MemoryProvider::contracts`], and written anyway because the
+/// alternative to a fail-closed arm is a fallback that grants something. This one requires a
+/// capability grant no `Permission` defines, which `authorize` refuses by name on every call,
+/// so a tool that reached here would be visible and uncallable rather than callable and
+/// ungoverned.
+fn unknown_memory_authority(name: &str) -> ToolAuthority {
+    ToolAuthority {
+        permission: Some(Permission::MemoryRead),
+        path_args: Vec::new(),
+        grants: vec![CapabilityGrant::new(format!("nmcp.undeclared.{name}"))],
+        effect: ToolEffect::Mutate,
+        reach: ToolReach::Remote,
+    }
+}
+
+#[async_trait]
+impl ToolProvider for MemoryProvider {
+    fn contract_version(&self) -> u32 {
+        1
+    }
+
+    // The trait declares `-> &str`; an impl cannot narrow it to a static lifetime on its own.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn provider_id(&self) -> &str {
+        ""
+    }
+
+    fn contracts(&self) -> Vec<ToolContract> {
+        vec![
+            ToolContract {
+                name: "mem.write".to_string(),
+                description: "Write a durable memory fact into the caller's own scope. \
+                              Upserts when `key` is supplied."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "key": {"type": "string"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "ttl_secs": {"type": "integer"},
+                        "scope_root": {
+                            "type": "string",
+                            "description": "Optional. Must equal the authenticated memory scope; \
+                                            omitting it is the normal case."
+                        }
+                    },
+                    "required": ["content"]
+                }),
+                authority: memory_tool_authority("mem.write"),
+                published_annotations: None,
+            },
+            ToolContract {
+                name: "mem.read".to_string(),
+                description: "Semantic search over memory facts in the caller's own scope."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "top_k": {"type": "integer", "default": 5},
+                        "scope_root": {
+                            "type": "string",
+                            "description": "Optional. Must equal the authenticated memory scope."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+                authority: memory_tool_authority("mem.read"),
+                published_annotations: None,
+            },
+            ToolContract {
+                name: "mem.list".to_string(),
+                description: "List every live memory fact in the caller's own scope.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "scope_root": {
+                            "type": "string",
+                            "description": "Optional. Must equal the authenticated memory scope."
+                        }
+                    },
+                    "required": []
+                }),
+                authority: memory_tool_authority("mem.list"),
+                published_annotations: None,
+            },
+            ToolContract {
+                name: "mem.refresh".to_string(),
+                description: "Refresh a memory fact's timestamp, optionally extending its TTL. \
+                              Only reaches facts in the caller's own scope."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "extend_ttl_secs": {"type": "integer"}
+                    },
+                    "required": ["id"]
+                }),
+                authority: memory_tool_authority("mem.refresh"),
+                published_annotations: None,
+            },
+            ToolContract {
+                name: "mem.expire_now".to_string(),
+                description: "Expire a memory fact immediately. The row survives for audit. \
+                              Only reaches facts in the caller's own scope."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                }),
+                authority: memory_tool_authority("mem.expire_now"),
+                published_annotations: None,
+            },
+        ]
+    }
+
+    async fn call(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &CallContext,
+        _granted: &GrantedAuthority,
+    ) -> ToolCallResult {
+        match name {
+            "mem.write" => {
+                let scope = match authorized_scope(&args, ctx, name) {
+                    Ok(scope) => scope,
+                    Err(refusal) => return refusal,
+                };
+                let Some(content) = args.get("content").and_then(Value::as_str) else {
+                    return ToolCallResult::err("mem.write: `content` is required");
+                };
+                let mut fact = MemoryFact::new(&scope, content);
+                if let Some(key) = args.get("key").and_then(Value::as_str) {
+                    fact = fact.with_key(key);
+                }
+                if let Some(tags) = args.get("tags").and_then(Value::as_array) {
+                    let tags: Vec<String> = tags
+                        .iter()
+                        .filter_map(|t| t.as_str().map(ToString::to_string))
+                        .collect();
+                    fact = fact.with_tags(tags);
+                }
+                if let Some(ttl) = args.get("ttl_secs").and_then(Value::as_i64) {
+                    fact = fact.with_ttl_secs(ttl);
+                }
+                match self.store.write(fact) {
+                    Ok(id) => ToolCallResult::ok(json!({ "id": id.to_string() })),
+                    Err(e) => ToolCallResult::err(format!("mem.write failed: {e}")),
+                }
+            }
+            "mem.read" => {
+                let scope = match authorized_scope(&args, ctx, name) {
+                    Ok(scope) => scope,
+                    Err(refusal) => return refusal,
+                };
+                let Some(query) = args.get("query").and_then(Value::as_str) else {
+                    return ToolCallResult::err("mem.read: `query` is required");
+                };
+                let top_k = args
+                    .get("top_k")
+                    .and_then(Value::as_u64)
+                    .and_then(|k| usize::try_from(k).ok())
+                    .unwrap_or(5);
+                match self.store.search(&scope, query, top_k) {
+                    Ok(facts) => ToolCallResult::ok(json!({
+                        "results": facts.iter().map(search_result_json).collect::<Vec<_>>()
+                    })),
+                    Err(e) => ToolCallResult::err(format!("mem.read failed: {e}")),
+                }
+            }
+            "mem.list" => {
+                let scope = match authorized_scope(&args, ctx, name) {
+                    Ok(scope) => scope,
+                    Err(refusal) => return refusal,
+                };
+                match self.store.list(&scope) {
+                    Ok(facts) => ToolCallResult::ok(json!({
+                        "facts": facts.iter().map(list_fact_json).collect::<Vec<_>>()
+                    })),
+                    Err(e) => ToolCallResult::err(format!("mem.list failed: {e}")),
+                }
+            }
+            // These two take no `scope_root` at all: the caller cannot express a scope, so
+            // there is nothing to corroborate and nothing to refuse. The scope goes straight
+            // from the context to the store's predicate, which is the provider half of I-079.
+            // Before that change the store matched on `id` alone and a caller holding another
+            // scope's UUID could expire that scope's memory.
+            "mem.refresh" => {
+                let scope = scope_from_context(ctx);
+                let id = match required_uuid(&args, name) {
+                    Ok(id) => id,
+                    Err(refusal) => return refusal,
+                };
+                let extend = args.get("extend_ttl_secs").and_then(Value::as_i64);
+                match self.store.refresh_by_id(&scope, id, extend) {
+                    Ok(true) => {
+                        ToolCallResult::ok(json!({ "refreshed": true, "id": id.to_string() }))
+                    }
+                    Ok(false) => ToolCallResult::err(format!("mem.refresh: fact `{id}` not found")),
+                    Err(e) => ToolCallResult::err(format!("mem.refresh failed: {e}")),
+                }
+            }
+            "mem.expire_now" => {
+                let scope = scope_from_context(ctx);
+                let id = match required_uuid(&args, name) {
+                    Ok(id) => id,
+                    Err(refusal) => return refusal,
+                };
+                match self.store.expire_now(&scope, id) {
+                    Ok(true) => {
+                        ToolCallResult::ok(json!({ "expired": true, "id": id.to_string() }))
+                    }
+                    Ok(false) => {
+                        ToolCallResult::err(format!("mem.expire_now: fact `{id}` not found"))
+                    }
+                    Err(e) => ToolCallResult::err(format!("mem.expire_now failed: {e}")),
+                }
+            }
+            unknown => ToolCallResult::err(format!("MemoryProvider: unknown tool `{unknown}`")),
+        }
+    }
+}
+
+/// A search hit. Carries `score` and omits `created_at`.
+///
+/// Two shapes rather than one because the base has two, and the difference is meaningful
+/// rather than accidental: a search result has a similarity score and a list entry does not,
+/// while a list entry carries the creation time a ranked hit has no use for. Merging them
+/// would change the wire shape of both for no reason a client asked for.
+fn search_result_json(fact: &MemoryFact) -> Value {
+    json!({
+        "id": fact.id.to_string(),
+        "scope_root": fact.scope_root,
+        "content": fact.content,
+        "key": fact.key,
+        "tags": fact.tags,
+        "score": fact.score,
+        "refreshed_at": fact.refreshed_at.to_rfc3339(),
+        "ttl_at": fact.ttl_at.map(|t| t.to_rfc3339()),
+    })
+}
+
+/// A list entry. Carries `created_at` and omits `score`.
+fn list_fact_json(fact: &MemoryFact) -> Value {
+    json!({
+        "id": fact.id.to_string(),
+        "scope_root": fact.scope_root,
+        "content": fact.content,
+        "key": fact.key,
+        "tags": fact.tags,
+        "created_at": fact.created_at.to_rfc3339(),
+        "refreshed_at": fact.refreshed_at.to_rfc3339(),
+        "ttl_at": fact.ttl_at.map(|t| t.to_rfc3339()),
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -909,6 +1288,317 @@ mod tests {
         assert!(
             facts[0].ttl_at.is_some(),
             "ttl_at should be set after refresh with extension"
+        );
+    }
+
+    // ── MemoryProvider (I-072a) ──────────────────────────────────────────────
+
+    use super::{MemoryProvider, memory_tool_authority};
+    use nmcp_policy::{Permission, RootRule};
+    use nmcp_schema::{
+        CallContext, GrantedAuthority, HeldAuthority, ToolAuthority, ToolEffect, ToolProvider,
+        ToolReach, authorize,
+    };
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
+
+    /// What the ring would hand a provider after authorizing. Minted through `authorize`
+    /// rather than constructed, because `GrantedAuthority` has no other constructor: these
+    /// tests therefore exercise the real authorization path rather than a stand-in for it.
+    fn granted_for(tool: &str, held_permissions: &[Permission]) -> GrantedAuthority {
+        let mut permissions = BTreeSet::new();
+        for p in held_permissions {
+            permissions.insert(*p);
+        }
+        let held = HeldAuthority {
+            roots: vec![RootRule {
+                id: "root".into(),
+                path: std::env::temp_dir(),
+                permissions,
+            }],
+            grants: BTreeSet::new(),
+            agent_id: None,
+        };
+        authorize(&memory_tool_authority(tool), &held, &json!({}))
+            .expect("the held permission must authorize this tool")
+    }
+
+    fn provider() -> MemoryProvider {
+        MemoryProvider::new(tmp_store())
+    }
+
+    fn ctx_for(session: &str) -> CallContext {
+        CallContext::new(Some(session.to_string()))
+    }
+
+    /// The payload a successful `ToolCallResult::ok` carries.
+    ///
+    /// `ok` stringifies its value into `content[0].text` and leaves `structured_content`
+    /// unset. That is the wire shape the base produced and the one a client reads, so the
+    /// tests read it back the same way rather than reaching for a field the constructor
+    /// never fills. `err_with_metadata` does populate `structured_content`, which is why the
+    /// refusal tests below read that field and these do not.
+    fn ok_payload(result: &nmcp_schema::ToolCallResult) -> Value {
+        assert!(!result.is_error, "expected success, got {result:?}");
+        let text = result.content[0]["text"]
+            .as_str()
+            .expect("ok results carry text content");
+        serde_json::from_str(text).expect("an ok payload must be JSON")
+    }
+
+    async fn call(
+        p: &MemoryProvider,
+        tool: &str,
+        args: Value,
+        ctx: &CallContext,
+        held: &[Permission],
+    ) -> nmcp_schema::ToolCallResult {
+        p.call(tool, args, ctx, &granted_for(tool, held)).await
+    }
+
+    #[tokio::test]
+    async fn the_five_tools_round_trip_in_the_callers_own_scope() {
+        let p = provider();
+        let ctx = ctx_for("alice");
+
+        let written = call(
+            &p,
+            "mem.write",
+            json!({"content": "the deploy window is Tuesday", "key": "deploy", "tags": ["ops"]}),
+            &ctx,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(!written.is_error, "write must succeed: {written:?}");
+        let id = ok_payload(&written)["id"].as_str().expect("id").to_string();
+
+        let listed = call(&p, "mem.list", json!({}), &ctx, &[Permission::MemoryRead]).await;
+        let listed_payload = ok_payload(&listed);
+        let facts = listed_payload["facts"].as_array().expect("facts").clone();
+        assert_eq!(facts.len(), 1);
+        // The list shape carries created_at and no score; the search shape is the reverse.
+        assert!(facts[0].get("created_at").is_some());
+        assert!(facts[0].get("score").is_none());
+
+        let read = call(
+            &p,
+            "mem.read",
+            json!({"query": "deploy window"}),
+            &ctx,
+            &[Permission::MemoryRead],
+        )
+        .await;
+        let read_payload = ok_payload(&read);
+        let results = read_payload["results"].as_array().expect("results").clone();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].get("score").is_some());
+        assert!(results[0].get("created_at").is_none());
+
+        let refreshed = call(
+            &p,
+            "mem.refresh",
+            json!({"id": id, "extend_ttl_secs": 3600}),
+            &ctx,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(!refreshed.is_error, "refresh must succeed: {refreshed:?}");
+
+        let expired = call(
+            &p,
+            "mem.expire_now",
+            json!({"id": id}),
+            &ctx,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(!expired.is_error, "expire must succeed: {expired:?}");
+
+        let after = call(&p, "mem.list", json!({}), &ctx, &[Permission::MemoryRead]).await;
+        let after_payload = ok_payload(&after);
+        let facts = after_payload["facts"].as_array().expect("facts").clone();
+        assert!(facts.is_empty(), "the expired fact must leave the live set");
+    }
+
+    #[tokio::test]
+    async fn naming_another_scope_is_refused_and_says_which_kind_of_refusal() {
+        let p = provider();
+        let ctx = ctx_for("alice");
+        let result = call(
+            &p,
+            "mem.write",
+            json!({"content": "x", "scope_root": "session:bob"}),
+            &ctx,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(result.is_error, "a foreign scope_root must be refused");
+        let structured = result.structured_content.as_ref().expect("structured");
+        assert_eq!(
+            structured["error_kind"], "policy_denied",
+            "the refusal must be attributable, not a bare runtime error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_scope_root_is_accepted_and_still_not_the_value_used() {
+        // The corroborating assertion is allowed to agree. What must never happen is the
+        // caller's string reaching the store, so this asserts the write landed in the
+        // context scope rather than merely that it succeeded.
+        let p = provider();
+        let ctx = ctx_for("alice");
+        let ok = call(
+            &p,
+            "mem.write",
+            json!({"content": "x", "scope_root": "session:alice"}),
+            &ctx,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(
+            !ok.is_error,
+            "a matching scope_root must be accepted: {ok:?}"
+        );
+        let facts = p.store.list("session:alice").expect("list");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].scope_root, "session:alice");
+    }
+
+    #[tokio::test]
+    async fn refresh_and_expire_cannot_reach_another_scope_even_with_the_id() {
+        // The provider half of I-079. The store's predicate is scoped; this asserts the
+        // provider hands it the context scope rather than anything the caller can influence.
+        // Note neither tool accepts a scope_root at all, so there is nothing to corroborate:
+        // a caller cannot even express the scope they are trying to reach.
+        let p = provider();
+        let alice = ctx_for("alice");
+        let bob = ctx_for("bob");
+
+        let written = call(
+            &p,
+            "mem.write",
+            json!({"content": "alice fact"}),
+            &alice,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        let id = ok_payload(&written)["id"].as_str().expect("id").to_string();
+
+        let stolen = call(
+            &p,
+            "mem.expire_now",
+            json!({"id": id}),
+            &bob,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(
+            stolen.is_error,
+            "bob must not expire alice's fact even holding its id"
+        );
+
+        let poked = call(
+            &p,
+            "mem.refresh",
+            json!({"id": id}),
+            &bob,
+            &[Permission::MemoryWrite],
+        )
+        .await;
+        assert!(poked.is_error, "bob must not refresh alice's fact");
+
+        let alice_facts = p.store.list("session:alice").expect("list");
+        assert_eq!(alice_facts.len(), 1, "alice's fact must still be live");
+    }
+
+    #[test]
+    fn the_ring_refuses_an_ungranted_call_before_the_provider_is_entered() {
+        // The permission guards the base carried inside `call` are gone. This is what
+        // replaced them, and it runs before `call` rather than inside it.
+        let held = HeldAuthority {
+            roots: vec![RootRule {
+                id: "root".into(),
+                path: std::env::temp_dir(),
+                permissions: [Permission::MemoryRead].into_iter().collect(),
+            }],
+            grants: BTreeSet::new(),
+            agent_id: None,
+        };
+        assert!(
+            authorize(&memory_tool_authority("mem.read"), &held, &json!({})).is_ok(),
+            "MemoryRead must authorize a read"
+        );
+        assert!(
+            authorize(&memory_tool_authority("mem.write"), &held, &json!({})).is_err(),
+            "MemoryRead alone must not authorize a write"
+        );
+    }
+
+    #[test]
+    fn every_declared_tool_has_an_authority_and_none_resolves_a_root() {
+        let p = provider();
+        let contracts = p.contracts();
+        assert_eq!(contracts.len(), 5);
+        for c in &contracts {
+            assert!(
+                c.authority.path_args.is_empty(),
+                "{}: memory is scoped by the call context, never by a path argument. A \
+                 scope_root in path_args would have the kernel resolve a root from a \
+                 caller-supplied string while the store queried the context scope, which is \
+                 the RC-20 shape.",
+                c.name
+            );
+            assert!(
+                c.authority.permission.is_some(),
+                "{}: every memory tool declares a permission",
+                c.name
+            );
+            assert_eq!(c.authority.reach, ToolReach::Local, "{}", c.name);
+            assert!(
+                c.published_annotations.is_none(),
+                "{}: RC-21, a first-party provider derives its annotations",
+                c.name
+            );
+            // RC-D5: every declared path argument must be a property of the tool's own
+            // schema. Vacuously true here, and asserted so it stays true if one is added.
+            for arg in &c.authority.path_args {
+                assert!(
+                    c.input_schema
+                        .get("properties")
+                        .and_then(|p| p.get(arg))
+                        .is_some(),
+                    "{}: declares path arg {arg} its schema cannot receive",
+                    c.name
+                );
+            }
+        }
+        let mutating: Vec<&str> = contracts
+            .iter()
+            .filter(|c| c.authority.effect == ToolEffect::Mutate)
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            mutating,
+            vec!["mem.write", "mem.refresh", "mem.expire_now"],
+            "only the three writing tools may declare Mutate"
+        );
+    }
+
+    #[test]
+    fn a_tool_with_no_authority_line_is_visible_and_uncallable() {
+        let held = HeldAuthority {
+            roots: vec![RootRule {
+                id: "root".into(),
+                path: std::env::temp_dir(),
+                permissions: Permission::ALL.iter().copied().collect(),
+            }],
+            grants: BTreeSet::new(),
+            agent_id: None,
+        };
+        let fallback: ToolAuthority = memory_tool_authority("mem.invented");
+        assert!(
+            authorize(&fallback, &held, &json!({})).is_err(),
+            "the fallback arm must refuse even a caller holding every permission"
         );
     }
 }
