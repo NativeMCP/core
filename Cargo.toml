@@ -121,4 +121,4 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 # rather than against a string this repository parses. MIT, inside deny.toml's allow
 # list. Default features off: the `use_pem` default pulls a PEM parser this crate has
 # no use for, because every key arrives as a JWK over the metadata endpoint.
-jsonwebtoken = { version = "9.3.1", default-features = false }
+jsonwebtoken = { version = "10.3.0", default-features = false }
