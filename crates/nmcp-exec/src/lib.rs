@@ -47,9 +47,17 @@ pub const MAX_TAIL_BYTES: usize = 64_000;
 /// of the work the cancel was supposed to stop: cancelling `sleep 10` still took ten seconds to
 /// report `cancelled`.
 ///
-/// Two seconds is three orders of magnitude above the EOF a fully terminated tree produces, and
-/// far below any wait deadline a caller sets, so the grace expiring is evidence about the job
-/// rather than about load on the machine.
+/// Two seconds is three orders of magnitude above the EOF a genuinely terminated tree produces
+/// and far below any wait deadline a caller sets, so the bound costs a correct job nothing.
+///
+/// **It is a bound on the wait, not a measurement of the tree.** I-069 shipped this constant with
+/// a doc saying the grace expiring was "evidence about the job rather than about load on the
+/// machine", and the post-merge macOS run falsified that the same day: a job whose shell had
+/// `exec`ed, leaving no descendant and closed pipes, reported the grace expiring anyway. Nothing
+/// held the pipe. Nothing had looked at it, because the runner was executing the whole
+/// workspace's tests at once and the drain task did not get scheduled. A timeout cannot tell a
+/// pipe that is still open from a pipe nobody read, so this records only that the drain did not
+/// complete and the log is therefore truncated (I-081). Terminating the tree is I-080.
 pub const KILLED_JOB_DRAIN_GRACE_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1309,16 +1317,17 @@ async fn monitor_job(
     metadata.status = outcome.0;
     metadata.exit_code = outcome.1;
     metadata.error = outcome.2;
-    // The claim is exactly what was observed and no more. Only the child and its descendants
-    // ever held these write ends, so a pipe still open after the child was reaped means a
-    // descendant outlived the kill. The converse does not follow: a descendant that closed or
-    // redirected its own stdio survives without holding the pipe, and this says nothing about
-    // it. Terminating the tree rather than the process is I-080.
+    // The claim is exactly what was observed and no more, which I-069 got wrong and I-081
+    // corrects. What expiring establishes is that the drain did not finish, so the log is
+    // short. Why it did not finish is not decidable here: a descendant holding the write end
+    // and a drain task that was never scheduled look identical from a timeout, and a loaded
+    // macOS runner produced the second while I-069's wording asserted the first into an
+    // immutable trail. Terminating the tree, which removes the question, is I-080.
     metadata.summary = if logs_complete {
         outcome.3
     } else {
         format!(
-            "{}; descendant processes still held the job's output pipes {KILLED_JOB_DRAIN_GRACE_MS}ms after the kill, so they outlived it and this log is truncated",
+            "{}; the output drain did not complete within {KILLED_JOB_DRAIN_GRACE_MS}ms of the kill, so this log is truncated",
             outcome.3
         )
     };
@@ -3307,7 +3316,7 @@ mod tests {
     /// so there was no descendant, no held pipe, and a bound of six seconds against a job that
     /// was already over. Waiting for the descendant to announce itself makes the ten seconds
     /// real before the clock starts.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_job_reaches_its_terminal_state_when_it_is_cancelled() {
         let root = temp_root("nmcp-exec-cancel-prompt");
         let broker = broker(&root);
@@ -3345,21 +3354,27 @@ mod tests {
         );
     }
 
-    /// I-069. The grace expiring is a positive observation, and the record has to carry it.
+    /// I-081, narrowing what I-069 asserted. A truncated log is recorded as a truncated log.
     ///
-    /// Only the child and its descendants ever hold these pipe write ends, so a pipe still open
-    /// after the child was reaped means a descendant outlived the kill. Without this the status
-    /// and the audit line would both say `cancelled` while the work continued, which is a false
-    /// entry in an immutable trail rather than a missing one.
+    /// I-069 called this `a_cancel_that_outlives_its_descendants_says_so_in_the_record` and
+    /// asserted the summary named surviving descendants. The inference does not hold: a timeout
+    /// cannot distinguish a pipe still held from a pipe nobody read, and the post-merge macOS
+    /// run produced the second against a job that had no descendants at all. What the record
+    /// carries now is the part that is true either way, that the drain did not finish and the
+    /// log is short, which is also the part a caller reading the log needs.
     ///
-    /// The negative case is
-    /// `a_cancel_that_leaves_nothing_behind_reports_a_complete_log`, and the two are only
-    /// meaningful together: this one alone would pass against an unconditional string.
+    /// The negative case is `a_cancel_that_leaves_nothing_behind_reports_a_complete_log`, and
+    /// the two are only meaningful together: this one alone would pass against an unconditional
+    /// string.
     ///
-    /// The descendant has to exist before the cancel for any of this to mean anything, which is
-    /// what the marker wait establishes and what the first version of this test did not.
-    #[tokio::test]
-    async fn a_cancel_that_outlives_its_descendants_says_so_in_the_record() {
+    /// A descendant has to exist before the cancel for the drain to stall at all, which is what
+    /// the marker wait establishes and what the first version of this test did not.
+    ///
+    /// Multi-threaded, so the drain has a worker of its own. On a current-thread runtime the
+    /// drain and the timeout share one thread and the grace measures scheduling as much as it
+    /// measures the pipe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_whose_log_is_cut_short_records_that_it_was() {
         let root = temp_root("nmcp-exec-cancel-survivors");
         let broker = broker(&root);
         let (script, marker) = descendant_marker_script();
@@ -3387,9 +3402,14 @@ mod tests {
             .expect("wait");
         assert_eq!(final_report.status, "cancelled");
         assert!(
-            final_report.summary.contains("outlived it"),
-            "the shell forks the sleeper, so cancelling the shell leaves a process holding the \
-             job's pipes and the summary has to say so. Got: {}",
+            final_report.summary.contains("this log is truncated"),
+            "the shell forks the sleeper, so cancelling the shell leaves the job's pipes held \
+             and the drain cannot finish. A short log has to say it is short. Got: {}",
+            final_report.summary
+        );
+        assert!(
+            !final_report.summary.contains("descendant"),
+            "and it must not say why, because a timeout cannot establish why (I-081). Got: {}",
             final_report.summary
         );
         let audit = std::fs::read_to_string(root.join("audit.jsonl")).expect("audit");
@@ -3409,8 +3429,13 @@ mod tests {
     /// Unix only, deliberately. `cmd.exe` has no `exec`: every `cmd /C` shape forks, so the
     /// no-descendant case cannot be constructed there through the shell the other tests use.
     /// Both CI legs that run this are the ones the defect was observed on.
+    ///
+    /// This test is also what caught I-081. It failed on the post-merge macOS run of #39 against
+    /// a job with no descendant and closed pipes, because on a current-thread runtime the drain
+    /// task was never scheduled to see the EOF. It runs multi-threaded now, so the grace
+    /// measures the pipe rather than the scheduler.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancel_that_leaves_nothing_behind_reports_a_complete_log() {
         let root = temp_root("nmcp-exec-cancel-clean");
         let broker = broker(&root);
@@ -3439,8 +3464,10 @@ mod tests {
         let elapsed = began.elapsed();
         assert_eq!(final_report.status, "cancelled");
         assert!(
-            !final_report.summary.contains("outlived it"),
-            "nothing outlived this kill, so the summary must not claim otherwise. Got: {}",
+            !final_report.summary.contains("truncated"),
+            "`exec` replaced the shell, so the pipes closed when the child was reaped and the \
+             drain had nothing left to read. A complete log must not be recorded as short. \
+             Got: {}",
             final_report.summary
         );
         assert!(
