@@ -1,0 +1,27 @@
+[package]
+name = "nmcpctl"
+description = "Operator command surface for NativeMCP: the secret broker's write half, policy tools and audit verification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+nmcp-audit = { path = "../nmcp-audit", version = "0.1.0" }
+nmcp-policy = { path = "../nmcp-policy", version = "0.1.0" }
+nmcp-secrets = { path = "../nmcp-secrets", version = "0.1.0" }
+rpassword.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

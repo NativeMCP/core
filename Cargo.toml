@@ -17,6 +17,7 @@ members = [
 "crates/nmcp-audit",
 "crates/nmcp-host",
 "crates/nmcp-secrets",
+"crates/nmcpctl",
 ]
 
 [workspace.package]
@@ -88,3 +89,10 @@ zeroize = "1.9.0"
 chacha20poly1305 = "0.11.0"
 getrandom = "0.4.3"
 hex = "0.4.3"
+# I-037/I-038 addition, an INV-7 reviewed change: the no-echo prompt for
+# `nmcpctl secret set` and `secret rotate` (NMCP-SPEC-002 SB-R1, SB-13). The
+# value arrives over the terminal with echo disabled or over piped stdin, and
+# never as an argument; a CLI that took the value on argv would publish it to
+# every process listing (T5), which is the modality SB-A2 removed by
+# construction. Apache-2.0/MIT, inside the deny.toml allow list.
+rpassword = "7.5.4"

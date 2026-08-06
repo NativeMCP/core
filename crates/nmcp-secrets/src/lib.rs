@@ -18,9 +18,10 @@
 //! owner. Resolution wiring at ring stage 5b and the audit records for every store operation
 //! are I-034, which is the first code with both a dispatch path and an `AuditSink` in scope;
 //! it is where [`SealedStore::evaluate`] and [`SealedStore::resolve`] get their production
-//! caller. The exfiltration tripwire is I-035. The operator command surface, `nmcpctl`, is
-//! I-037 and I-038, and until it lands the write half below has no production caller, exactly
-//! as NMCP-SPEC-002 SB-13 sequences it.
+//! caller. The exfiltration tripwire is I-035. The operator command surface is I-037 and
+//! I-038: the `nmcpctl` crate is the write half's production caller, exactly as NMCP-SPEC-002
+//! SB-13 sequences it, and [`SealedStore::resume`] and [`SealedStore::binding_summary`]
+//! landed with it, the reverse of `suspend` and the read half of `bind` respectively.
 //!
 //! ## Dependency discipline
 //!
@@ -89,10 +90,10 @@ pub use name::{SecretName, SecretNameError, Version, VersionError};
 pub use sealed::Sealed;
 pub use sealer::{SECRET_ENTROPY, SealContext, SealError, Sealer, SealerId};
 pub use store::{
-    DEFAULT_OVERLAP_WINDOW_SECS, DEFAULT_TRIPWIRE_FLOOR, MigrationEntry, MigrationReport,
-    ResolveError, SECRETS_DIR, STORE_CONFIG_FILE, STORE_SCHEMA_VERSION, SealedStore, SecretMeta,
-    SkippedEntry, StoreError, TRIPWIRE_FLOOR_MINIMUM, UnreadableEntry, UnreadableReason,
-    VersionMeta,
+    BindingSummary, DEFAULT_OVERLAP_WINDOW_SECS, DEFAULT_TRIPWIRE_FLOOR, MigrationEntry,
+    MigrationReport, ResolveError, SECRETS_DIR, STORE_CONFIG_FILE, STORE_SCHEMA_VERSION,
+    SealedStore, SecretMeta, SkippedEntry, StoreError, TRIPWIRE_FLOOR_MINIMUM, UnreadableEntry,
+    UnreadableReason, VersionMeta,
 };
 
 /// Semantic version of this crate, taken from the workspace manifest.
