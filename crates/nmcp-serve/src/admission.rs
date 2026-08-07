@@ -231,6 +231,15 @@ pub(crate) fn mcp_client_token_from_headers(headers: &HeaderMap) -> Option<Strin
         .or_else(|| bearer_token_from_headers(headers))
 }
 
+/// `sha256_hex` for the lane tests, which build a credential the same way policy does.
+///
+/// A named seam rather than widening `sha256_hex` itself: the hash belongs to the static
+/// credential path and nothing outside this module should be reaching for it in production.
+#[cfg(test)]
+pub(crate) fn sha256_hex_for_tests(input: &str) -> String {
+    sha256_hex(input)
+}
+
 // Refusal, at the resolution an audit record may carry ────────────────────────────────────
 
 /// Why an authentication attempt failed, at the resolution an audit record may carry.
@@ -263,6 +272,14 @@ impl AuthRejection {
         }
     }
 }
+
+impl std::fmt::Display for AuthRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for AuthRejection {}
 
 // Admission ───────────────────────────────────────────────────────────────────────────────
 

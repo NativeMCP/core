@@ -1487,6 +1487,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "nmcp-abac",
  "nmcp-audit",
  "nmcp-authn",
@@ -1497,6 +1498,7 @@ dependencies = [
  "nmcp-inspector",
  "nmcp-oauth",
  "nmcp-policy",
+ "nmcp-proto",
  "nmcp-router",
  "nmcp-secrets",
  "nmcp-transport",
