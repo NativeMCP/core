@@ -324,10 +324,20 @@ pub(crate) fn build_metrics(state: &AppState) -> String {
             "nmcp_policy_file_rejected {}",
             u8::from(state.policy_load.rejection().is_some())
         ),
-        // The two catalog metrics, `catalog_feed_rejected` and `catalog_servers_total`,
-        // arrive with I-077, which introduces the `catalog` field they read. A metric
-        // emitting a placeholder would be worse than a missing one: a series that always
-        // reports zero is indistinguishable from a healthy one.
+        // 1 means a catalog feed on disk was refused and the shipped default is in force
+        // (G6-7). I-076 deleted these two rather than emitting placeholders, because a series
+        // that always reports zero is indistinguishable from a healthy one.
+        format!(
+            "nmcp_catalog_feed_rejected {}",
+            u8::from(state.catalog().rejection().is_some())
+        ),
+        // In this tree the shipped default carries no entries, so a zero here reads as either
+        // "no feed installed" or "the feed was refused". The series above is what separates
+        // them, which is why the two are only useful together.
+        format!(
+            "nmcp_catalog_servers_total {}",
+            state.catalog().catalog().servers.len()
+        ),
         // Streaming transport metrics (PR-09)
         format!(
             "nmcp_transport_sessions_active {}",
@@ -485,8 +495,51 @@ pub(crate) fn build_doctor(state: &AppState) -> Value {
     })
 }
 
-/// Identity, paths, permissions and the delete-verb sweep.
+/// G6-7. The catalog in force, and whether a feed on disk was refused.
+///
+/// A **warning** rather than an error, and deliberately not a readiness check. Readiness fails on
+/// a rejected policy because policy governs what runs; a catalog is a list of software an operator
+/// could install, so a refused browse list is worth saying out loud and is not worth stopping a
+/// deploy over.
+///
+/// That asymmetry is the part a later reader is most likely to correct by accident, which is why
+/// it is written here as well as in NMCP-PLAN-002 and in [`crate::catalog_store`]'s module doc,
+/// and why the test asserts it against its own opposite in the same run.
+fn doctor_catalog_check(state: &AppState) -> Value {
+    match state.catalog().rejection() {
+        None => doctor_check(
+            "catalog_feed_loaded",
+            true,
+            "info",
+            format!("gateway catalog in force: {}", state.catalog().source()),
+            None,
+        ),
+        Some(rejection) => doctor_check(
+            "catalog_feed_loaded",
+            false,
+            "warning",
+            format!(
+                "the catalog feed at {} was rejected and the shipped default is in force: {}",
+                rejection.path, rejection.error
+            ),
+            // The base's remediation ends "the browse catalog is the one compiled into this
+            // build". True there, where the default carries thirty-two entries. Here it carries
+            // none, so the honest sentence names the consequence rather than the fallback: an
+            // operator told the compiled-in catalog is in force goes looking for entries that do
+            // not exist.
+            Some(
+                "Fix or remove catalog-feed.json beside the policy file and restart. Until then the browse catalog is empty, because this build ships the admission posture and no entries.",
+            ),
+        ),
+    }
+}
+
 /// Identity, the policy file, the two listeners and the configured paths.
+///
+/// The first line of this doc comment used to read "Identity, paths, permissions and the
+/// delete-verb sweep", which is the doc of the function this one was split out of at I-076. A
+/// split copied the header and the copy stayed. Corrected here because the surrounding code was
+/// already being read.
 ///
 /// Split from the roots and profile group below only for length: the base carried one
 /// vector and the emitted order is unchanged.
@@ -523,13 +576,7 @@ fn doctor_identity_and_path_checks(state: &AppState, policy: &PolicyConfig) -> V
                 ),
             ),
         },
-        // G6-7's catalog check arrives with I-077, which introduces the `catalog` field.
-        // Its shape is settled and recorded in NMCP-PLAN-002: a **warning** rather than an
-        // error, and deliberately not a readiness check. A rejected policy fails readiness
-        // because policy governs what runs; a catalog is a list of software an operator could
-        // install, so a stale browse list is worth saying out loud and is not worth stopping a
-        // deploy over. That asymmetry is the part a later reader is most likely to
-        // "fix" by accident, which is why it is written down here as well as there.
+        doctor_catalog_check(state),
         doctor_check(
             "policy_path",
             true,
@@ -1281,7 +1328,9 @@ mod tests {
         clippy::panic
     )]
 
-    use super::{build_doctor, build_readiness, machine_policy_check, public_readiness};
+    use super::{
+        build_doctor, build_metrics, build_readiness, machine_policy_check, public_readiness,
+    };
     use crate::AppState;
     use nmcp_policy::PolicyConfig;
     use nmcp_policy::machine::{MachinePolicy, MachinePolicySource};
@@ -1527,6 +1576,112 @@ mod tests {
                 .iter()
                 .any(|check| check["id"] == "oauth_key_set")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    /// The catalog rejection is a warning and a metric, and never a readiness failure.
+    ///
+    /// The asymmetry, asserted rather than described, and asserted **against its own opposite**
+    /// in the same test: a rejected policy in the same run must fail readiness. Without that
+    /// half, a build that had quietly stopped failing readiness on anything would pass.
+    ///
+    /// The remediation string is checked too. In this tree the shipped default carries no
+    /// entries, so telling an operator the compiled-in catalog is in force would send them
+    /// looking for entries that do not exist.
+    #[test]
+    fn a_refused_catalog_feed_warns_and_a_refused_policy_fails_readiness() {
+        let root = temp_root("catalog-asymmetry");
+        std::fs::write(root.join("catalog-feed.json"), b"{ not json").expect("write feed");
+        let policy_path = root.join("policy.json");
+        std::fs::write(&policy_path, b"{}").expect("write policy");
+
+        let state = AppState::with_policy_path(
+            PolicyConfig {
+                audit_path: root.join("audit.jsonl"),
+                ..PolicyConfig::default()
+            },
+            Some(policy_path),
+        )
+        .expect("state");
+
+        let rejection = state
+            .catalog()
+            .rejection()
+            .expect("a malformed feed is a rejection");
+        assert!(rejection.error.contains("parse error"));
+
+        let doctor = build_doctor(&state);
+        let checks = doctor["checks"].as_array().expect("checks");
+        let feed = checks
+            .iter()
+            .find(|check| check["id"] == "catalog_feed_loaded")
+            .expect("the catalog check is emitted");
+        assert_eq!(feed["ok"], false);
+        assert_eq!(
+            feed["severity"], "warning",
+            "a refused catalog reported at error severity would make a browse list a fault"
+        );
+        assert!(
+            feed["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("empty")),
+            "the remediation must name the consequence in this tree, where the shipped default \
+             carries no entries: {}",
+            feed["remediation"]
+        );
+        // The property is that the catalog warning does not decide the verdict, not that the
+        // verdict is true: this fixture is a temp directory, and other checks in it fail at error
+        // severity for reasons that have nothing to do with a catalog. Asserting `ok == true`
+        // read as an assertion about the catalog and was an assertion about the whole fixture.
+        let verdict_with_rejection = doctor["ok"].clone();
+        let clean = AppState::new(PolicyConfig {
+            audit_path: root.join("audit.jsonl"),
+            ..PolicyConfig::default()
+        })
+        .expect("state");
+        assert!(clean.catalog().rejection().is_none());
+        assert_eq!(
+            verdict_with_rejection,
+            build_doctor(&clean)["ok"],
+            "the refused catalog changed the doctor's overall verdict, which makes the warning \
+             severity decorative: `build_doctor` treats a failing warning as still ok on purpose"
+        );
+
+        // The readiness half. `build_readiness` reports per check under `checks` and carries no
+        // top-level verdict of its own; `ok` is the doctor's. So the assertion is that the
+        // catalog does not appear among the readiness checks at all, which is stronger than a
+        // verdict comparison: a catalog check that reported `ok` would still be a catalog check
+        // somebody could later make fail.
+        let ready = build_readiness(&state);
+        let names: Vec<&str> = ready["checks"]
+            .as_object()
+            .expect("checks")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.contains("catalog")),
+            "readiness carries a catalog check. Policy governs what runs; a catalog is a list of \
+             software an operator could install, and a browse list must not be able to stop a \
+             deploy. Found: {names:?}"
+        );
+
+        // The negative control, and it is what stops this passing vacuously: a rejected POLICY
+        // does reach readiness, so the absence above is a decision rather than an omission.
+        state
+            .policy_load
+            .record_rejected("deliberate rejection, for the control");
+        let after = build_readiness(&state);
+        assert_eq!(
+            after["checks"]["policy_file_matches_live"]["ok"], false,
+            "a rejected policy must be visible in readiness, which is the other half of the \
+             asymmetry: {}",
+            after["checks"]
+        );
+
+        let metrics = build_metrics(&state);
+        assert!(metrics.contains("nmcp_catalog_feed_rejected 1"));
+        assert!(metrics.contains("nmcp_catalog_servers_total 0"));
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

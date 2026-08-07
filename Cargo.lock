@@ -1508,6 +1508,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
