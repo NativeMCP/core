@@ -177,8 +177,24 @@ jobs:
           # NMCP-SPEC-001 R-6. The pattern is assembled from fragments so
           # that this file does not itself contain the names it rejects,
           # the same technique as the INV-6 gate above.
+          #
+          # Fragment B carried a platform prefix and a hard hyphen, which
+          # matched exactly one of the four spellings the pre-previous
+          # brand takes: the repository name, and neither of the two
+          # unhyphenated identifier forms nor the environment variables.
+          # NMCP-DEC-001 measured that and specified the fix as one
+          # character class rather than a third fragment. The separator
+          # class admits a hyphen, an underscore or nothing, and never a
+          # space, so all four spellings match under -i and the same two
+          # words in ordinary prose do not.
+          #
+          # Landed at I-075a, which is the issue that ports the file
+          # carrying one of the three spellings the narrower pattern
+          # missed. Writing this note is also how the gate's own warning
+          # proved itself: the first draft quoted the old fragment and
+          # failed the gate it was documenting.
           A="$(printf '%s%s' 'Signal' 'Desk')"
-          B="$(printf '%s%s%s' 'windows' '-local-' 'repo')"
+          B="$(printf '%s%s%s' 'local' '[-_]?' 'repo')"
           P="(${A}|${B})"
           if git grep -n -i -E "$P"; then
             echo "::error::INV-8 violation: legacy brand reference present."

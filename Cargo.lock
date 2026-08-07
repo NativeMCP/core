@@ -1489,6 +1489,7 @@ dependencies = [
  "axum",
  "nmcp-abac",
  "nmcp-audit",
+ "nmcp-authn",
  "nmcp-exec",
  "nmcp-gateway",
  "nmcp-host",
@@ -1502,7 +1503,9 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
