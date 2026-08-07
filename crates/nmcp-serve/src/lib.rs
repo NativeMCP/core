@@ -60,6 +60,7 @@
 mod admission;
 mod auth_attempts;
 pub mod diagnostics;
+mod mcp_http;
 mod peer;
 
 use nmcp_authn::JwksCache;
@@ -475,6 +476,18 @@ impl AppState {
     #[must_use]
     pub fn event_emitter(&self) -> &ExecutionEventEmitter {
         &self.event_emitter
+    }
+
+    /// Replace the policy in force, the way a reload does.
+    ///
+    /// The shared handle exists so a reload is observed rather than snapshotted, and WD-D3's
+    /// whole subject is a socket that observes one. A test needs to perform the edit without a
+    /// file, a watcher and a running server, and this is the smallest thing that models it.
+    /// `cfg(test)`, because the production write path is the policy update lock plus the file
+    /// and neither is optional there.
+    #[cfg(test)]
+    pub(crate) fn replace_policy_for_tests(&self, policy: PolicyConfig) {
+        *self.policy.write() = policy;
     }
 
     /// The issuer key sets. Component (m).

@@ -122,3 +122,11 @@ reqwest = { version = "0.12.28", default-features = false, features = ["json", "
 # list. Default features off: the `use_pem` default pulls a PEM parser this crate has
 # no use for, because every key arrives as a JWK over the metadata endpoint.
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+# I-075b addition, an INV-7 reviewed change: the SSE lane builds its response body
+# as a `Stream` of events, which is what axum's `Sse` type consumes, and this crate
+# has no other way to construct one. Two combinators are used and no more:
+# `stream::iter` over the replayed events and `stream::pending` for the tail that
+# keeps the connection open. It is already in this graph transitively through axum
+# and tokio; naming it here makes the direct use explicit rather than relying on a
+# transitive copy that a dependency bump could remove. MIT/Apache-2.0.
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
