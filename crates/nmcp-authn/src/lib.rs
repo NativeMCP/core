@@ -1300,3 +1300,63 @@ mod trust_ceiling_tests {
         ));
     }
 }
+
+// ── The backend is actually present (I-082) ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod backend_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use jsonwebtoken::jwk::JwkSet;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use serde_json::{Value, json};
+
+    /// A real RS256 verification, because nothing else in this crate performs one.
+    ///
+    /// Every other test drives `accept`, which decides claims, or the key cache, which decides
+    /// ages. **None of them touches a signature.** So a build whose `jsonwebtoken` features
+    /// leave no algorithm backend compiled in would pass this crate's whole suite and refuse
+    /// every real token in production, which is a silent authentication outage rather than a
+    /// failure anybody would see in CI.
+    ///
+    /// This asserts the backend exists by using it. The token is signed by a key this test does
+    /// not hold, so verification must fail on the SIGNATURE rather than on "algorithm not
+    /// supported": the distinction is the whole point.
+    #[test]
+    fn an_rs256_verification_reaches_the_signature_check_rather_than_an_unsupported_algorithm() {
+        // A well-formed RSA public JWK. Verification against it must fail, and the reason
+        // matters.
+        let jwks: JwkSet = serde_json::from_value(json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "k1",
+                "use": "sig",
+                "alg": "RS256",
+                "n": "sXchqfXm2ZQ1YlPl6JmZ6iMDNTGmVUZmVXUUdmM1FnZmVXcmVzaGtleQ",
+                "e": "AQAB"
+            }]
+        }))
+        .expect("a well formed key set");
+        let jwk = jwks.find("k1").expect("the key is in the set");
+        let key = DecodingKey::from_jwk(jwk).expect(
+            "from_jwk must build an RSA decoding key; failing here means no RSA backend is \
+             compiled in and every RS256 token would be refused in production",
+        );
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        validation.validate_aud = false;
+        let forged =
+            "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJhbGljZSJ9.bm90LWEtcmVhbC1zaWduYXR1cmU";
+
+        let err = decode::<Value>(forged, &key, &validation)
+            .expect_err("a token signed by nobody must not verify");
+        assert!(
+            !format!("{err:?}").to_lowercase().contains("unsupported"),
+            "the algorithm must be supported and the SIGNATURE must be what fails. An \
+             `unsupported` error means the crate was built with no backend for RS256, which \
+             would refuse every real token while this crate's other tests all still pass. \
+             Got: {err:?}"
+        );
+    }
+}
