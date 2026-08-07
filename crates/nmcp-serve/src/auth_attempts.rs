@@ -581,8 +581,22 @@ mod tests {
 
         let flushed = ledger.flush_expired(now + WINDOW);
         assert_eq!(flushed.len(), 2);
+        // A FLAKY ASSERTION, fixed. This read `for host in [".42", ".43"]` and scanned the whole
+        // serialized document. `AuditEvent.timestamp` is a `DateTime<Utc>`, which serialises with
+        // fractional seconds, so `.42` matched any record whose fraction happened to begin with
+        // those two digits. Two records and two patterns is roughly a four percent failure rate
+        // per run, which is exactly often enough to red a CI job occasionally and never often
+        // enough to be reproduced by whoever sees it.
+        //
+        // Third instance of one shape in this port, after `crates/nmcp-serve` matching
+        // `crates/nmcp-serve-assets` and `Instant` matching a doc comment about removing
+        // `Instant`. A substring assertion is only as precise as the shortest thing that
+        // satisfies it, and a two-character suffix satisfies almost anything.
+        //
+        // The full address is what must not appear, and naming it is both stronger and immune to
+        // whatever else the record carries.
         let rendered = serde_json::to_string(&flushed).expect("serialize");
-        for host in [".42", ".43"] {
+        for host in ["203.0.113.42", "203.0.113.43"] {
             assert!(
                 !rendered.contains(host),
                 "the record keeps the network and never the host: {rendered}"

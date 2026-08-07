@@ -59,6 +59,7 @@
 
 mod admission;
 mod auth_attempts;
+pub mod catalog_store;
 pub mod diagnostics;
 mod mcp_http;
 mod peer;
@@ -276,6 +277,16 @@ pub struct AppState {
     /// read the registry, and because WinMCP binds its Group Policy reader once at construction
     /// (NMCP-SPEC-001 R-3).
     pub machine_policy: SharedMachinePolicySource,
+    /// Component (n). The catalog in force, and where it came from (G6-7).
+    ///
+    /// The seventeenth and last field the frozen graph was short. Interior-mutable and shared for
+    /// the same reason `jwks` is: a feed applied through one clone of [`AppState`] has to be the
+    /// catalog every other clone answers from.
+    ///
+    /// Loaded from a snapshot beside the policy file, falling back to the shipped default. In
+    /// this tree that default carries the admission posture and **no entries**, which is why the
+    /// rejection surfaces are load-bearing here rather than a nicety. See [`catalog_store`].
+    catalog: catalog_store::CatalogStore,
     /// Component (m). The issuer key sets inbound bearer tokens are verified against (WG-4).
     ///
     /// Two readers, and they are the reason this field is here rather than in I-074: the
@@ -297,12 +308,17 @@ pub struct AppState {
 impl AppState {
     /// The number of fields this graph carries today.
     ///
-    /// Stated rather than inferred, and asserted by a test, because one more arrives later:
-    /// `catalog`, with I-077. A frozen graph that grows without anyone editing a number is a
-    /// graph that is not frozen, and this constant moving is the whole mechanism. It has moved
-    /// twice: `machine_policy` took it from fourteen to fifteen at I-076, and `jwks` takes it to
-    /// sixteen here. Both edits are visible in a diff rather than inferred from a compile.
-    pub const FIELD_COUNT: usize = 16;
+    /// Stated rather than inferred, and asserted by a test. **This is the whole graph now**:
+    /// sixteen residents from NMCP-SPEC-004 section 5.2 as amended, plus (s), the fleet-policy
+    /// source core adds and the base has no counterpart for.
+    ///
+    /// A frozen graph that grows without anyone editing a number is a graph that is not frozen,
+    /// and this constant moving is the mechanism. It moved three times, each in the issue that
+    /// landed the field and each visible in a diff: `machine_policy` at I-076, `jwks` at I-075a,
+    /// `catalog` at I-077a. The second is the one that mattered, because the plan had assigned
+    /// that field to an issue which had already merged without it, and the exhaustive
+    /// destructuring test below was the only thing in the tree positioned to notice.
+    pub const FIELD_COUNT: usize = 17;
 
     /// Build the graph with no policy file, so every store is ephemeral.
     ///
@@ -409,6 +425,12 @@ impl AppState {
         };
         Ok(Self {
             machine_policy,
+            // (n) The catalog store, from the snapshot beside the policy file when there is
+            // one. An absent file is the ordinary state of a fresh install and is not a
+            // rejection; a malformed one is, and it keeps the prior catalog and says so.
+            catalog: catalog_store::CatalogStore::load(
+                catalog_store::catalog_feed_path(policy_path.as_deref()).as_deref(),
+            ),
             // (m) The JWKS cache, on the process clock. WG-4's seam is `JwksCache::with_clock`,
             // which the cache's own tests drive; nothing in a running server injects a clock.
             jwks: Arc::new(JwksCache::new()),
@@ -494,6 +516,12 @@ impl AppState {
     #[must_use]
     pub fn jwks(&self) -> &JwksCache {
         &self.jwks
+    }
+
+    /// The catalog in force. Component (n).
+    #[must_use]
+    pub fn catalog(&self) -> &catalog_store::CatalogStore {
+        &self.catalog
     }
 }
 
@@ -622,6 +650,7 @@ mod tests {
             policy_load: _,
             secrets: _,
             jwks: _,
+            catalog: _,
             oauth: _,
         } = state;
         let named = [
@@ -640,6 +669,7 @@ mod tests {
             "policy_load",
             "secrets",
             "jwks",
+            "catalog",
             "oauth",
         ];
         assert_eq!(
