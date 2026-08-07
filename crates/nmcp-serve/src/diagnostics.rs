@@ -30,6 +30,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
+use nmcp_authn::KeySetPosture;
 use nmcp_policy::PolicyConfig;
 use nmcp_router::SharedRouter;
 use serde::Deserialize;
@@ -466,7 +467,7 @@ pub(crate) fn build_doctor(state: &AppState) -> Value {
     let policy = state.policy();
     let mut checks = doctor_identity_and_path_checks(state, &policy);
     checks.extend(doctor_roots_and_profile_checks(state, &policy));
-    checks.extend(doctor_oauth_checks(&policy));
+    checks.extend(doctor_oauth_checks(state, &policy));
     checks.extend(doctor_policy_posture_checks(&policy));
     checks.extend(doctor_transport_checks(state));
     let ok = checks.iter().all(|check| {
@@ -678,9 +679,12 @@ fn doctor_roots_and_profile_checks(state: &AppState, policy: &PolicyConfig) -> V
 
 /// The resource-server posture an operator reads to tell a loopback install taking static
 /// tokens from one accepting bearer tokens off the internet.
-/// Takes only the policy. The one state read in this group was `state.jwks`, and it left with
-/// the key-set posture check for I-074, which introduces the field.
-fn doctor_oauth_checks(policy: &PolicyConfig) -> Vec<Value> {
+///
+/// Reads `state.jwks`, which is why I-076 could not write the key-set arm and deleted it with
+/// the owner named instead of stubbing it. The owner it named was I-074 and that was wrong; see
+/// NMCP-SPEC-004 A-7. It returns here, with the field, by I-076's own rule that a check arrives
+/// with the thing it checks.
+fn doctor_oauth_checks(state: &AppState, policy: &PolicyConfig) -> Vec<Value> {
     let mut checks = Vec::new();
     // OAuth resource-server posture (G3-11, RS-14). An operator reading this should be able
     // to tell a loopback install taking static tokens from one accepting bearer tokens from
@@ -709,12 +713,57 @@ fn doctor_oauth_checks(policy: &PolicyConfig) -> Vec<Value> {
                 ),
                 None,
             ));
-            // The key-set posture check arrives with I-074, which introduces the `jwks`
-            // field and the `KeySetPosture` type it reads. It is the one place an operator can
-            // see that an authorization server has been unreachable long enough to matter,
-            // because a key set past its trust ceiling refuses every caller while the caller is
-            // told only `invalid_token`. I-074's own tests already pin the posture transitions
-            // against a driven clock; what is missing here is only the surfacing.
+            // A key set this server can no longer trust refuses every caller, and the
+            // caller is told only `invalid_token`, so this is the one place an operator can see
+            // that the authorization server has been unreachable long enough to matter.
+            //
+            // The severities are not uniform and the difference is the point. `Stale` is a
+            // warning because tokens are still being accepted: the refetch is failing and the
+            // consequence has not arrived. `Expired` is an error because it already has.
+            // Reporting both at one severity would either cry wolf during a brief outage or
+            // stay quiet through a total one.
+            for (issuer, posture) in state.jwks().posture(&oauth.authorization_servers) {
+                let (ok, severity, detail) = match posture {
+                    KeySetPosture::NeverFetched => (
+                        true,
+                        "info",
+                        format!(
+                            "no key set fetched yet for {issuer}; the first token to arrive \
+                             fetches one"
+                        ),
+                    ),
+                    KeySetPosture::Fresh { age_secs } => (
+                        true,
+                        "info",
+                        format!("key set for {issuer} fetched {age_secs}s ago"),
+                    ),
+                    KeySetPosture::Stale { age_secs } => (
+                        false,
+                        "warning",
+                        format!(
+                            "key set for {issuer} is {age_secs}s old and refetching has not \
+                             succeeded; tokens are still accepted for now"
+                        ),
+                    ),
+                    KeySetPosture::Expired { age_secs } => (
+                        false,
+                        "error",
+                        format!(
+                            "key set for {issuer} is {age_secs}s old, past the trust ceiling, \
+                             so every token from this issuer is being refused"
+                        ),
+                    ),
+                };
+                checks.push(doctor_check(
+                    "oauth_key_set",
+                    ok,
+                    severity,
+                    detail,
+                    Some(
+                        "Confirm this host can reach the authorization server's metadata and JWKS endpoints; the key set is refetched hourly and stops being trusted after 24 hours.",
+                    ),
+                ));
+            }
             checks.push(doctor_check(
                 "oauth_subject_bindings",
                 !oauth.subjects.is_empty(),
@@ -1409,6 +1458,74 @@ mod tests {
         assert!(
             checks.iter().any(|check| check["id"] == "machine_policy"),
             "the doctor still reports the machine policy check on an unmanaged host"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    /// The key-set posture reaches the doctor, once per configured issuer.
+    ///
+    /// The surfacing is what I-076 deleted and what this restores; the posture transitions
+    /// themselves are `nmcp-authn`'s and are already pinned there against a driven clock. Two
+    /// issuers rather than one on purpose: a loop replaced by a single summary check would pass
+    /// a one-issuer test and lose exactly the information an operator needs, which is **which**
+    /// authorization server has gone unreachable.
+    #[test]
+    fn the_doctor_reports_a_key_set_posture_for_every_configured_issuer() {
+        let root = temp_root("key-set");
+        let state = AppState::new(PolicyConfig {
+            audit_path: root.join("audit.jsonl"),
+            oauth_resource: Some(nmcp_policy::OAuthResourceConfig {
+                resource: "https://mcp.example.com/mcp".into(),
+                authorization_servers: vec![
+                    "https://issuer-one.example".into(),
+                    "https://issuer-two.example".into(),
+                ],
+                subjects: std::collections::BTreeMap::new(),
+                algorithms: vec!["RS256".into()],
+                clock_skew_secs: 60,
+                scopes_supported: Vec::new(),
+            }),
+            ..PolicyConfig::default()
+        })
+        .expect("state");
+
+        let doctor = build_doctor(&state);
+        let checks = doctor["checks"].as_array().expect("checks");
+        let key_sets: Vec<&serde_json::Value> = checks
+            .iter()
+            .filter(|check| check["id"] == "oauth_key_set")
+            .collect();
+
+        assert_eq!(
+            key_sets.len(),
+            2,
+            "one key-set check per configured issuer; a summary check cannot say which \
+             authorization server is unreachable"
+        );
+        for issuer in ["issuer-one", "issuer-two"] {
+            assert!(
+                key_sets.iter().any(|check| check["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(issuer))),
+                "no key-set check named {issuer}"
+            );
+        }
+        // Nothing has been fetched, so both are `NeverFetched`: ordinary before the first token
+        // arrives, and an `info` rather than a finding. A server that reported a problem here on
+        // every cold start would train an operator to ignore the check that matters.
+        for check in &key_sets {
+            assert_eq!(check["severity"], "info");
+            assert_eq!(check["ok"], true);
+        }
+
+        // An install with no `oauth_resource` publishes no key-set check at all, rather than one
+        // reporting that nothing is wrong with a thing it does not have.
+        let plain = build_doctor(&state_in(&root));
+        assert!(
+            !plain["checks"]
+                .as_array()
+                .expect("checks")
+                .iter()
+                .any(|check| check["id"] == "oauth_key_set")
         );
         let _ = std::fs::remove_dir_all(root);
     }

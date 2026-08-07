@@ -3,10 +3,12 @@
 //! Part of the NativeMCP `core` workspace. The governance invariants in `docs/GOVERNANCE.md`
 //! apply.
 //!
-//! I-073 lands [`AppState`] and the two leaf modules beneath it. The three lanes, diagnostics
-//! and the admin surface are I-074 through I-077 and are not here.
+//! I-073 landed [`AppState`] and the two leaf modules beneath it. I-076 added diagnostics and
+//! the fleet-policy source. I-075a adds [`admission`], which is what decides whether a caller
+//! may proceed and as whom, and the `jwks` field that path reads. The three lanes are I-075b and
+//! the admin surface is I-077.
 //!
-//! # Fourteen fields, and why not sixteen
+//! # Fifteen fields, and why not seventeen
 //!
 //! NMCP-SPEC-004 section 5.2 freezes seventeen components. Two of them, runtime path
 //! resolution (b) and provider registration (q), are things construction *does* rather than
@@ -16,13 +18,27 @@
 //! named on the field, because a port working from the table alone would have dropped it and
 //! taken the sealed store's persistence with it.
 //!
-//! Of those sixteen, fourteen are here. `jwks` is `JwksCache`, which I-074 introduces with
-//! `nmcp-authn`; `catalog` is the catalog store, which I-077 introduces. Both issues run after
-//! this one, so a struct declaring those fields could not compile when this lands. **A field
-//! arrives in the issue that introduces its type.** Declaring one early would mean a
-//! placeholder, and a placeholder in a frozen object graph is the thing freezing it prevents.
-//! [`AppState::FIELD_COUNT`] is asserted by a test, so those two additions are edits to a
-//! stated number rather than quiet growth.
+//! A-6 adds a seventeenth component, (s), the fleet-policy source, which the base has no
+//! counterpart for. So the frozen table is sixteen residents and this struct carries fifteen of
+//! them: `catalog` is the catalog store, which I-077 introduces along with the readers that make
+//! it worth holding.
+//!
+//! # A field arrives with its first reader
+//!
+//! I-073 wrote that rule as *a field arrives in the issue that introduces its type*, and
+//! assigned `jwks` to I-074 on that basis. **That was wrong, and I-074 merged without it.**
+//! `nmcp-authn` is a leaf crate; this one depends on it and not the reverse, so the issue that
+//! introduced `JwksCache` had no access to this struct and could not have carried out its own
+//! assignment. The rule described I-077's case, where a type and its reader arrive together
+//! because both are new code in this crate, and generalised a coincidence.
+//!
+//! Corrected as NMCP-SPEC-004 A-7. `jwks` arrives here, with [`admission`], because
+//! `authenticate_mcp_client` is its first reader and the doctor's key-set posture check is its
+//! second. The type merely had to exist by now, and it did.
+//!
+//! Declaring a field ahead of any reader would mean a placeholder, and a placeholder in a frozen
+//! object graph is the thing freezing it prevents. [`AppState::FIELD_COUNT`] is asserted by a
+//! test, so each addition is an edit to a stated number rather than quiet growth.
 //!
 //! # The sealer is a parameter
 //!
@@ -41,10 +57,12 @@
 //! `configure_event_log_mirror` under this workspace's names, and `nmcp-policy` carries
 //! `audit_event_log`. The whole path ports.
 
+mod admission;
 mod auth_attempts;
 pub mod diagnostics;
 mod peer;
 
+use nmcp_authn::JwksCache;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -193,15 +211,19 @@ pub struct AppState {
     /// On the state rather than a global, because a test builds its own server and must not
     /// share a ledger with another test running beside it.
     ///
-    /// Read by the lanes' authentication path, which is I-075. `expect` rather than `allow`,
-    /// and this one attribute is the crate's single enforcement point: it is dead in both the
-    /// lib and lib-test targets, so it stops applying the moment a lane reads it and the
-    /// compiler says so. The module-level `allow`s in `peer` and `auth_attempts` exist because
-    /// their own tests use everything they declare, which makes `expect` unfulfillable there.
-    #[expect(
-        dead_code,
-        reason = "read by the lanes' auth path, which lands in I-075"
-    )]
+    /// Read by [`admission::authenticate_and_record`], which every lane goes through.
+    ///
+    /// I-073 marked this `#[expect(dead_code)]` rather than `allow`, so the attribute would fail
+    /// the day something read the ledger. It half-fired here, and the half is worth recording:
+    /// the field is now read in the **lib-test** target, because this module's tests drive the
+    /// throttle, and still dead in the **lib** target, because nothing routes to admission until
+    /// I-075b. An expectation unfulfilled in either target is an error, so this is `allow` now
+    /// and it stops being needed at all when the lanes land.
+    ///
+    /// I-073 also gave this field an accessor. It was dead in both targets even after this
+    /// issue, because `authenticate_and_record` reads the field directly the way the base did,
+    /// so it is deleted rather than kept alive by an attribute.
+    #[allow(dead_code, reason = "read in the lib-test target; routed to at I-075b")]
     auth_attempts: Arc<auth_attempts::AuthAttemptLedger>,
     /// Component (h). Read per request by every provider.
     policy: Arc<RwLock<PolicyConfig>>,
@@ -253,6 +275,16 @@ pub struct AppState {
     /// read the registry, and because WinMCP binds its Group Policy reader once at construction
     /// (NMCP-SPEC-001 R-3).
     pub machine_policy: SharedMachinePolicySource,
+    /// Component (m). The issuer key sets inbound bearer tokens are verified against (WG-4).
+    ///
+    /// Two readers, and they are the reason this field is here rather than in I-074: the
+    /// admission path verifies against it per request, and the doctor reports its posture per
+    /// issuer. `nmcp-authn` owns the type and knows nothing about this struct.
+    ///
+    /// The cache is interior-mutable and shared, so this is a handle rather than a value: two
+    /// clones of [`AppState`] that fetched separately would each hold a key set the other could
+    /// not see, and a rotation observed on one would leave the other refusing valid tokens.
+    jwks: Arc<JwksCache>,
     /// Component (c). OAuth grants, brokered to every upstream that names a provider (G6-9).
     ///
     /// One per process. Two brokers over the same providers would each run a sweep, and two
@@ -264,12 +296,12 @@ pub struct AppState {
 impl AppState {
     /// The number of fields this graph carries today.
     ///
-    /// Stated rather than inferred, and asserted by a test, because more arrive later:
-    /// `jwks` with I-074 and `catalog` with I-077. A frozen graph that grows without anyone
-    /// editing a number is a graph that is not frozen, and this constant moving is the whole
-    /// mechanism: `machine_policy` took it from fourteen to fifteen at I-076 and that edit is
-    /// visible in the diff rather than inferred from a compile.
-    pub const FIELD_COUNT: usize = 15;
+    /// Stated rather than inferred, and asserted by a test, because one more arrives later:
+    /// `catalog`, with I-077. A frozen graph that grows without anyone editing a number is a
+    /// graph that is not frozen, and this constant moving is the whole mechanism. It has moved
+    /// twice: `machine_policy` took it from fourteen to fifteen at I-076, and `jwks` takes it to
+    /// sixteen here. Both edits are visible in a diff rather than inferred from a compile.
+    pub const FIELD_COUNT: usize = 16;
 
     /// Build the graph with no policy file, so every store is ephemeral.
     ///
@@ -376,6 +408,9 @@ impl AppState {
         };
         Ok(Self {
             machine_policy,
+            // (m) The JWKS cache, on the process clock. WG-4's seam is `JwksCache::with_clock`,
+            // which the cache's own tests drive; nothing in a running server injects a clock.
+            jwks: Arc::new(JwksCache::new()),
             auth_attempts: Arc::new(auth_attempts::AuthAttemptLedger::new()),
             policy: policy_arc,
             policy_path,
@@ -442,15 +477,39 @@ impl AppState {
         &self.event_emitter
     }
 
-    /// The failed-authentication ledger. Component (o).
+    /// The issuer key sets. Component (m).
     #[must_use]
-    #[expect(
-        dead_code,
-        reason = "called by the lanes' auth path, which lands in I-075"
-    )]
-    pub(crate) fn auth_attempts(&self) -> &auth_attempts::AuthAttemptLedger {
-        &self.auth_attempts
+    pub fn jwks(&self) -> &JwksCache {
+        &self.jwks
     }
+}
+
+/// Compare two strings without leaking how far they matched.
+///
+/// Dead in the lib target until the lanes route to admission at I-075b and the admin chain lands
+/// at I-078; live in the lib-test target through the static credential path.
+///
+/// At the crate root rather than inside [`admission`] because it has two readers and they land
+/// in different issues: the static credential path here, and the admin token comparison in the
+/// composition root at I-078. Same rule as [`AppState`]'s fields, applied to a function.
+///
+/// Length is compared first and early-returns, which does leak that one bit. That is deliberate
+/// and it is what every constant-time comparison of variable-length inputs does: both sides here
+/// are hex digests of a fixed width, so the branch is unreachable for any real credential and
+/// exists to make the fold below sound rather than to decide anything.
+#[allow(
+    dead_code,
+    reason = "the static credential path routes at I-075b; the admin chain is I-078"
+)]
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// The broker's own sealed grant store, beside the secret store rather than inside it.
@@ -520,10 +579,16 @@ mod tests {
 
     /// The acceptance criterion NMCP-PLAN-002 adds for I-073.
     ///
-    /// `jwks` arrives with I-074 and `catalog` with I-077, and a frozen object graph that grows
-    /// without anyone editing a number is a graph that is not frozen. The pattern is exhaustive,
-    /// so adding a field stops this compiling rather than merely failing, and the names are
-    /// listed so the count is checked against something real instead of against itself.
+    /// `catalog` arrives with I-077, and a frozen object graph that grows without anyone editing
+    /// a number is a graph that is not frozen. The pattern is exhaustive, so adding a field stops
+    /// this compiling rather than merely failing, and the names are listed so the count is
+    /// checked against something real instead of against itself.
+    ///
+    /// It has now done its job twice, and the second time is the interesting one. `machine_policy`
+    /// at I-076 was a field somebody meant to add. `jwks` at I-075a was a field the plan had
+    /// assigned to an issue that already merged without it, so nothing else in the tree was
+    /// going to notice the gap. This stopped compiling, which is the only reason the number and
+    /// the graph are still the same number.
     #[test]
     fn the_graph_carries_exactly_the_fields_it_declares() {
         let root = temp_root("fields");
@@ -543,6 +608,7 @@ mod tests {
             abac: _,
             policy_load: _,
             secrets: _,
+            jwks: _,
             oauth: _,
         } = state;
         let named = [
@@ -560,6 +626,7 @@ mod tests {
             "abac",
             "policy_load",
             "secrets",
+            "jwks",
             "oauth",
         ];
         assert_eq!(

@@ -21,6 +21,7 @@ axum.workspace = true
 nmcp-identity = { path = "../nmcp-identity", version = "0.2.0" }
 nmcp-inspector = { path = "../nmcp-inspector", version = "0.2.0" }
 nmcp-abac = { path = "../nmcp-abac", version = "0.2.0" }
+nmcp-authn = { path = "../nmcp-authn", version = "0.2.0" }
 nmcp-audit = { path = "../nmcp-audit", version = "0.2.0" }
 nmcp-exec = { path = "../nmcp-exec", version = "0.2.0" }
 nmcp-gateway = { path = "../nmcp-gateway", version = "0.2.0" }
@@ -33,7 +34,9 @@ nmcp-transport = { path = "../nmcp-transport", version = "0.2.0" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
