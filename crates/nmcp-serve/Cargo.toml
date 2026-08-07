@@ -31,9 +31,11 @@ nmcp-oauth = { path = "../nmcp-oauth", version = "0.2.0" }
 nmcp-policy = { path = "../nmcp-policy", version = "0.2.0" }
 nmcp-proto = { path = "../nmcp-proto", version = "0.2.0" }
 nmcp-router = { path = "../nmcp-router", version = "0.2.0" }
+nmcp-schema = { path = "../nmcp-schema", version = "0.2.0" }
 nmcp-secrets = { path = "../nmcp-secrets", version = "0.2.0" }
 nmcp-transport = { path = "../nmcp-transport", version = "0.2.0" }
 parking_lot.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

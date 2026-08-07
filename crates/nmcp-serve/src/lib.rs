@@ -63,6 +63,7 @@ pub mod catalog_store;
 pub mod diagnostics;
 mod mcp_http;
 mod peer;
+mod policy_write;
 
 use nmcp_authn::JwksCache;
 use std::path::{Path, PathBuf};
@@ -396,7 +397,16 @@ impl AppState {
         let policy = policy.with_runtime_paths(policy_path.as_deref());
         // (c) OAuth broker, then reconfigure. Before providers: an upstream that brokers needs a
         // broker that already knows its provider by the time it first refreshes.
-        let oauth = Broker::with_default_client(grant_store(policy_path.as_deref())?)?;
+        // (c) OAuth broker, with the SB-17 client-secret seam wired. Built after (a) so the
+        // lookup can capture the store: until this, `nmcp-oauth` refused by name any provider
+        // whose configuration named a client secret, which is SB-8's fail-closed state and was
+        // the only state core had.
+        let oauth = Broker::with_parts(
+            grant_store(policy_path.as_deref())?,
+            default_http_client()?,
+            nmcp_oauth::grant::now_unix,
+            Some(policy_write::client_secret_lookup(&secrets)),
+        );
         oauth.reconfigure(policy.oauth_providers.clone());
         // (d) Audit sink, then platform mirror configured from policy.
         let audit = AuditSink::open(&policy.audit_path)?;
@@ -518,6 +528,21 @@ impl AppState {
         &self.jwks
     }
 
+    /// The subset of this state a policy change acts on.
+    ///
+    /// A bag rather than [`AppState`] itself, so the reconcile stays callable from a test that
+    /// has not built a whole server. `secrets` is the handle rather than a copy, because
+    /// `SealedStore` is deliberately not `Clone`.
+    pub(crate) fn wiring(&self) -> policy_write::RuntimeWiring {
+        policy_write::RuntimeWiring {
+            gateway: self.gateway.clone(),
+            router: self.router.clone(),
+            audit: self.audit.clone(),
+            secrets: Arc::clone(&self.secrets),
+            oauth: Arc::clone(&self.oauth),
+        }
+    }
+
     /// The catalog in force. Component (n).
     #[must_use]
     pub fn catalog(&self) -> &catalog_store::CatalogStore {
@@ -551,6 +576,29 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
         .zip(b.as_bytes())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// The HTTP client this runtime gives the OAuth broker.
+///
+/// Duplicated from `Broker::with_default_client`, and that is a gap worth naming rather than
+/// hiding. `nmcp-oauth` offers `with_default_client`, which builds this client and takes no
+/// lookup, and `with_parts`, which takes a lookup and no client. **They are mutually exclusive**,
+/// so the first caller that needs the runtime's client *and* a client-secret seam has to rebuild
+/// the client, which is the daemon and which is this. The two must not drift: a broker with a
+/// different timeout or a proxy it should not have would be a change nobody made on purpose.
+///
+/// The fix belongs in `nmcp-oauth`, as a constructor that takes the lookup and builds the same
+/// client. Not taken here because that crate is ratified and this is not the issue for it.
+///
+/// # Errors
+///
+/// When the HTTP client cannot be built, which is the same failure `with_default_client` returns.
+fn default_http_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .no_proxy()
+        .build()
+        .map_err(|err| anyhow::anyhow!("building the OAuth broker's HTTP client: {err}"))
 }
 
 /// The broker's own sealed grant store, beside the secret store rather than inside it.
